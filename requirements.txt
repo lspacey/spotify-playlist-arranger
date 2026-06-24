@@ -6,46 +6,45 @@
 # Spotify Web API
 spotipy>=2.23.0
 
-# Capture audio — WASAPI loopback (Windows)
-# If pip install faile:you need Visual C++ Build Tools:
+# Capture audio – WASAPI loopback (Windows)
+# If `pip install pyaudiowpatch` fails, you need Visual C++ Build Tools:
 # https://visualstudio.microsoft.com/visual-cpp-build-tools/
 pyaudiowpatch>=0.2.12
 
-# audio analysis
+# Audio analysis
 librosa>=0.10.0
 numpy>=1.24.0
 soundfile>=0.12.0
 
-# termial UI
+# Terminal UI
 rich>=13.0.0
 
-# optional: load .env file
-# python-dotenv>=1.0.0
+# Environment-variable loader
+python-dotenv>=1.0.0
 
-# MERT neural embeddings (optional — for audio vector analysis)
-# ─── CPU-only (default):
+# MERT neural embeddings (for audio vector analysis)
+# ─── CPU-only (default) ────────────────────────────────────────────────────────
 torch>=2.0.0
 torchaudio>=2.0.0
 transformers>=4.30.0,<4.49
 accelerate>=0.20.0
 
-# ─── CUDA acceleration (Windows / Linux):
-#   Check your CUDA version first:  nvidia-smi
-#   Then visit https://pytorch.org/get-started/locally/ for the exact index URL.
-#   Example — CUDA 12.1:
+# ─── CUDA acceleration (Windows / Linux) ───────────────────────────────────────
+#   Check your CUDA version:  nvidia-smi
+#   Visit https://pytorch.org/get-started/locally/ for the correct index URL.
+#
+#   Example – CUDA 12.1:
 #     pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
-#     pip install transformers>=4.30.0 accelerate>=0.20.0
+#     pip install transformers>=4.30.0,<4.49 accelerate>=0.20.0
 #
-#   Example — CUDA 11.8:
+#   Example – CUDA 11.8:
 #     pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
-#     pip install transformers>=4.30.0 accelerate>=0.20.0
+#     pip install transformers>=4.30.0,<4.49 accelerate>=0.20.0
 #
-#   After installing, verify:  python -c "import torch; print(torch.cuda.is_available())"
-#   if you see False -> try reinstalling: 
-#                         pip uninstall torch torchvision
-#                       then install again, like:
-#                         pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+#   Verify:  python -c "import torch; print(torch.cuda.is_available())"
+#   If False →  pip uninstall torch torchvision
+#               pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
-# LLM backends (optional — pick one or more)
-ollama>=0.1.0
-openai>=1.0.0
+# LLM backends (pick at least one)
+ollama>=0.1.0        # local LLM  (free, offline)
+openai>=1.0.0        # for DeepSeek / Mistral APIs

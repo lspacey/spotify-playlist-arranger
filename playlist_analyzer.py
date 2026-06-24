@@ -903,7 +903,7 @@ def _run_smart_sorting(console, db: dict, descs: list, pl_id: str, pl_name: str,
         "playlist_id": pl_id,
         "playlist_name": pl_name,
         "saved_at": datetime.datetime.now().isoformat(),
-        "cost": best_cost,
+        "cost": float(best_cost),
         "tracks": [
             {
                 "spotify_id": d["spotify_id"],
@@ -921,7 +921,7 @@ def _run_smart_sorting(console, db: dict, descs: list, pl_id: str, pl_name: str,
     # Display result table
     tbl = Table(title=f"Sorted — {pl_name}", header_style="bold")
     tbl.add_column("#", style="dim", width=4)
-    tbl.add_column("Track", width=36)
+    tbl.add_column("Track", width=44)
     tbl.add_column("BPM", width=5)
     tbl.add_column("Key", width=7)
     for i, d in enumerate(ordered_descs):
@@ -957,29 +957,32 @@ def _run_smart_sorting(console, db: dict, descs: list, pl_id: str, pl_name: str,
                 continue
             try:
                 uris = [f"spotify:track:{d['spotify_id']}" for d in ordered_descs if d.get("spotify_id")]
-                import requests as _requests
-                token = sp.auth_manager.get_access_token(as_dict=False)
-                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                 ts_tag = datetime.datetime.now().strftime("%Y%m%d%H%M")
                 new_name = f"{pl_name} {ts_tag}"
-                resp = _requests.post(
-                    "https://api.spotify.com/v1/me/playlists",
-                    headers=headers, json={"name": new_name, "public": False}, timeout=20,
+                new_pl, err = _spotify_request_with_retries(
+                    sp, "POST", "me/playlists",
+                    payload={"name": new_name, "public": False},
                 )
-                if resp.ok:
-                    pl = resp.json()
+                if err or not new_pl:
+                    console.print(f"[red]Error creating playlist: {err}[/red]")
+                else:
+                    all_ok = True
                     for i in range(0, len(uris), 100):
                         chunk = uris[i:i+100]
-                        _requests.post(
-                            f"https://api.spotify.com/v1/playlists/{pl['id']}/items",
-                            headers=headers, json={"uris": chunk}, timeout=20,
+                        _, err2 = _spotify_request_with_retries(
+                            sp, "POST", f"playlists/{new_pl['id']}/items",
+                            payload={"uris": chunk},
                         )
-                    console.print(f"[bold green]✓ New playlist created: {new_name}[/bold green]")
-                    url = (pl.get("external_urls") or {}).get("spotify")
-                    if url:
-                        console.print(f"[cyan]  {url}[/cyan]")
-                else:
-                    console.print(f"[red]Spotify error: {resp.status_code} {resp.text[:200]}[/red]")
+                        if err2:
+                            console.print(f"[red]Error adding batch {i//100 + 1}: {err2}[/red]")
+                            all_ok = False
+                            break
+                        time.sleep(0.3)  # gentle throttle between chunks
+                    if all_ok:
+                        console.print(f"[bold green]✓ New playlist created: {new_name}[/bold green]")
+                        url = (new_pl.get("external_urls") or {}).get("spotify")
+                        if url:
+                            console.print(f"[cyan]  {url}[/cyan]")
             except Exception as exc:
                 console.print(f"[red]Error: {exc}[/red]")
 
@@ -994,12 +997,8 @@ def _run_smart_sorting(console, db: dict, descs: list, pl_id: str, pl_name: str,
             except Exception:
                 existing = []
             bk_file = ANCHORS_DIR / f"backup_{pl_id}.json"
-            bk_file.write_text(
-                json.dumps({"playlist_id": pl_id, "playlist_name": pl_name,
-                            "saved_at": datetime.datetime.now().isoformat(), "tracks": existing},
-                           ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            _atomic_write_json(bk_file, {"playlist_id": pl_id, "playlist_name": pl_name,
+                                          "saved_at": datetime.datetime.now().isoformat(), "tracks": existing})
             console.print(f"[green]✓ Backup saved to {bk_file.name}[/green]")
 
             # Reorder: PUT first 100, then POST rest in batches (API limit)
@@ -1016,6 +1015,7 @@ def _run_smart_sorting(console, db: dict, descs: list, pl_id: str, pl_name: str,
                         if err2:
                             console.print(f"[red]Error adding batch: {err2}[/red]")
                             break
+                        time.sleep(0.3)  # gentle throttle between chunks
                     else:
                         console.print(f"[bold green]✓ Playlist \"{pl_name}\" updated![/bold green]")
             else:
@@ -1150,7 +1150,7 @@ def _run_ai_anchor_generation(console, descs: list, pl_name: str, pl_id: str) ->
     tbl = Table(show_header=True, header_style="bold")
     tbl.add_column("#", style="dim", width=3)
     tbl.add_column("Type", width=18)
-    tbl.add_column("Description", width=60)
+    tbl.add_column("Description", width=80)
     for i, s in enumerate(PLAYLIST_STRUCTURES, 1):
         tbl.add_row(str(i), s["name"], s["desc"])
     console.print(tbl)
@@ -1235,6 +1235,23 @@ def _print_anchor_plan(console, plan: list, descs: list):
     console.print(Panel("\n".join(lines), title="Anchor Plan", border_style="green"))
 
 
+_ANCHOR_EDITOR_HELP = Panel(
+    "[bold]Anchor Editor[/bold]\n"
+    "  [cyan]a <#>[/cyan]      — add track as anchor (number from track list)\n"
+    "  [cyan]tracks[/cyan]     — show all tracks with IDs and descriptions\n"
+    "  [cyan]ph[/cyan]         — add placeholder at end\n"
+    "  [cyan]del <#>[/cyan]    — delete element at position\n"
+    "  [cyan]u <#>[/cyan]      — move element up\n"
+    "  [cyan]dn <#>[/cyan]     — move element down\n"
+    "  [cyan]show[/cyan]       — show current plan\n"
+    "  [cyan]ai[/cyan]         — generate anchors with AI\n"
+    "  [cyan]go[/cyan]         — run smart sorting\n"
+    "  [cyan]home[/cyan]       — return to playlist selection\n"
+    "  [cyan]exit[/cyan]       — close the script",
+    border_style="blue",
+)
+
+
 def anchor_editor_loop(console, descs: list, db: dict, pl_id: str, pl_name: str, sp=None) -> str:
     """
     Interactive anchor editor.
@@ -1259,21 +1276,7 @@ def anchor_editor_loop(console, descs: list, db: dict, pl_id: str, pl_name: str,
 
     desc_by_id = {d["spotify_id"]: d for d in descs}
 
-    console.print(Panel(
-        "[bold]Anchor Editor[/bold]\n"
-        "  [cyan]a <#>[/cyan]      — add track as anchor (number from track list)\n"
-        "  [cyan]tracks[/cyan]     — show all tracks with IDs and descriptions\n"
-        "  [cyan]ph[/cyan]         — add placeholder at end\n"
-        "  [cyan]del <#>[/cyan]    — delete element at position\n"
-        "  [cyan]u <#>[/cyan]      — move element up\n"
-        "  [cyan]dn <#>[/cyan]     — move element down\n"
-        "  [cyan]show[/cyan]       — show current plan\n"
-        "  [cyan]ai[/cyan]         — generate anchors with AI\n"
-        "  [cyan]go[/cyan]         — run smart sorting\n"
-        "  [cyan]home[/cyan]       — return to playlist selection\n"
-        "  [cyan]exit[/cyan]       — close the script",
-        border_style="blue",
-    ))
+    console.print(_ANCHOR_EDITOR_HELP)
 
     if plan:
         console.print("[green]Loaded anchor plan:[/green]")
@@ -1396,7 +1399,7 @@ def anchor_editor_loop(console, descs: list, db: dict, pl_id: str, pl_name: str,
             return "exit"
 
         else:
-            console.print("[dim]Unknown command. Available: a <#>, tracks, ph, del <#>, u <#>, dn <#>, show, ai, go, home, exit[/dim]")
+            console.print(_ANCHOR_EDITOR_HELP)
 
 
 # ─── Global audio state ───────────────────────────────────────────────────────
