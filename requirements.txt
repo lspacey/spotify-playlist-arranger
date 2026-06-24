@@ -1,3 +1,8 @@
+#    python -m venv venv
+#    venv\Scripts\activate
+#    pip install -r requirements.txt
+#    pip list
+
 # Spotify Web API
 spotipy>=2.23.0
 
@@ -16,3 +21,31 @@ rich>=13.0.0
 
 # optional: load .env file
 # python-dotenv>=1.0.0
+
+# MERT neural embeddings (optional — for audio vector analysis)
+# ─── CPU-only (default):
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.30.0,<4.49
+accelerate>=0.20.0
+
+# ─── CUDA acceleration (Windows / Linux):
+#   Check your CUDA version first:  nvidia-smi
+#   Then visit https://pytorch.org/get-started/locally/ for the exact index URL.
+#   Example — CUDA 12.1:
+#     pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
+#     pip install transformers>=4.30.0 accelerate>=0.20.0
+#
+#   Example — CUDA 11.8:
+#     pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
+#     pip install transformers>=4.30.0 accelerate>=0.20.0
+#
+#   After installing, verify:  python -c "import torch; print(torch.cuda.is_available())"
+#   if you see False -> try reinstalling: 
+#                         pip uninstall torch torchvision
+#                       then install again, like:
+#                         pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+
+# LLM backends (optional — pick one or more)
+ollama>=0.1.0
+openai>=1.0.0
