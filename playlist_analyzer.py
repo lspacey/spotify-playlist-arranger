@@ -4,11 +4,18 @@ Spotify Playlist Analyzer
 Browses own playlists, shows missing tracks, analyzes them via audio capture + MERT.
 """
 
-import os, sys, time, threading, collections, json, pathlib, datetime, re
+import os, sys, time, threading, collections, json, pathlib, datetime, re, math, random, copy
 import numpy as np
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_CACHE"] = str(pathlib.Path.home() / ".cache" / "huggingface" / "hub")
+
+# ─── Load .env file ───────────────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(pathlib.Path(__file__).parent / ".env")
+except ImportError:
+    pass
 
 _db_lock = threading.Lock()
 
@@ -122,6 +129,43 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 _llm_client = None
 _llm_backend_used = None
 
+def _spotify_request_with_retries(sp, method, path, payload=None, max_retries=5):
+    """Spotify API call with retries for 429/5xx errors. Refreshes token on each retry."""
+    import requests as _req
+    url = f"https://api.spotify.com/v1/{path.lstrip('/')}"
+    backoff = 1.0
+    for attempt in range(max_retries):
+        try:
+            # Refresh token on every attempt (may have expired)
+            token = sp.auth_manager.get_access_token(as_dict=False)
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+            if method.upper() == "POST":
+                resp = _req.post(url, headers=headers, json=payload, timeout=30)
+            elif method.upper() == "PUT":
+                resp = _req.put(url, headers=headers, json=payload, timeout=30)
+            elif method.upper() == "GET":
+                resp = _req.get(url, headers=headers, timeout=30)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", 5)) + 1
+                time.sleep(wait)
+                continue
+            if resp.status_code in (500, 502, 503, 504):
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 20)
+                continue
+            if not resp.ok:
+                return None, f"{resp.status_code} {resp.text[:200]}"
+            return resp.json() if resp.text else {}, None
+        except Exception:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 20)
+    return None, "max retries exceeded"
+
+
 def _init_llm_client(console):
     """Initialize the LLM client based on LLM env var: ollama | deepseek | mistral."""
     global _llm_client, _llm_backend_used
@@ -133,6 +177,15 @@ def _init_llm_client(console):
     if backend == "ollama":
         if not HAS_OLLAMA:
             console.print("[red]ollama package not installed: pip install ollama[/red]")
+            sys.exit(1)
+        # Verify model exists locally
+        try:
+            _ollama.show(OLLAMA_MODEL)
+        except Exception:
+            console.print(
+                f"[red]✗ Model '{OLLAMA_MODEL}' not found locally. "
+                f"Please run: ollama pull {OLLAMA_MODEL}[/red]"
+            )
             sys.exit(1)
         console.print(f"[cyan]Using Ollama — model: {OLLAMA_MODEL}[/cyan]")
         _llm_backend_used = "ollama"
@@ -177,36 +230,56 @@ def _llm_chat(console, system_msg, user_msg, temperature=0.7, max_tokens=300):
     """Send a chat request to the configured LLM backend. Returns response text."""
     backend = LLM_BACKEND
 
-    if backend == "ollama":
-        resp = _ollama.chat(
-            model=OLLAMA_MODEL,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            options={"temperature": temperature, "num_predict": max_tokens},
-            think=False,
-        )
-        raw = resp["message"]["content"].strip()
-        # strip <think>...</think> if present
-        text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        if not text:
-            m = re.search(r"<think>(.*?)</think>", raw, flags=re.DOTALL)
-            text = m.group(1).strip() if m else raw
-        return text
+    if _llm_client is None:
+        _init_llm_client(console)
 
-    elif backend in ("deepseek", "mistral"):
-        model = DEEPSEEK_MODEL if backend == "deepseek" else MISTRAL_MODEL
-        resp = _llm_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return resp.choices[0].message.content.strip()
+    try:
+        if backend == "ollama":
+            kwargs = {
+                "model": OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "options": {"temperature": temperature, "num_predict": max_tokens},
+            }
+            try:
+                kwargs["think"] = False
+                resp = _ollama.chat(**kwargs)
+            except TypeError:
+                # `think` parameter not supported by some models/versions
+                del kwargs["think"]
+                resp = _ollama.chat(**kwargs)
+            except Exception as e:
+                raise RuntimeError(f"Ollama API error: {e}") from e
+            raw = resp.get("message", {}).get("content", "")
+            if not raw:
+                return ""
+            raw = raw.strip()
+            # strip <think>...</think> if present
+            text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            if not text:
+                m = re.search(r"<think>(.*?)</think>", raw, flags=re.DOTALL)
+                text = m.group(1).strip() if m else raw
+            return text
+
+        elif backend in ("deepseek", "mistral"):
+            model = DEEPSEEK_MODEL if backend == "deepseek" else MISTRAL_MODEL
+            try:
+                resp = _llm_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",   "content": user_msg},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:
+                raise RuntimeError(f"{backend.title()} API error: {e}") from e
+            return resp.choices[0].message.content.strip()
+    except Exception as e:
+        raise RuntimeError(f"LLM error ({backend}): {e}") from e
 
     return ""
 
@@ -286,6 +359,13 @@ def _load_descriptions(playlist_id: str) -> list | None:
     return None
 
 
+def _atomic_write_json(file_path: pathlib.Path, data: object):
+    """Write JSON atomically: temp file first, then rename."""
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(file_path)
+
+
 def _save_descriptions(playlist_id: str, playlist_name: str, tracks: list, model: str):
     """Save track descriptions to anchors/descriptions_<pl_id>.json."""
     desc_file = ANCHORS_DIR / f"descriptions_{playlist_id}.json"
@@ -295,7 +375,7 @@ def _save_descriptions(playlist_id: str, playlist_name: str, tracks: list, model
         "model":         model,
         "tracks":        tracks,
     }
-    desc_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(desc_file, data)
 
 
 def _backup_exists(playlist_id: str) -> bool:
@@ -417,7 +497,906 @@ def generate_track_descriptions(console, db, tracks, pl_name, pl_id):
             f"(likely not in DB). Run analysis first.[/yellow]"
         )
 
+    # ── Enrich each description entry with metrics from tracks_db.json ──────
+    enriched_any = False
+    for d in descs:
+        tid = d.get("spotify_id")
+        if tid and tid in db:
+            entry = db[tid]
+            f = entry.get("features") or {}
+            d["bpm"]          = round(f.get("bpm", 0), 1)
+            d["key"]          = f"{f.get('chroma_key', '')} {f.get('mode', '')}".strip()
+            d["camelot"]      = f.get("camelot", "")
+            d["loudness_db"]  = round(f.get("rms_db", 0), 1)
+            d["dynamic_range"]= round(f.get("dynamic_range", 0), 1)
+            d["harm_ratio"]   = round(f.get("harm_ratio", 0), 2)
+            d["flatness"]     = round(f.get("flatness", 0), 3)
+            d["bass_pct"]     = round(f.get("bass", 0) * 100, 1)
+            d["mid_pct"]      = round(f.get("mid", 0) * 100, 1)
+            d["high_pct"]     = round(f.get("high", 0) * 100, 1)
+            d["onset_str"]    = round(f.get("onset_str", 0), 2)
+            d["duration_ms"]  = entry.get("duration_ms", 0)
+            enriched_any = True
+
+    # Save after enrichment if any data changed (reconciles with DB updates)
+    if enriched_any and descs:
+        model_name = (
+            OLLAMA_MODEL if LLM_BACKEND == "ollama"
+            else DEEPSEEK_MODEL if LLM_BACKEND == "deepseek"
+            else MISTRAL_MODEL
+        )
+        _save_descriptions(pl_id, pl_name, descs, model_name)
+        console.print(f"[dim]✓ Descriptions updated with fresh metrics[/dim]")
+
     return descs
+
+
+# ─── Playlist structure types ─────────────────────────────────────────────────
+
+PLAYLIST_STRUCTURES = [
+    {"id": "flat",         "name": "Flat",                "desc": "Uniform energy throughout — steady, hypnotic, no dramatic shifts.","anchor_pct": 12},
+    {"id": "rise_fall",    "name": "Rise and Fall",        "desc": "Gradual build-up to a single peak, then a slow descent.","anchor_pct": 20},
+    {"id": "wave",         "name": "Wave",                 "desc": "Multiple crests and troughs — tension builds, releases, then builds again.","anchor_pct": 25},
+    {"id": "pulse",        "name": "Pulse / Peaks",        "desc": "Alternating high-energy and low-energy blocks, like a heartbeat.","anchor_pct": 18},
+    {"id": "slow_burn",    "name": "Slow Burn / Crescendo","desc": "Starts minimal and sparse, steadily accumulates density and intensity.","anchor_pct": 20},
+    {"id": "rollercoaster","name": "Rollercoaster",        "desc": "Frequent dynamic swings — intense peaks followed by deep valleys.","anchor_pct": 22},
+    {"id": "alternating",  "name": "Alternation / ABAB",   "desc": "Two contrasting moods or textures trading places back and forth.","anchor_pct": 16},
+    {"id": "descending",   "name": "Descending / Cooling",  "desc": "Starts heavy and intense, gradually unwinds into calm and space.","anchor_pct": 20},
+    {"id": "ascension",    "name": "Ascension",             "desc": "Steady climb from darkness to light, low energy to high energy.","anchor_pct": 20},
+    {"id": "story",        "name": "Story Arc",             "desc": "Introduction → development → climax → resolution — like a narrative.","anchor_pct": 25},
+]
+
+
+# ─── Smart sorting (Simulated Annealing ATSP with anchors) ───────────────────
+
+CAMELOT_TO_IDX = {
+    "1A":0,  "2A":1,  "3A":2,  "4A":3,  "5A":4,  "6A":5,
+    "7A":6,  "8A":7,  "9A":8,  "10A":9, "11A":10,"12A":11,
+    "1B":12, "2B":13, "3B":14, "4B":15, "5B":16, "6B":17,
+    "7B":18, "8B":19, "9B":20, "10B":21,"11B":22,"12B":23,
+}
+
+WEIGHTS = {"mood": 0.35, "bpm": 0.15, "transition": 0.25, "key": 0.15, "energy": 0.10}
+ARTIST_PENALTY = 0.18
+ALBUM_PENALTY  = 0.30
+
+
+def _norm_text(s: str) -> str:
+    return " ".join(str(s or "").strip().lower().split())
+
+
+def _artist_tokens(s: str) -> set:
+    txt = str(s or "").lower().replace("&", ",").replace(";", ",")
+    return {p.strip() for p in txt.split(",") if p.strip()}
+
+
+def _cos_dist(a: "np.ndarray", b: "np.ndarray") -> float:
+    n = np.linalg.norm(a) * np.linalg.norm(b)
+    if n < 1e-9:
+        return 1.0
+    return float(1.0 - np.dot(a, b) / n)
+
+
+def _camelot_distance(cam_a: str, cam_b: str) -> float:
+    if cam_a == "?" or cam_b == "?":
+        return 0.5
+    ia = CAMELOT_TO_IDX.get(cam_a, -1)
+    ib = CAMELOT_TO_IDX.get(cam_b, -1)
+    if ia < 0 or ib < 0:
+        return 0.5
+    ring_a, num_a = ia // 12, ia % 12
+    ring_b, num_b = ib // 12, ib % 12
+    circ = min(abs(num_a - num_b), 12 - abs(num_a - num_b))
+    ring_penalty = 0 if ring_a == ring_b else 1
+    return min(circ + ring_penalty, 6) / 6.0
+
+
+def _track_distance(ta: dict, tb: dict, emb_a, emb_b) -> float:
+    fa = ta.get("features") or {}
+    fb = tb.get("features") or {}
+    end_a   = ta.get("end_seg", fa)
+    start_b = tb.get("start_seg", fb)
+
+    if emb_a is not None and emb_b is not None:
+        d_mood = min(_cos_dist(emb_a, emb_b) / 2.0, 1.0)
+    else:
+        ca = fa.get("chroma_cens") or fa.get("chroma_vals")
+        cb = fb.get("chroma_cens") or fb.get("chroma_vals")
+        if ca and cb:
+            n = min(len(ca), len(cb))
+            d_mood = min(_cos_dist(np.array(ca[:n], dtype=np.float32), np.array(cb[:n], dtype=np.float32)) / 2.0, 1.0)
+        else:
+            d_mood = 0.5
+
+    bpm_end_a   = end_a.get("bpm", fa.get("bpm", 120))
+    bpm_start_b = start_b.get("bpm", fb.get("bpm", 120))
+    d_bpm = min(abs(bpm_end_a - bpm_start_b) / 200.0, 1.0)
+
+    mfcc_ea = end_a.get("mfcc20") or end_a.get("mfcc13") or fa.get("mfcc20") or fa.get("mfcc13")
+    mfcc_sb = start_b.get("mfcc20") or start_b.get("mfcc13") or fb.get("mfcc20") or fb.get("mfcc13")
+    if mfcc_ea and mfcc_sb:
+        va = np.array(mfcc_ea, dtype=np.float32)
+        vb = np.array(mfcc_sb, np.float32)
+        n  = min(len(va), len(vb))
+        d_transition = min(_cos_dist(va[:n], vb[:n]) / 2.0, 1.0)
+    else:
+        d_transition = 0.5
+
+    cam_a = end_a.get("camelot", fa.get("camelot", "?"))
+    cam_b = start_b.get("camelot", fb.get("camelot", "?"))
+    d_key = _camelot_distance(cam_a, cam_b)
+
+    rms_ea = end_a.get("rms_db", fa.get("rms_db", -20))
+    rms_sb = start_b.get("rms_db", fb.get("rms_db", -20))
+    d_energy = min(abs(rms_ea - rms_sb) / 60.0, 1.0)
+
+    base = (WEIGHTS["mood"]*d_mood + WEIGHTS["bpm"]*d_bpm
+            + WEIGHTS["transition"]*d_transition + WEIGHTS["key"]*d_key
+            + WEIGHTS["energy"]*d_energy)
+
+    artist_a = _artist_tokens(ta.get("artist", ""))
+    artist_b = _artist_tokens(tb.get("artist", ""))
+    album_a  = _norm_text(ta.get("album", ""))
+    album_b  = _norm_text(tb.get("album", ""))
+    if album_a and album_b and album_a == album_b:
+        base += ALBUM_PENALTY
+    elif artist_a and artist_b and (artist_a & artist_b):
+        base += ARTIST_PENALTY
+
+    return min(base, 1.0 + ALBUM_PENALTY)
+
+
+def _load_embedding(tid: str, db: dict):
+    entry = db.get(tid)
+    if not entry:
+        return None
+    ef = entry.get("embedding_file")
+    if not ef:
+        return None
+    p = BASE_DIR / ef
+    return np.load(str(p)).astype(np.float32) if p.exists() else None
+
+
+_SORTING_CACHE = {}  # {playlist_id: {"D": ndarray, "track_ids": list, "all_tracks": list, "embeddings": list}}
+
+def _build_distance_matrix(track_indices: list, all_tracks: list, embeddings: list) -> "np.ndarray":
+    n = len(track_indices)
+    D = np.zeros((n, n), dtype=np.float32)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                D[i, j] = _track_distance(all_tracks[i], all_tracks[j], embeddings[i], embeddings[j])
+    return D
+
+
+def _path_cost(order: list, D: "np.ndarray") -> float:
+    return sum(D[order[i], order[i+1]] for i in range(len(order)-1))
+
+
+def _nearest_neighbor_init(free_ids: list, start: int, D: "np.ndarray") -> list:
+    if not free_ids:
+        return []
+    remaining = set(free_ids)
+    current   = start
+    path      = []
+    while remaining:
+        best = min(remaining, key=lambda x: D[current, x])
+        path.append(best)
+        remaining.discard(best)
+        current = best
+    return path
+
+
+def _solve_atsp_with_anchors(all_ids, anchors, slots, D, iterations=None, T_start=1.0, T_end=1e-4):
+    n = len(all_ids)
+    if iterations is None:
+        iterations = max(n * 500, 5000)
+
+    free_ids = [x for x in all_ids if x not in set(anchors)]
+
+    if not anchors:
+        if not free_ids:
+            return all_ids
+        shuffled = list(free_ids)
+        random.shuffle(shuffled)
+        if random.random() < 0.5:
+            order = _nearest_neighbor_init(shuffled[1:], shuffled[0], D)
+            order = [shuffled[0]] + order
+        else:
+            order = shuffled
+        current_cost = _path_cost(order, D)
+        best_order   = list(order)
+        best_cost    = current_cost
+        cooling = (T_end / T_start) ** (1.0 / max(iterations, 1))
+        T = T_start
+        for _ in range(iterations):
+            if len(order) < 2:
+                break
+            i, j = sorted(random.sample(range(len(order)), 2))
+            order[i:j+1] = order[i:j+1][::-1]
+            nc = _path_cost(order, D)
+            delta = nc - current_cost
+            if delta < 0 or random.random() < math.exp(-delta / T):
+                current_cost = nc
+                if nc < best_cost:
+                    best_order = list(order)
+                    best_cost  = nc
+            else:
+                order[i:j+1] = order[i:j+1][::-1]
+            T *= cooling
+        return best_order
+
+    n_slots    = len(anchors) + 1
+    slot_open  = (list(slots) + [False] * n_slots)[:n_slots]
+    open_slots = [i for i, v in enumerate(slot_open) if v]
+
+    if not open_slots:
+        return list(anchors)
+
+    shuffled_free = list(free_ids)
+    random.shuffle(shuffled_free)
+    slot_contents = [[] for _ in range(n_slots)]
+    for idx, fid in enumerate(shuffled_free):
+        slot_contents[open_slots[idx % len(open_slots)]].append(fid)
+
+    for si in open_slots:
+        if random.random() < 0.5:
+            start_anchor = anchors[si - 1] if si > 0 else (slot_contents[si][0] if slot_contents[si] else 0)
+            slot_contents[si] = _nearest_neighbor_init(slot_contents[si], start_anchor, D)
+        else:
+            random.shuffle(slot_contents[si])
+
+    def build_order():
+        result = []
+        for si in range(n_slots):
+            result.extend(slot_contents[si])
+            if si < len(anchors):
+                result.append(anchors[si])
+        return result
+
+    current_cost = _path_cost(build_order(), D)
+    best_slots   = copy.deepcopy(slot_contents)
+    best_cost    = current_cost
+    cooling      = (T_end / T_start) ** (1.0 / max(iterations, 1))
+    T            = T_start
+
+    for _ in range(iterations):
+        if random.random() < 0.6 and open_slots:
+            si = random.choice(open_slots)
+            sl = slot_contents[si]
+            if len(sl) < 2:
+                T *= cooling; continue
+            i, j = sorted(random.sample(range(len(sl)), 2))
+            sl[i:j+1] = sl[i:j+1][::-1]
+            nc = _path_cost(build_order(), D)
+            delta = nc - current_cost
+            if delta < 0 or random.random() < math.exp(-delta / T):
+                current_cost = nc
+                if nc < best_cost:
+                    best_slots = copy.deepcopy(slot_contents)
+                    best_cost  = nc
+            else:
+                sl[i:j+1] = sl[i:j+1][::-1]
+        elif len(open_slots) >= 2 and free_ids:
+            si = random.choice(open_slots)
+            sj = random.choice([s for s in open_slots if s != si])
+            if not slot_contents[si]:
+                T *= cooling; continue
+            idx = random.randrange(len(slot_contents[si]))
+            tid = slot_contents[si].pop(idx)
+            ins = random.randrange(len(slot_contents[sj]) + 1)
+            slot_contents[sj].insert(ins, tid)
+            nc = _path_cost(build_order(), D)
+            delta = nc - current_cost
+            if delta < 0 or random.random() < math.exp(-delta / T):
+                current_cost = nc
+                if nc < best_cost:
+                    best_slots = copy.deepcopy(slot_contents)
+                    best_cost  = nc
+            else:
+                slot_contents[sj].pop(ins)
+                slot_contents[si].insert(idx, tid)
+        T *= cooling
+
+    slot_contents[:] = best_slots
+    return build_order()
+
+
+def _run_smart_sorting(console, db: dict, descs: list, pl_id: str, pl_name: str, sp):
+    """Run SA sorting, return (ordered_descs, result). Result: 'retry', 'editor', 'home', 'exit'."""
+    plan = _load_anchors_file(pl_id)
+    if not plan:
+        console.print("[yellow]No anchors found. Please create anchors first.[/yellow]")
+        return descs, "editor"
+
+    n_anchors = sum(1 for e in plan if e["type"] == "anchor")
+    if n_anchors == 0:
+        console.print("[yellow]No anchors in plan — nothing to sort.[/yellow]")
+        return descs, "editor"
+
+    # Build index arrays
+    desc_by_id = {d["spotify_id"]: d for d in descs}
+    track_ids   = [d["spotify_id"] for d in descs]
+    tid_to_idx  = {tid: i for i, tid in enumerate(track_ids)}
+
+    anchors_idx = [tid_to_idx[e["spotify_id"]] for e in plan if e["type"] == "anchor"]
+    slots = []
+    ap = [j for j, e in enumerate(plan) if e["type"] == "anchor"]
+    if ap:
+        slots = [any(plan[k]["type"] == "placeholder" for k in range(0, ap[0]))]
+        for i in range(len(ap)-1):
+            slots.append(any(plan[k]["type"] == "placeholder" for k in range(ap[i]+1, ap[i+1])))
+        slots.append(any(plan[k]["type"] == "placeholder" for k in range(ap[-1]+1, len(plan))))
+
+    # Load track data from DB + embeddings
+    all_tracks = [db[tid] for tid in track_ids if tid in db]
+    if len(all_tracks) != len(track_ids):
+        console.print("[yellow]Some tracks not in DB — sorting may be degraded.[/yellow]")
+        # Re-index track list and rebuild slots to match filtered anchors
+        valid_ids     = [t.get("spotify_id", tid) for tid, t in zip(track_ids, all_tracks)]
+        new_tid_to_idx = {tid: i for i, tid in enumerate(valid_ids)}
+        # Build filtered plan (only anchors whose tracks exist in DB) and recalc slots
+        filtered_anchors = []
+        new_plan = []
+        for e in plan:
+            if e["type"] == "anchor" and e["spotify_id"] in new_tid_to_idx:
+                filtered_anchors.append(new_tid_to_idx[e["spotify_id"]])
+                new_plan.append(e)
+            elif e["type"] == "placeholder":
+                new_plan.append(e)
+            # skip anchors with missing tracks
+        anchors_idx = filtered_anchors
+        # Rebuild slots from filtered plan
+        slots = []
+        ap_new = [j for j, e in enumerate(new_plan) if e["type"] == "anchor"]
+        if ap_new:
+            slots = [any(new_plan[k]["type"] == "placeholder" for k in range(0, ap_new[0]))]
+            for i in range(len(ap_new)-1):
+                slots.append(any(new_plan[k]["type"] == "placeholder" for k in range(ap_new[i]+1, ap_new[i+1])))
+            slots.append(any(new_plan[k]["type"] == "placeholder" for k in range(ap_new[-1]+1, len(new_plan))))
+        all_tracks = [db[tid] for tid in valid_ids]
+        track_ids  = valid_ids
+        tid_to_idx = new_tid_to_idx
+
+    embeddings = [_load_embedding(tid, db) for tid in track_ids]
+
+    n_total = len(all_tracks)
+    # Use cached distance matrix if track_ids haven't changed
+    cache_key = tuple(track_ids)
+    cached = _SORTING_CACHE.get(pl_id)
+    if cached and cached.get("track_ids") == cache_key:
+        D = cached["D"]
+        console.print(f"[dim]Using cached distance matrix ({n_total}×{n_total})[/dim]")
+    else:
+        console.print(f"[dim]Building distance matrix for {n_total} tracks ({n_total*n_total} pairs)...[/dim]")
+        D = _build_distance_matrix(list(range(n_total)), all_tracks, embeddings)
+        _SORTING_CACHE[pl_id] = {"D": D, "track_ids": cache_key, "all_tracks": all_tracks, "embeddings": embeddings}
+
+    all_indices = list(range(len(all_tracks)))
+    iters = max(len(all_tracks) * 500, 5000)
+    N_RUNS = 100
+
+    console.print(f"[cyan]SA: {N_RUNS} runs × {iters} iterations...[/cyan]")
+    best_order, best_cost = None, float("inf")
+    for run in range(N_RUNS):
+        candidate = _solve_atsp_with_anchors(all_indices, anchors_idx, slots, D, iterations=iters)
+        cost = _path_cost(candidate, D)
+        if cost < best_cost:
+            best_cost, best_order = cost, candidate
+        if (run + 1) % 20 == 0 or run == 0:
+            console.print(f"  [dim]Run {run+1}/{N_RUNS}  best={best_cost:.4f}[/dim]")
+
+    ordered = best_order
+    console.print(f"[bold green]Best cost: {best_cost:.4f}[/bold green]")
+
+    # Build ordered list
+    ordered_descs = []
+    anchor_set = set(anchors_idx)
+    for idx in ordered:
+        tid = track_ids[idx]
+        d = desc_by_id.get(tid, {"spotify_id": tid, "name": "?", "artist": "?"})
+        ordered_descs.append(d)
+
+    # Save result
+    result_file = ANCHORS_DIR / f"result_{pl_id}.json"
+    result_data = {
+        "playlist_id": pl_id,
+        "playlist_name": pl_name,
+        "saved_at": datetime.datetime.now().isoformat(),
+        "cost": best_cost,
+        "tracks": [
+            {
+                "spotify_id": d["spotify_id"],
+                "name": d.get("name", ""),
+                "artist": d.get("artist", ""),
+                "bpm": d.get("bpm", 0),
+                "camelot": d.get("camelot", ""),
+            }
+            for d in ordered_descs
+        ],
+    }
+    result_file.write_text(json.dumps(result_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    console.print(f"[green]✓ Result saved to {result_file.name}[/green]")
+
+    # Display result table
+    tbl = Table(title=f"Sorted — {pl_name}", header_style="bold")
+    tbl.add_column("#", style="dim", width=4)
+    tbl.add_column("Track", width=36)
+    tbl.add_column("BPM", width=5)
+    tbl.add_column("Key", width=7)
+    for i, d in enumerate(ordered_descs):
+        tbl.add_row(
+            str(i + 1),
+            f"{d['name'][:32]} — {d.get('artist','')[:16]}",
+            f"{d.get('bpm',0):.0f}",
+            f"{d.get('camelot','?')}",
+        )
+    console.print(tbl)
+
+    # Post-sort menu
+    while True:
+        console.print()
+        console.print("  [cyan]S[/cyan] — Run another sorting")
+        console.print("  [cyan]N[/cyan] — Save as New Playlist in Spotify")
+        console.print(f"  [cyan]U[/cyan] — Update existing playlist \"{pl_name}\"")
+        console.print("  [cyan]E[/cyan] — Return to Anchor Editor")
+        console.print("  [cyan]H[/cyan] — Return to Home")
+        console.print("  [cyan]X[/cyan] — Exit")
+        raw = Prompt.ask("[bold]Action[/bold] [S/N/U/E/H/X]").strip().upper()
+        if not raw:
+            continue
+
+        ch = raw[0]
+        if ch == "S":
+            return descs, "retry"
+
+        elif ch == "N":
+            # Save as new playlist in Spotify
+            if not sp:
+                console.print("[red]Spotify not connected.[/red]")
+                continue
+            try:
+                uris = [f"spotify:track:{d['spotify_id']}" for d in ordered_descs if d.get("spotify_id")]
+                import requests as _requests
+                token = sp.auth_manager.get_access_token(as_dict=False)
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                ts_tag = datetime.datetime.now().strftime("%Y%m%d%H%M")
+                new_name = f"{pl_name} {ts_tag}"
+                resp = _requests.post(
+                    "https://api.spotify.com/v1/me/playlists",
+                    headers=headers, json={"name": new_name, "public": False}, timeout=20,
+                )
+                if resp.ok:
+                    pl = resp.json()
+                    for i in range(0, len(uris), 100):
+                        chunk = uris[i:i+100]
+                        _requests.post(
+                            f"https://api.spotify.com/v1/playlists/{pl['id']}/items",
+                            headers=headers, json={"uris": chunk}, timeout=20,
+                        )
+                    console.print(f"[bold green]✓ New playlist created: {new_name}[/bold green]")
+                    url = (pl.get("external_urls") or {}).get("spotify")
+                    if url:
+                        console.print(f"[cyan]  {url}[/cyan]")
+                else:
+                    console.print(f"[red]Spotify error: {resp.status_code} {resp.text[:200]}[/red]")
+            except Exception as exc:
+                console.print(f"[red]Error: {exc}[/red]")
+
+        elif ch == "U":
+            # Update existing playlist
+            if not sp:
+                console.print("[red]Spotify not connected.[/red]")
+                continue
+            console.print(f"[cyan]Backing up existing playlist...[/cyan]")
+            try:
+                existing = get_playlist_tracks(sp, pl_id)
+            except Exception:
+                existing = []
+            bk_file = ANCHORS_DIR / f"backup_{pl_id}.json"
+            bk_file.write_text(
+                json.dumps({"playlist_id": pl_id, "playlist_name": pl_name,
+                            "saved_at": datetime.datetime.now().isoformat(), "tracks": existing},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            console.print(f"[green]✓ Backup saved to {bk_file.name}[/green]")
+
+            # Reorder: PUT first 100, then POST rest in batches (API limit)
+            uris = [f"spotify:track:{d['spotify_id']}" for d in ordered_descs if d.get("spotify_id")]
+            if uris:
+                first_chunk = uris[:100]
+                rest_chunks = [uris[i:i+100] for i in range(100, len(uris), 100)]
+                _, err = _spotify_request_with_retries(sp, "PUT", f"playlists/{pl_id}/items", {"uris": first_chunk})
+                if err:
+                    console.print(f"[red]Error updating playlist: {err}[/red]")
+                else:
+                    for chunk in rest_chunks:
+                        _, err2 = _spotify_request_with_retries(sp, "POST", f"playlists/{pl_id}/items", {"uris": chunk})
+                        if err2:
+                            console.print(f"[red]Error adding batch: {err2}[/red]")
+                            break
+                    else:
+                        console.print(f"[bold green]✓ Playlist \"{pl_name}\" updated![/bold green]")
+            else:
+                console.print("[yellow]No tracks to update.[/yellow]")
+
+        elif ch == "E":
+            return descs, "editor"
+
+        elif ch == "H":
+            return descs, "home"
+
+        elif ch == "X":
+            return descs, "exit"
+
+
+# ─── Anchor editor ────────────────────────────────────────────────────────────
+
+ANCHOR_SYSTEM_PROMPT = (
+    "You are a music curator and playlist architect with deep knowledge of "
+    "electronic, ambient, downtempo, and experimental music.\n\n"
+    "You will receive a list of tracks from a single playlist, each with:\n"
+    "- A short audio-based description\n"
+    "- Key audio features (BPM, key, loudness, harmonic ratio, dynamics)\n"
+    "- Artist and track name\n\n"
+    "Your task: select exactly N anchor tracks that best realise the requested "
+    "playlist structure type, and arrange them in the correct order.\n"
+    "Choose tracks whose descriptions and features match the energy arc, mood "
+    "progression, and dynamic contour described by the structure. "
+    "Prioritise diversity of textures and keys.\n\n"
+    "OUTPUT FORMAT — strictly follow this structure, no extra text:\n"
+    "ANCHORS:\n"
+    "1. Track Name — Artist\n"
+    "2. Track Name — Artist\n"
+    "...\n"
+    "N. Track Name — Artist"
+)
+
+
+def _load_anchors_file(playlist_id: str) -> list | None:
+    """Load anchors from anchors/anchors_<pl_id>.json. Returns plan list or None."""
+    af = ANCHORS_DIR / f"anchors_{playlist_id}.json"
+    if not af.exists():
+        return None
+    try:
+        return json.loads(af.read_text(encoding="utf-8")).get("plan", None)
+    except Exception:
+        return None
+
+
+def _save_anchors_file(playlist_id: str, playlist_name: str, plan: list):
+    """Save anchors plan to anchors/anchors_<pl_id>.json."""
+    af = ANCHORS_DIR / f"anchors_{playlist_id}.json"
+    data = {
+        "playlist_id":   playlist_id,
+        "playlist_name": playlist_name,
+        "saved_at":      datetime.datetime.now().isoformat(),
+        "plan":          plan,
+    }
+    af.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _plan_from_track_list(track_list: list, descs: list) -> list:
+    """Convert a list of {"spotify_id":...} dicts into an editor plan."""
+    plan = []
+    for t in track_list:
+        plan.append({"type": "anchor", "spotify_id": t["spotify_id"]})
+    return plan
+
+
+def _build_descriptions_block(descs: list) -> str:
+    """Build a compact block of track descriptions for the LLM prompt."""
+    lines = []
+    for d in descs:
+        sid  = d.get("spotify_id", "")
+        name = d.get("name", "?")
+        art  = d.get("artist", "?")
+        desc = d.get("description", "")[:150]
+        bpm  = d.get("bpm", 0)
+        key  = d.get("key", "")
+        loud = d.get("loudness_db", 0)
+        harm = d.get("harm_ratio", 0)
+        dyn  = d.get("dynamic_range", 0)
+        onset= d.get("onset_str", 0)
+        bass = d.get("bass_pct", 0)
+        feat = f"BPM={bpm:.0f} Key={key} Loud={loud:.1f}dB Harm={harm:.2f} Dyn={dyn:.1f}dB Onset={onset:.2f} Bass={bass:.1f}%"
+        lines.append(f'  "{name}" — {art}  [{feat}]\n    {desc}')
+    return "\n\n".join(lines)
+
+
+def _parse_llm_anchor_list(raw_text: str, descs: list, expected_n: int) -> list:
+    """Parse LLM response like 'ANCHORS:\n1. Name — Artist\n...' into track dicts."""
+    section = re.search(r"ANCHORS\s*:(.*)", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    block   = section.group(1).strip() if section else raw_text
+
+    parsed = []
+    for line in block.splitlines():
+        m = re.match(r"\s*\d+\.\s*(.+?)\s*[-\u2014\u2013]\s*(.+)", line)
+        if m:
+            parsed.append({
+                "name":   m.group(1).strip().strip('\"\' '),
+                "artist": m.group(2).strip().strip('\"\' '),
+            })
+        if len(parsed) >= expected_n:
+            break
+
+    # Match against descriptions
+    results = []
+    descs_by_name = {d["name"].lower(): d for d in descs}
+    for a in parsed:
+        key = a["name"].lower()
+        if key in descs_by_name:
+            results.append(descs_by_name[key])
+        else:
+            # fuzzy match
+            found = next(
+                (d for d in descs if a["name"].lower() in d["name"].lower()
+                 or d["name"].lower() in a["name"].lower()),
+                None,
+            )
+            if found:
+                results.append(found)
+
+    return results
+
+
+def _run_ai_anchor_generation(console, descs: list, pl_name: str, pl_id: str) -> list:
+    """Ask LLM to generate anchors. Returns plan list."""
+    _init_llm_client(console)
+
+    # Show structure options
+    console.print("\n[bold cyan]Playlist structure types:[/bold cyan]\n")
+    tbl = Table(show_header=True, header_style="bold")
+    tbl.add_column("#", style="dim", width=3)
+    tbl.add_column("Type", width=18)
+    tbl.add_column("Description", width=60)
+    for i, s in enumerate(PLAYLIST_STRUCTURES, 1):
+        tbl.add_row(str(i), s["name"], s["desc"])
+    console.print(tbl)
+
+    while True:
+        raw = Prompt.ask(
+            f"\n[bold]Select structure type # (1-{len(PLAYLIST_STRUCTURES)})[/bold]",
+            default="1",
+        ).strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(PLAYLIST_STRUCTURES):
+            chosen = PLAYLIST_STRUCTURES[int(raw) - 1]
+            break
+        console.print(f"[red]Please enter 1-{len(PLAYLIST_STRUCTURES)}[/red]")
+
+    # Compute adaptive anchor count from percentage of total tracks
+    n_anchors = max(3, int(len(descs) * chosen.get("anchor_pct", 20) / 100))
+    console.print(
+        f"\n[cyan]Structure: [bold]{chosen['name']}[/bold] — {chosen['desc']}[/cyan]"
+    )
+    console.print(
+        f"[dim]Target anchors: {n_anchors}  ({chosen.get('anchor_pct',20)}% of {len(descs)} tracks, "
+        f"~{max(len(descs) // max(n_anchors, 1), 1)} per segment)[/dim]"
+    )
+
+    # Build user message
+    desc_block = _build_descriptions_block(descs)
+    user_msg = (
+        f'Playlist name: "{pl_name}"\n'
+        f'Total tracks: {len(descs)}\n\n'
+        f'Requested structure: {chosen["name"]}\n'
+        f'{chosen["desc"]}\n\n'
+        f'Select exactly {n_anchors} anchor tracks and arrange them '
+        f'to create this structure. Below is the full track list '
+        f'with audio descriptions and technical features:\n\n'
+        f'{desc_block}\n\n'
+        f'Now select {n_anchors} anchor tracks and order them.'
+    )
+
+    console.print("[cyan]Asking LLM to choose anchors...[/cyan]", end=" ", highlight=False)
+    raw_resp = ""
+    try:
+        raw_resp = _llm_chat(
+            console, ANCHOR_SYSTEM_PROMPT, user_msg,
+            temperature=0.4, max_tokens=6000,
+        )
+        console.print("[green]✓[/green]")
+    except Exception as e:
+        console.print(f"[red]LLM error: {e}[/red]")
+        return []
+
+    matched = _parse_llm_anchor_list(raw_resp, descs, n_anchors)
+    if not matched:
+        console.print("[yellow]⚠ Could not parse anchors from LLM response[/yellow]")
+        return []
+
+    console.print(f"[green]✓ LLM selected {len(matched)} anchors[/green]")
+    plan = _plan_from_track_list(matched, descs)
+    _save_anchors_file(pl_id, pl_name, plan)
+    console.print(f"[green]✓ Anchors saved to anchors/anchors_{pl_id}.json[/green]")
+    return plan
+
+
+def _print_anchor_plan(console, plan: list, descs: list):
+    """Display current anchor plan with track info."""
+    if not plan:
+        console.print("[yellow]Plan is empty[/yellow]")
+        return
+    desc_by_id = {d["spotify_id"]: d for d in descs}
+    lines = []
+    for i, e in enumerate(plan):
+        if e["type"] == "anchor":
+            sid = e.get("spotify_id", "")
+            d   = desc_by_id.get(sid, {})
+            lines.append(
+                f"  [bold]{i+1}.[/bold] ⚓ {d.get('name','?')[:40]} "
+                f"[cyan]{d.get('artist','?')[:20]}[/cyan] "
+                f"[green]{d.get('bpm',0):.0f} BPM[/green] "
+                f"[yellow]{d.get('camelot','?')}[/yellow]"
+            )
+        else:
+            lines.append(f"  [bold]{i+1}.[/bold] [dim]── [ placeholder ] ──[/dim]")
+    console.print(Panel("\n".join(lines), title="Anchor Plan", border_style="green"))
+
+
+def anchor_editor_loop(console, descs: list, db: dict, pl_id: str, pl_name: str, sp=None) -> str:
+    """
+    Interactive anchor editor.
+    Returns "home" to go back to playlist selection, "exit" to quit.
+    """
+    # Load existing anchors or start empty
+    plan = _load_anchors_file(pl_id) or []
+    # Validate: keep only anchors whose spotify_ids are in the current playlist
+    desc_ids = set(d["spotify_id"] for d in descs)
+    valid_plan = []
+    removed = 0
+    for e in plan:
+        if e["type"] != "anchor":
+            valid_plan.append(e)
+        elif e.get("spotify_id", "") in desc_ids:
+            valid_plan.append(e)
+        else:
+            removed += 1
+    if removed:
+        console.print(f"[yellow]{removed} anchor(s) removed — no longer in playlist[/yellow]")
+    plan = valid_plan
+
+    desc_by_id = {d["spotify_id"]: d for d in descs}
+
+    console.print(Panel(
+        "[bold]Anchor Editor[/bold]\n"
+        "  [cyan]a <#>[/cyan]      — add track as anchor (number from track list)\n"
+        "  [cyan]tracks[/cyan]     — show all tracks with IDs and descriptions\n"
+        "  [cyan]ph[/cyan]         — add placeholder at end\n"
+        "  [cyan]del <#>[/cyan]    — delete element at position\n"
+        "  [cyan]u <#>[/cyan]      — move element up\n"
+        "  [cyan]dn <#>[/cyan]     — move element down\n"
+        "  [cyan]show[/cyan]       — show current plan\n"
+        "  [cyan]ai[/cyan]         — generate anchors with AI\n"
+        "  [cyan]go[/cyan]         — run smart sorting\n"
+        "  [cyan]home[/cyan]       — return to playlist selection\n"
+        "  [cyan]exit[/cyan]       — close the script",
+        border_style="blue",
+    ))
+
+    if plan:
+        console.print("[green]Loaded anchor plan:[/green]")
+        _print_anchor_plan(console, plan, descs)
+
+    while True:
+        cmd = Prompt.ask("\n[bold]anchor>[/bold]").strip().lower()
+
+        if cmd.startswith("a "):
+            try:
+                idx = int(cmd[2:]) - 1
+                if not (0 <= idx < len(descs)):
+                    console.print(f"[red]No track #{idx+1}. Use 'tracks' to list.[/red]")
+                else:
+                    sid = descs[idx]["spotify_id"]
+                    plan.append({"type": "anchor", "spotify_id": sid})
+                    console.print(f"[green]+ {descs[idx]['name']}[/green]")
+                    _save_anchors_file(pl_id, pl_name, plan)
+            except ValueError:
+                console.print("[red]Usage: a <number>[/red]")
+
+        elif cmd == "tracks":
+            # Show compact track list with IDs
+            tbl = Table(show_header=True, header_style="bold")
+            tbl.add_column("#", style="dim", width=4)
+            tbl.add_column("Track", width=34)
+            tbl.add_column("BPM", width=5)
+            tbl.add_column("Key", width=7)
+            tbl.add_column("Desc", width=60)
+            for i, d in enumerate(descs):
+                desc = d.get("description", "")
+                desc_display = desc[:58] + ("..." if len(desc) > 58 else "")
+                tbl.add_row(
+                    str(i + 1),
+                    f"{d['name'][:30]} — {d['artist'][:16]}",
+                    f"{d.get('bpm',0):.0f}",
+                    f"{d.get('camelot','?')}",
+                    desc_display,
+                )
+            console.print(tbl)
+
+        elif cmd == "ph":
+            plan.append({"type": "placeholder"})
+            console.print(f"[cyan]Placeholder at position {len(plan)}[/cyan]")
+
+        elif cmd.startswith("del "):
+            try:
+                pos = int(cmd[4:]) - 1
+                if 0 <= pos < len(plan):
+                    removed = plan.pop(pos)
+                    label = desc_by_id.get(removed.get("spotify_id",""), {}).get("name", "placeholder")
+                    console.print(f"[yellow]Removed: {label}[/yellow]")
+                    _save_anchors_file(pl_id, pl_name, plan)
+                else:
+                    console.print("[red]Invalid position[/red]")
+            except ValueError:
+                console.print("[red]Usage: del <number>[/red]")
+
+        elif cmd.startswith("u "):
+            try:
+                pos = int(cmd[2:]) - 1
+                if 1 <= pos < len(plan):
+                    plan[pos-1], plan[pos] = plan[pos], plan[pos-1]
+                    console.print("[green]↑[/green]")
+                    _save_anchors_file(pl_id, pl_name, plan)
+                else:
+                    console.print("[red]Cannot move up[/red]")
+            except ValueError:
+                console.print("[red]Usage: u <number>[/red]")
+
+        elif cmd.startswith("dn "):
+            try:
+                pos = int(cmd[3:]) - 1
+                if 0 <= pos < len(plan) - 1:
+                    plan[pos], plan[pos+1] = plan[pos+1], plan[pos]
+                    console.print("[green]↓[/green]")
+                    _save_anchors_file(pl_id, pl_name, plan)
+                else:
+                    console.print("[red]Cannot move down[/red]")
+            except ValueError:
+                console.print("[red]Usage: dn <number>[/red]")
+
+        elif cmd == "show":
+            _print_anchor_plan(console, plan, descs)
+
+        elif cmd == "ai":
+            new_plan = _run_ai_anchor_generation(console, descs, pl_name, pl_id)
+            if new_plan:
+                plan = new_plan
+                console.print("[green]Anchors generated by AI — loaded into editor[/green]")
+                _print_anchor_plan(console, plan, descs)
+            else:
+                console.print("[yellow]AI generation returned no results[/yellow]")
+
+        elif cmd == "go":
+            _save_anchors_file(pl_id, pl_name, plan)
+            n_anchors = sum(1 for e in plan if e["type"] == "anchor")
+            if n_anchors == 0:
+                console.print("[yellow]No anchors in plan — nothing to sort.[/yellow]")
+                continue
+            ordered, action = _run_smart_sorting(console, db, descs, pl_id, pl_name, sp)
+            if action == "retry":
+                continue  # re-run sorting
+            elif action == "editor":
+                _print_anchor_plan(console, plan, descs)
+                continue
+            elif action == "home":
+                return "home"
+            elif action == "exit":
+                return "exit"
+
+        elif cmd == "home":
+            _save_anchors_file(pl_id, pl_name, plan)
+            console.print("[dim]Anchors saved — returning to playlists.[/dim]")
+            return "home"
+
+        elif cmd == "exit":
+            _save_anchors_file(pl_id, pl_name, plan)
+            console.print("[dim]Anchors saved — exiting.[/dim]")
+            return "exit"
+
+        else:
+            console.print("[dim]Unknown command. Available: a <#>, tracks, ph, del <#>, u <#>, dn <#>, show, ai, go, home, exit[/dim]")
 
 
 # ─── Global audio state ───────────────────────────────────────────────────────
@@ -1231,20 +2210,64 @@ def main():
                     break
 
                 elif action == "recover":
-                    # ── Recover from backup → move to Playlist editor (stub) ──
+                    # ── Recover from backup → go directly to anchor editor ──
                     bk_file = ANCHORS_DIR / f"backup_{pl_id}.json"
+                    if not bk_file.exists():
+                        console.print("[red]Backup file not found.[/red]")
+                        break
                     console.print(
                         f"\n[bold magenta]Recovering from backup:[/bold magenta] "
                         f"[dim]{bk_file.name}[/dim]"
                     )
-                    console.print(
-                        "[yellow]Playlist editor not yet implemented. "
-                        "Backup file is ready at:[/yellow] "
-                        f"[dim]{bk_file}[/dim]"
-                    )
-                    console.print(
-                        "[dim](Backup loaded — returning to playlist list.)[/dim]"
-                    )
+                    # Load backup as track list
+                    try:
+                        bk_data = json.loads(bk_file.read_text(encoding="utf-8"))
+                        bk_tracks = bk_data.get("tracks", [])
+                        if not bk_tracks:
+                            console.print("[yellow]Backup is empty — nothing to recover.[/yellow]")
+                            break
+                        # Build descriptions from backup tracks
+                        descs = []
+                        for t in bk_tracks:
+                            tid = t.get("id") or t.get("spotify_id", "")
+                            descs.append({
+                                "spotify_id": tid,
+                                "name": t.get("name", "?"),
+                                "artist": t.get("artist", "?"),
+                                "album": t.get("album", "?"),
+                                "description": "",
+                                "playlist": pl_name,
+                                "bpm": 0, "key": "", "camelot": "",
+                                "loudness_db": 0, "dynamic_range": 0,
+                                "harm_ratio": 0, "flatness": 0,
+                                "bass_pct": 0, "mid_pct": 0, "high_pct": 0,
+                                "onset_str": 0, "duration_ms": 0,
+                            })
+                        # Enrich from DB
+                        for d in descs:
+                            tid = d.get("spotify_id")
+                            if tid and tid in db:
+                                entry = db[tid]
+                                f = entry.get("features") or {}
+                                d["bpm"] = round(f.get("bpm", 0), 1)
+                                d["key"] = f"{f.get('chroma_key','')} {f.get('mode','')}".strip()
+                                d["camelot"] = f.get("camelot", "")
+                                d["loudness_db"] = round(f.get("rms_db", 0), 1)
+                                d["dynamic_range"] = round(f.get("dynamic_range", 0), 1)
+                                d["harm_ratio"] = round(f.get("harm_ratio", 0), 2)
+                                d["flatness"] = round(f.get("flatness", 0), 3)
+                                d["bass_pct"] = round(f.get("bass", 0)*100, 1)
+                                d["mid_pct"] = round(f.get("mid", 0)*100, 1)
+                                d["high_pct"] = round(f.get("high", 0)*100, 1)
+                                d["onset_str"] = round(f.get("onset_str", 0), 2)
+                                d["duration_ms"] = entry.get("duration_ms", 0)
+                        console.print(f"[green]✓ Loaded {len(descs)} tracks from backup[/green]")
+                        result = anchor_editor_loop(console, descs, db, pl_id, pl_name, sp)
+                        if result == "exit":
+                            raise KeyboardInterrupt()
+                        # if home, fall through to break inner loop
+                    except Exception as e:
+                        console.print(f"[red]Error loading backup: {e}[/red]")
                     break
 
                 elif action == "analyze":
@@ -1303,19 +2326,27 @@ def main():
                         console, db, tracks, pl_name, pl_id,
                     )
 
-                    # ── Step 2.2: Launch playlist editor (stub) ──────────────
+                    # ── Step 2.2: Launch anchor editor ───────────────────────
                     console.print(
                         f"\n[bold green]✓ {len(descs)} track descriptions ready[/bold green]"
                     )
-                    console.print(
-                        "[yellow]Playlist editor (editing descriptions + sorting) "
-                        "not yet implemented.[/yellow]"
-                    )
-                    console.print(
-                        f"[dim]Descriptions saved to anchors/descriptions_{pl_id}.json[/dim]"
-                    )
-                    # For now, return to playlist list after generating descriptions
-                    break
+                    # Check if anchors file exists and load it
+                    af = ANCHORS_DIR / f"anchors_{pl_id}.json"
+                    if af.exists():
+                        console.print(
+                            f"[green]✓ Existing anchor plan found: "
+                            f"[dim]{af.name}[/dim][/green]"
+                        )
+                    else:
+                        console.print("[dim]No existing anchor plan — starting fresh.[/dim]")
+
+                    result = anchor_editor_loop(console, descs, db, pl_id, pl_name, sp)
+                    if result == "exit":
+                        console.print("[yellow]Exiting...[/yellow]")
+                        # Break both loops — exit script
+                        raise KeyboardInterrupt()
+                    elif result == "home":
+                        break  # back to playlist selection
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Exiting...[/yellow]")
