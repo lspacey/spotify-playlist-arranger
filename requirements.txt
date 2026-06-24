@@ -1,0 +1,18 @@
+# Spotify Web API
+spotipy>=2.23.0
+
+# Capture audio — WASAPI loopback (Windows)
+# If pip install faile:you need Visual C++ Build Tools:
+# https://visualstudio.microsoft.com/visual-cpp-build-tools/
+pyaudiowpatch>=0.2.12
+
+# audio analysis
+librosa>=0.10.0
+numpy>=1.24.0
+soundfile>=0.12.0
+
+# termial UI
+rich>=13.0.0
+
+# optional: load .env file
+# python-dotenv>=1.0.0
