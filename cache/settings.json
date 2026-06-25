@@ -1,0 +1,23 @@
+{
+  "db_path": "e:\\Projects\\Spotify_playlists\\repository\\database\\tracks_db.sqlite",
+  "embeds_dir": "e:\\Projects\\Spotify_playlists\\repository\\embeddings",
+  "cache_dir": "e:\\Projects\\Spotify_playlists\\repository\\cache",
+  "anchors_dir": "e:\\Projects\\Spotify_playlists\\repository\\anchors",
+  "sa_iterations_multiplier": 500,
+  "sa_n_runs": 100,
+  "sa_T_start": 1.0,
+  "sa_T_end": 0.0001,
+  "w_mood": 0.35,
+  "w_bpm": 0.15,
+  "w_transition": 0.25,
+  "w_key": 0.15,
+  "w_energy": 0.1,
+  "artist_penalty": 0.18,
+  "album_penalty": 0.3,
+  "duration_tolerance": 0.01,
+  "llm_backend": "deepseek",
+  "ollama_model": "gemma4:26b",
+  "deepseek_model": "deepseek-v4-flash",
+  "mistral_model": "mistal-large-latest",
+  "selected_audio_device_index": 13
+}

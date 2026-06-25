@@ -22,6 +22,12 @@ rich>=13.0.0
 # Environment-variable loader
 python-dotenv>=1.0.0
 
+# Web UI framework
+nicegui>=1.4.0
+
+# Audio metadata (for local file support)
+mutagen>=1.47.0
+
 # MERT neural embeddings (for audio vector analysis)
 # ─── CPU-only (default) ────────────────────────────────────────────────────────
 torch>=2.0.0
@@ -48,3 +54,6 @@ accelerate>=0.20.0
 # LLM backends (pick at least one)
 ollama>=0.1.0        # local LLM  (free, offline)
 openai>=1.0.0        # for DeepSeek / Mistral APIs
+
+# HTTP requests (for Spotify API direct calls)
+requests>=2.28.0

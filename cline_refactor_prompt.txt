@@ -1,0 +1,394 @@
+You are an expert Python developer. Your task is to refactor a working monolithic script
+`playlist_analyzer.py` into a modular NiceGUI web application called `playlist_arranger`.
+The existing `playlist_analyzer.py`, `requirements.txt`, `README.md`, and
+`run_playlist_analyzer.cmd` are all available to you in the repository root.
+
+---
+
+## STEP 0 — Read and understand the source
+
+Before writing any code, fully read `playlist_analyzer.py`. Identify and map every
+function and constant to its target module (listed in Step 1). Do not invent new logic —
+reuse existing implementations verbatim, adapting only import paths and removing
+Rich/console-specific UI calls (replace them with return values or async callbacks).
+
+---
+
+## STEP 1 — Create the module structure
+
+Create the following package/file layout in the repository root:
+
+```
+playlist_arranger/
+├── main.py
+├── config.py
+├── database/
+│   ├── __init__.py
+│   ├── db.py
+│   └── migrate.py
+├── audio/
+│   ├── __init__.py
+│   ├── capture.py
+│   ├── features.py
+│   └── mert.py
+├── sources/
+│   ├── __init__.py
+│   ├── spotify_source.py
+│   └── local_source.py
+├── analysis/
+│   ├── __init__.py
+│   ├── worker.py
+│   └── session.py
+├── llm/
+│   ├── __init__.py
+│   ├── client.py
+│   ├── descriptions.py
+│   └── prompts.py
+├── sorting/
+│   ├── __init__.py
+│   ├── distance.py
+│   ├── solver.py
+│   └── anchors.py
+├── cache/
+│   ├── __init__.py
+│   └── store.py
+└── ui/
+    ├── __init__.py
+    ├── state.py
+    ├── pages/
+    │   ├── welcome.py
+    │   ├── playlist_source.py
+    │   ├── anchor_editor.py
+    │   ├── smart_sorting.py
+    │   ├── database_panel.py
+    │   └── settings_panel.py
+    └── components/
+        ├── track_table.py
+        └── progress.py
+```
+
+---
+
+## STEP 2 — Module responsibilities and source mapping
+
+### `config.py`
+- Load `.env` via `python-dotenv`
+- All constants from `playlist_analyzer.py`: `SAMPLE_RATE`, `MERT_SR`, `BUFFER_SECONDS`,
+  `SPOTIFY_SCOPE`, `REDIRECT_URI`, `KEY_NAMES`, `CAMELOT`, `CAMELOT_TO_IDX`, `WEIGHTS`,
+  `ARTIST_PENALTY`, `ALBUM_PENALTY`, `POLL_*`, `CHUNK`, `SEG_SECONDS`, etc.
+- All LLM env vars: `LLM_BACKEND`, `OLLAMA_MODEL`, `DEEPSEEK_MODEL`, `MISTRAL_MODEL` and
+  their API keys
+- Configurable paths (with defaults relative to the script directory):
+  - `DB_PATH`: `<root>/database/tracks_db.sqlite`
+  - `EMBEDS_DIR`: `<root>/embeddings/`
+  - `CACHE_DIR`: `<root>/cache/`
+- A `Settings` dataclass with all the above paths + algo params (SA iterations, weights,
+  duration tolerance), persisted to `cache/settings.json` via `atomic_write_json`
+- Audio device selection: `SELECTED_AUDIO_DEVICE_INDEX` (default: first WASAPI loopback)
+
+### `database/db.py`
+- SQLite backend replacing `tracks_db.json`
+- Schema: single table `tracks (spotify_id TEXT PRIMARY KEY, data TEXT NOT NULL)`
+- `PRAGMA journal_mode=WAL` and `PRAGMA synchronous=NORMAL` on every connection
+- Functions:
+  - `get_track(track_id: str) -> dict | None` — single lookup by primary key
+  - `save_track(track_id: str, entry: dict)` — atomic upsert
+  - `load_all() -> dict` — returns `{id: dict}` for full DB scan (used by sorting)
+  - `save_many(records: dict)` — bulk upsert via `executemany`
+  - `delete_track(track_id: str)`
+  - `vacuum()` — `EXECUTE VACUUM`
+  - `analyze()` — `EXECUTE ANALYZE`
+  - `track_count() -> int`
+- Use a `threading.Lock` (same pattern as `_db_lock` in source) for write operations
+
+### `database/migrate.py`
+- `migrate_from_json(json_path: pathlib.Path)` — reads `tracks_db.json`, calls
+  `db.save_many()`, prints migration stats
+
+### `audio/capture.py`
+- Port `list_loopback_devices()`, `start_audio_capture()`, `_make_callback()` verbatim
+- Expose `audio_deque`, `full_buf`, `start_buf`, `start_buf_done` as module-level state
+- Add `stop_capture(pa, stream)` helper
+
+### `audio/features.py`
+- Port `_extract_features()`, `_extract_features_full()`, `_trim_silence()`, `_to_mono()`
+  verbatim from source
+- No changes to logic
+
+### `audio/mert.py`
+- Port `load_mert()`, `_mert_embedding()` verbatim
+- Model/extractor as module-level singletons with a `threading.Lock`
+
+### `sources/spotify_source.py`
+- Port `init_spotify()`, `get_own_playlists()`, `get_playlist_tracks()`,
+  `play_track_on_device()`, `_spotify_request_with_retries()` verbatim
+- Add `reorder_playlist(sp, playlist_id, ordered_uris)` — correct implementation:
+  PUT first 100 URIs (full replace), then POST remaining chunks of 100 with
+  `time.sleep(0.3)` between each, all via `_spotify_request_with_retries`
+- Add `create_playlist(sp, name, uris)` — creates new playlist and adds tracks,
+  also uses `_spotify_request_with_retries` and `time.sleep(0.3)` between chunk POSTs
+- `is_configured() -> bool` — returns True if `SPOTIPY_CLIENT_ID` and
+  `SPOTIPY_CLIENT_SECRET` are set in env
+
+### `sources/local_source.py`
+- `scan_folder(folder: pathlib.Path) -> list[dict]` — scans for `.mp3` and `.flac` files
+- For each file, read ID3/FLAC tags using `mutagen` (add to requirements):
+  `name` (TIT2 or filename stem), `artist` (TPE1), `album` (TALB), `duration_ms`
+- `make_track_id(file_path: pathlib.Path) -> str` — compute `SHA1` of the first 512 KB
+  of file bytes; this is the stable unique track ID for local files
+- `make_playlist_id(folder: pathlib.Path) -> str` — `SHA1` of the canonical absolute
+  folder path string (UTF-8 encoded)
+- `load_m3u(m3u_path: pathlib.Path) -> list[pathlib.Path]` — parse M3U/M3U8 file,
+  return list of resolved file paths
+- `save_m3u(m3u_path: pathlib.Path, file_paths: list[pathlib.Path])` — write M3U8
+  (UTF-8, `#EXTM3U` header, `#EXTINF` lines with duration and title from tags)
+- `play_local_file(file_path: pathlib.Path)` — open file with `os.startfile()` on
+  Windows, `subprocess.run(['open', ...])` on macOS, `xdg-open` on Linux
+
+### `analysis/worker.py`
+- Port `save_track_worker()` verbatim, replacing `load_db()`/`save_db()` calls with
+  `db.save_track(tid, entry)`
+- Replace `np.save(str(emb_path), ...)` path construction to use `config.EMBEDS_DIR`
+
+### `analysis/session.py`
+- Port `AnalysisSession` class verbatim
+- Remove all `rich` console calls; replace with a `progress_cb(msg: str)` callback
+  parameter that the UI layer will bind to a NiceGUI progress element
+- Add `on_track_done(track_id: str)` callback for UI table refresh
+
+### `llm/client.py`
+- Port `_init_llm_client()`, `_llm_chat()` verbatim
+- Remove `console` parameter; use Python `logging` instead of `console.print`
+- Expose `llm_chat(system_msg, user_msg, temperature, max_tokens) -> str` as the
+  public API (initializes client lazily on first call)
+
+### `llm/descriptions.py`
+- Port `generate_track_descriptions()`, `_feat_summary()`, `_emb_stats()` verbatim
+- Replace `db` dict parameter with calls to `db.get_track(tid)` and `db.load_all()`
+- Replace `console.print` with `progress_cb(msg: str)` callback
+- Replace file I/O with calls to `cache.store` functions
+
+### `llm/prompts.py`
+- `DESCRIPTION_SYSTEM_PROMPT` (verbatim from source)
+- `ANCHOR_SYSTEM_PROMPT` (verbatim from source)
+- `PLAYLIST_STRUCTURES` list (verbatim from source)
+
+### `sorting/distance.py`
+- Port `_track_distance()`, `_cos_dist()`, `_camelot_distance()`, `_norm_text()`,
+  `_artist_tokens()`, `_load_embedding()`, `_build_distance_matrix()` verbatim
+- Fix the `np.array(ca[:n], np.float32)` bug -> `np.array(ca[:n], dtype=np.float32)`
+- Fix `_build_distance_matrix`: the `track_indices` parameter is unused; either remove
+  it or use `all_tracks[track_indices[i]]` correctly
+
+### `sorting/solver.py`
+- Port `_solve_atsp_with_anchors()`, `_nearest_neighbor_init()`, `_path_cost()` verbatim
+- Port `_run_smart_sorting()` — remove `console` and `sp` parameters; replace with
+  `progress_cb(msg: str)` callback and return only `(ordered_descs, cost)` tuple
+- `_SORTING_CACHE` as module-level dict for distance matrix caching
+
+### `sorting/anchors.py`
+- Port `_load_anchors_file()`, `_save_anchors_file()`, `_plan_from_track_list()`,
+  `_build_descriptions_block()`, `_parse_llm_anchor_list()`,
+  `_run_ai_anchor_generation()` verbatim
+- Replace `console` with `progress_cb` callbacks
+- `merge_adjacent_placeholders(plan: list) -> list` — NEW function: collapses two or
+  more consecutive `{"type": "placeholder"}` entries into a single one
+
+### `cache/store.py`
+- Port `_atomic_write_json()`, `_load_descriptions()`, `_save_descriptions()`,
+  `_backup_exists()` verbatim
+- All paths use `config.CACHE_DIR` instead of hardcoded `ANCHORS_DIR`
+- Add `load_backup(playlist_id) -> dict | None`
+- Add `save_result(playlist_id, playlist_name, ordered_descs, cost)`
+
+### `ui/state.py`
+- Global reactive NiceGUI state (use `nicegui.storage.user` or plain Python module-level
+  vars + `ui.refreshable` decorators):
+  - `current_playlist_id: str | None`
+  - `current_playlist_name: str | None`
+  - `current_playlist_source: str | None`  # "spotify" | "local"
+  - `current_tracks: list`
+  - `current_descs: list`
+  - `current_anchor_plan: list`
+  - `current_sorted_descs: list`
+  - `sp: spotipy.Spotify | None`
+  - `spotify_device_id: str | None`
+  - `audio_capture_active: bool`
+  - `settings: config.Settings`
+
+### `ui/pages/welcome.py`
+- Render introductory panel when no playlist source is selected
+- Content must describe the actual implemented functionality:
+  - Spotify and local file playlist support
+  - Audio capture and MERT neural embedding analysis
+  - LLM-powered track descriptions (Ollama / DeepSeek / Mistral)
+  - AI anchor selection with 10 playlist structure types
+  - Simulated Annealing smart sorting
+  - Export back to Spotify or local M3U playlist
+
+### `ui/pages/playlist_source.py`
+- Two sub-sections, toggled by source type:
+  **Spotify section** (only shown if `sources.spotify_source.is_configured()`):
+  - Connect button -> runs `init_spotify()`, stores `sp` in state
+  - Spotify device dropdown (populated from `sp.devices()`)
+  - Playlist table: name, track count, backup indicator (checkmark if backup exists in cache)
+  - On playlist select: fetch tracks, populate `state.current_tracks`, show track table
+  - Track table shows: #, name, artist, duration, DB status (In DB / reason if missing)
+  - "Analyze missing" button -> launches `AnalysisSession` in background thread,
+    progress shown via `ui/components/progress.py`
+  - "Recover from backup" button (visible if backup exists) -> loads backup tracks,
+    navigates to Anchor Selection
+
+  **Local files section**:
+  - Folder path input with browse button (`ui.upload` or path text input)
+  - On path submit: `local_source.scan_folder()`, show track table
+  - Track table same as Spotify section
+  - "Analyze missing" button -> same AnalysisSession flow but reads from local file
+    instead of Spotify playback (use `local_source.play_local_file()` for capture sync)
+
+### `ui/pages/anchor_editor.py`
+- Track list table (all tracks with descriptions, BPM, key, Camelot)
+- Current anchor plan displayed as ordered list with drag-to-reorder
+- Controls:
+  - "Add anchor" — click track row or enter track number
+  - "Add placeholder" — adds `{"type": "placeholder"}` at end
+  - "Remove" — remove item from plan
+  - "Move up / Move down" buttons
+  - Structure type selector (dropdown from `PLAYLIST_STRUCTURES`)
+  - LLM backend selector + "Generate with AI" button -> calls
+    `_run_ai_anchor_generation()` in background, populates plan
+  - "Save plan" button -> calls `merge_adjacent_placeholders()` then saves
+- Plan must never be fully empty: if user removes last item, automatically add one
+  placeholder
+- On save: merge adjacent placeholders before persisting
+
+### `ui/pages/smart_sorting.py`
+- SA parameters panel: iterations, T_start, T_end, N_RUNS (editable, with defaults)
+- "Run sorting" button -> runs `_run_smart_sorting()` in background thread with progress
+- Result displayed as reorderable track list: #, name, artist, BPM, Camelot, description
+- "Play track" button per row (Spotify or local)
+- "Run again" button
+- Save section:
+  - Spotify: "Save as new playlist" / "Update existing playlist" (with backup warning)
+  - Local: "Save as M3U" (file path input)
+- Display sorting cost and run statistics
+
+### `ui/pages/database_panel.py`
+- Opens as a `ui.dialog` overlay
+- Track browser: searchable table (by name/artist), paginated (50 per page)
+- Track detail view: shows full JSON (using `ui.code` or `ui.json`)
+- Edit button -> opens editable form for key fields
+- Delete button with confirmation dialog
+- "Import from tracks_db.json" button -> calls `migrate_from_json()`
+- Maintenance section: "VACUUM" button, "ANALYZE" button, track count display
+
+### `ui/pages/settings_panel.py`
+- Opens as a `ui.dialog` overlay
+- Path settings with validation:
+  - Database file path (default: `<script_dir>/database/tracks_db.sqlite`)
+  - Embeddings folder (default: `<script_dir>/embeddings/`)
+  - Cache folder (default: `<script_dir>/cache/`)
+- On path change: reload DB connection, refresh right panel
+- SA algorithm parameters: iterations multiplier, N_RUNS, T_start, T_end, weights
+  (MOOD, BPM, TRANSITION, KEY, ENERGY as sliders 0.0-1.0)
+- Audio device list: shows all WASAPI loopback + input devices, radio selection
+- LLM settings: backend selector, model name inputs
+- "Save settings" -> persists to `cache/settings.json`
+
+### `ui/components/track_table.py`
+- Reusable `TrackTable` NiceGUI component
+- Columns: #, name, artist, album, duration, BPM, key/Camelot, status badge
+- Row actions: play, add-to-anchors (optional, enabled by flag)
+- Color-coded status: green (in DB), red (missing), yellow (wrong duration)
+
+### `ui/components/progress.py`
+- `ProgressPanel` component: shows spinner + scrollable log output
+- `start(title)`, `log(msg)`, `done(msg)`, `error(msg)` methods
+- Used by analysis session, LLM description generation, SA sorting
+
+### `main.py`
+- NiceGUI app entry point
+- Left sidebar with navigation buttons:
+  - Theme toggle (light/dark) — `ui.dark_mode()`
+  - "Spotify" source button (disabled if `not is_configured()`)
+  - "Local Files" source button
+  - "Anchor Selection" button (disabled until playlist selected)
+  - "Smart Sorting" button (disabled until anchor plan non-empty)
+  - "Database" button -> opens database panel dialog
+  - "Settings" button -> opens settings panel dialog
+- Right panel: conditionally renders the active page component
+- On source switch: clear `state.current_playlist_*`, reset right panel
+- `ui.run(title='Playlist Arranger', port=8080, reload=False)`
+
+---
+
+## STEP 3 — Bug fixes to apply during porting
+
+Apply these fixes from the original `playlist_analyzer.py` while porting:
+
+1. `np.array(ca[:n], np.float32)` -> `np.array(ca[:n], dtype=np.float32)` in
+   `sorting/distance.py`
+2. `_build_distance_matrix`: use `all_tracks[track_indices[i]]` or remove unused param
+3. `_spotify_request_with_retries`: the `return None, "max retries exceeded"` line must
+   be at the `for` loop level (not inside `except`); fix indentation
+4. Backup write in `reorder_playlist` must use `atomic_write_json`, not `write_text`
+5. In `_run_smart_sorting` result saving: `"tracks"` list must be a proper list of dicts
+   `{"spotify_id": ..., "name": ..., ...}` — add the missing braces
+
+---
+
+## STEP 4 — Update project files
+
+### `requirements.txt`
+Add to the existing requirements:
+```
+nicegui>=1.4.0
+mutagen>=1.47.0
+```
+Keep all existing requirements (spotipy, librosa, pyaudiowpatch, transformers, torch,
+ollama, openai, python-dotenv, rich, numpy, requests).
+Remove `rich` only if it is not used anywhere in the new code (keep it if used in
+migrate.py or any CLI helper).
+
+### `README.md`
+Update with:
+- New project structure diagram
+- Setup instructions: `pip install -r requirements.txt`, configure `.env`
+- How to run: `python -m playlist_arranger.main` or `start.bat`
+- `.env` variables reference table (all Spotify, LLM, and path vars)
+- Brief description of each major feature
+
+### `start.bat`
+Based on `run_playlist_analyzer.cmd`, create `start.bat`:
+```bat
+@echo off
+cd /d "%~dp0"
+if exist ".venv\Scripts\activate.bat" call .venv\Scripts\activate.bat
+python -m playlist_arranger.main
+pause
+```
+
+---
+
+## STEP 5 — Self-verification checklist
+
+After writing all modules, verify the following before finishing:
+
+- [ ] Every function from `playlist_analyzer.py` is accounted for in a module
+- [ ] No function logic was rewritten — only adapted (import paths, console->callback)
+- [ ] `config.py` exports all constants used across modules; no module defines its own
+      duplicate constants
+- [ ] `db.py` uses `threading.Lock` for writes (mirrors `_db_lock` pattern)
+- [ ] `save_track_worker` in `analysis/worker.py` calls `db.save_track()`, not JSON file
+- [ ] `_run_smart_sorting` in `sorting/solver.py` does NOT import from `ui/` — pure logic
+- [ ] `main.py` is the only file that imports from `ui/`
+- [ ] All 5 bug fixes from Step 3 are applied
+- [ ] `start.bat` launches successfully with `python -m playlist_arranger.main`
+- [ ] `mutagen` is in `requirements.txt`
+- [ ] `nicegui` is in `requirements.txt`
+- [ ] No circular imports between modules
+- [ ] `merge_adjacent_placeholders()` is implemented in `sorting/anchors.py`
+- [ ] Local track ID uses `SHA1` of first 512 KB of file bytes
+- [ ] Local playlist ID uses `SHA1` of canonical folder path
+
+Do not generate placeholder stubs — implement every function fully.
