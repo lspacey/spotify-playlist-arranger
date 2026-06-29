@@ -70,176 +70,127 @@ def render_right_panel() -> None:
                 ui.label("No anchor plan. Create anchors first.").classes("text-yellow-500")
 
 
-def run_descriptions() -> None:
-    """Generate track descriptions in background thread."""
+async def run_descriptions() -> None:
+    """Generate track descriptions (async, logs progress to logger)."""
+    import asyncio
     progress = ProgressPanel("Generating Descriptions...")
     with _right_panel:
         progress.render()
-
-    def bg_task():
-        try:
-            from playlist_arranger.llm.descriptions import generate_track_descriptions
-            descs = generate_track_descriptions(
-                _state.current_tracks,
-                _state.current_playlist_name,
-                _state.current_playlist_id,
-                progress_cb=lambda msg: ui.timer(0, lambda m=msg: progress.log(m), once=True),
-            )
-            _state.current_descs[:] = descs
-            ui.timer(0.1, lambda: progress.done(f"Generated {len(descs)} descriptions"), once=True)
-            ui.timer(0.2, lambda: set_page("anchors"), once=True)
-        except Exception as e:
-            ui.timer(0.1, lambda: progress.error(str(e)), once=True)
-            logger.exception("Description generation failed")
-
-    threading.Thread(target=bg_task, daemon=True).start()
+    try:
+        from playlist_arranger.llm.descriptions import generate_track_descriptions
+        descs = await asyncio.to_thread(
+            generate_track_descriptions,
+            _state.current_tracks,
+            _state.current_playlist_name,
+            _state.current_playlist_id,
+            progress_cb=lambda msg: logger.info(msg),
+        )
+        _state.current_descs[:] = descs
+        progress.done(f"Generated {len(descs)} descriptions")
+        set_page("anchors")
+    except Exception as e:
+        progress.error(str(e))
+        logger.exception("Description generation failed")
 
 
-def run_analysis() -> None:
-    """Run analysis session for missing Spotify tracks."""
+async def run_analysis() -> None:
+    """Run analysis session for missing Spotify tracks (async, logs to logger)."""
+    import asyncio
     progress = ProgressPanel("Analyzing Tracks...")
     with _right_panel:
         progress.render()
+    try:
+        from playlist_arranger.database import db as _db
+        from playlist_arranger.analysis.session import AnalysisSession
 
-    def _log(msg):
-        ui.timer(0, lambda m=msg: progress.log(m), once=True)
+        to_analyze = [
+            t for t in _state.current_tracks
+            if _state.get_track_needs_analysis(t["id"], t.get("duration_ms"))
+        ]
+        if not to_analyze:
+            progress.done("All tracks already in DB")
+            return
 
-    def _done(msg="Analysis complete!"):
-        ui.timer(0.1, lambda m=msg: progress.done(m), once=True)
+        session = AnalysisSession(
+            sp=_state.sp,
+            tracks=to_analyze,
+            playlist_name=_state.current_playlist_name,
+            playlist_uri=f"spotify:playlist:{_state.current_playlist_id}",
+            spotify_device_id=_state.spotify_device_id,
+            progress_cb=lambda msg: logger.info(msg),
+            on_track_done=lambda tid: logger.info("Saved: %s", tid),
+        )
+        await asyncio.to_thread(session.run)
+        progress.done("Analysis complete!")
 
-    def _error(msg):
-        ui.timer(0.1, lambda m=msg: progress.error(m), once=True)
-
-    def bg_task():
-        try:
-            from playlist_arranger.database import db as _db
-            from playlist_arranger.analysis.session import AnalysisSession
-
-            to_analyze = [
-                t for t in _state.current_tracks
-                if _state.get_track_needs_analysis(t["id"], t.get("duration_ms"))
-            ]
-            if not to_analyze:
-                _done("All tracks already in DB")
-                return
-
-            session = AnalysisSession(
-                sp=_state.sp,
-                tracks=to_analyze,
-                playlist_name=_state.current_playlist_name,
-                playlist_uri=f"spotify:playlist:{_state.current_playlist_id}",
-                spotify_device_id=_state.spotify_device_id,
-                progress_cb=_log,
-                on_track_done=lambda tid: _log(f"Saved: {tid}"),
-            )
-            session.run()
-            _done("Analysis complete!")
-
-            # Check results
-            still = sum(
-                1 for t in _state.current_tracks
-                if _state.get_track_needs_analysis(t["id"], t.get("duration_ms"))
-            )
-            if still == 0:
-                _log(f"All {len(_state.current_tracks)} tracks now in DB!")
-            else:
-                _log(f"{still} track(s) still missing.")
-        except Exception as e:
-            _error(str(e))
-            logger.exception("Analysis failed")
-
-    threading.Thread(target=bg_task, daemon=True).start()
+        still = sum(
+            1 for t in _state.current_tracks
+            if _state.get_track_needs_analysis(t["id"], t.get("duration_ms"))
+        )
+        if still == 0:
+            logger.info("All %d tracks now in DB", len(_state.current_tracks))
+        else:
+            logger.info("%d track(s) still missing", still)
+    except Exception as e:
+        progress.error(str(e))
+        logger.exception("Analysis failed")
 
 
-def run_analysis_local() -> None:
-    """Run analysis for local files (play + capture)."""
+async def run_analysis_local() -> None:
+    """Fast direct analysis for local files — reads audio from disk, no playback needed."""
+    import asyncio
     progress = ProgressPanel("Analyzing Local Tracks...")
     with _right_panel:
         progress.render()
+    try:
+        from playlist_arranger.analysis.worker import save_track_worker
+        import pathlib
+        import numpy as np
 
-    def _log(msg):
-        ui.timer(0, lambda m=msg: progress.log(m), once=True)
-
-    def _done(msg="Analysis complete!"):
-        ui.timer(0.1, lambda m=msg: progress.done(m), once=True)
-
-    def _error(msg):
-        ui.timer(0.1, lambda m=msg: progress.error(m), once=True)
-
-    def bg_task():
         try:
-            from playlist_arranger.database import db as _db
-            from playlist_arranger.sources.local_source import play_local_file
-            from playlist_arranger.audio.capture import (
-                start_audio_capture,
-                stop_capture,
+            import librosa
+        except ImportError:
+            progress.error("librosa not installed")
+            return
+
+        to_analyze = [
+            t for t in _state.current_tracks
+            if _state.get_track_needs_analysis(t["id"], t.get("duration_ms"))
+        ]
+        if not to_analyze:
+            progress.done("All tracks already in DB")
+            return
+
+        logger.info("Fast-analyzing %d local file(s) from disk...", len(to_analyze))
+
+        for idx, track in enumerate(to_analyze, 1):
+            logger.info("[%d/%d] %s — %s", idx, len(to_analyze), track['name'], track['artist'])
+            fp = pathlib.Path(track.get("file_path", ""))
+            if not fp.exists():
+                logger.info("File not found — skipping")
+                continue
+
+            try:
+                # Load audio directly from disk (fast path — no playback/capture)
+                y, sr = librosa.load(str(fp), sr=None, mono=True)
+                logger.info("Loaded %s (%.1fs at %d Hz)", fp.name, len(y)/sr, sr)
+            except Exception as exc:
+                logger.warning("Could not read audio file: %s (%s)", fp.name, exc)
+                continue
+
+            save_track_worker(
+                track_info=track,
+                playlist_name=_state.current_playlist_name,
+                playlist_uri="",
+                y_full=y,
+                status_cb=lambda msg: logger.info(msg),
             )
-            from playlist_arranger.analysis.worker import save_track_worker
-            import pathlib
+            logger.info("Done")
 
-            to_analyze = [
-                t for t in _state.current_tracks
-                if _state.get_track_needs_analysis(t["id"], t.get("duration_ms"))
-            ]
-            if not to_analyze:
-                _done("All tracks already in DB")
-                return
-
-            # Start audio capture
-            s = _state.get_settings()
-            pa, stream, dev_name = start_audio_capture(
-                s.selected_audio_device_index
-            )
-            if stream is None:
-                _error("Audio capture unavailable")
-                return
-            _log(f"Audio: {dev_name}")
-
-            total = len(to_analyze)
-            for idx, track in enumerate(to_analyze, 1):
-                _log(f"[{idx}/{total}] {track['name']} — {track['artist']}")
-
-                # Play file
-                fp = pathlib.Path(track.get("file_path", ""))
-                if fp.exists():
-                    play_local_file(fp)
-                else:
-                    _log("File not found — skipping")
-                    continue
-
-                # Wait for track duration
-                dur_s = track["duration_ms"] / 1000
-                import time
-                time.sleep(dur_s + 1.0)
-
-                # Save
-                from playlist_arranger.audio.features import _to_mono
-                import numpy as np
-                from playlist_arranger.audio.capture import actual_sr, audio_deque, audio_lock
-
-                with audio_lock:
-                    y_live = _to_mono(np.array(audio_deque, dtype=np.float32), actual_sr)
-                y_final = y_live if len(y_live) > actual_sr * 2 else None
-
-                if y_final is not None:
-                    save_track_worker(
-                        track_info=track,
-                        playlist_name=_state.current_playlist_name,
-                        playlist_uri="",
-                        y_full=y_final,
-                        status_cb=_log,
-                    )
-                    _log("Done")
-                else:
-                    _log("Not enough audio — skipping")
-
-            stop_capture(pa, stream)
-            _done("Analysis complete!")
-        except Exception as e:
-            _error(str(e))
-            logger.exception("Local analysis failed")
-
-    threading.Thread(target=bg_task, daemon=True).start()
+        progress.done("Analysis complete!")
+    except Exception as e:
+        progress.error(str(e))
+        logger.exception("Local analysis failed")
 
 
 def recover_backup() -> None:
@@ -373,6 +324,20 @@ def main_page():
 def main():
     """Launch the Playlist Arranger web app."""
     logger.info("Starting Playlist Arranger on http://0.0.0.0:8082")
+
+    # Preload MERT model (non-blocking, loads in background)
+    def _preload_mert():
+        try:
+            from playlist_arranger.audio.mert import load_mert, HAS_MERT
+            if HAS_MERT:
+                logger.info("Preloading MERT model...")
+                load_mert(progress_cb=lambda msg: logger.info(msg))
+                logger.info("MERT model ready")
+        except Exception:
+            logger.exception("MERT preload failed")
+
+    threading.Thread(target=_preload_mert, daemon=True).start()
+
     ui.run(
         title="Playlist Arranger",
         host="0.0.0.0",

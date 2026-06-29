@@ -187,30 +187,28 @@ def build_anchor_editor():
             ui.notify("Anchor plan saved!", type="positive")
             refresh_plan()
 
-        def run_ai_anchors(struct_idx):
+        async def run_ai_anchors(struct_idx):
+            import asyncio
             progress = ui.column().classes("w-full mt-2")
             with progress:
                 log = ui.log().classes("w-full h-32")
-
-            def bg_task():
-                try:
-                    plan = _run_ai_anchor_generation(
-                        current_descs,
-                        current_playlist_name,
-                        current_playlist_id,
-                        struct_idx,
-                        progress_cb=lambda msg: log.push(msg),
-                    )
-                    if plan:
-                        current_anchor_plan[:] = plan
-                        _save_anchors_file(current_playlist_id, current_playlist_name, plan)
-                        ui.timer(0.1, lambda: ui.notify("AI anchors generated!", type="positive"), once=True)
-                        ui.timer(0.2, lambda: ui.run_javascript("location.reload()"), once=True)
-                    else:
-                        ui.timer(0.1, lambda: ui.notify("AI generation returned no results", type="warning"), once=True)
-                except Exception as e:
-                    ui.timer(0.1, lambda: ui.notify(f"AI anchor generation failed: {e}", type="negative"), once=True)
-
-            threading.Thread(target=bg_task, daemon=True).start()
+            try:
+                plan = await asyncio.to_thread(
+                    _run_ai_anchor_generation,
+                    current_descs,
+                    current_playlist_name,
+                    current_playlist_id,
+                    struct_idx,
+                    progress_cb=lambda msg: log.push(msg),
+                )
+                if plan:
+                    current_anchor_plan[:] = plan
+                    _save_anchors_file(current_playlist_id, current_playlist_name, plan)
+                    ui.notify("AI anchors generated!", type="positive")
+                    ui.run_javascript("location.reload()")
+                else:
+                    ui.notify("AI generation returned no results", type="warning")
+            except Exception as e:
+                ui.notify(f"AI anchor generation failed: {e}", type="negative")
 
     return container

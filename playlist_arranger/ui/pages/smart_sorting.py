@@ -50,40 +50,33 @@ def build_smart_sorting():
         progress_container = ui.column().classes("w-full")
 
         # Run button
-        def run_sorting():
+        async def run_sorting():
+            import asyncio
             progress_container.clear()
             with progress_container:
                 log = ui.log().classes("w-full h-48")
+            try:
+                from playlist_arranger.database import db as _db
+                db_dict = _db.load_all()
 
-            def bg_task():
-                try:
-                    from playlist_arranger.database import db as _db
-                    db_dict = _db.load_all()
+                def progress_cb(msg):
+                    log.push(msg)
 
-                    def progress_cb(msg):
-                        log.push(msg)
-
-                    ordered, cost = _run_smart_sorting(
-                        db_dict, current_descs,
-                        current_playlist_id, current_playlist_name,
-                        progress_cb=progress_cb,
-                    )
-                    current_sorted_descs[:] = ordered
-
-                    # Save result
-                    save_result(
-                        current_playlist_id, current_playlist_name,
-                        ordered, cost,
-                    )
-                    ui.timer(0.1, lambda: ui.notify(
-                        f"Sorting complete! Cost: {cost:.4f}",
-                        type="positive",
-                    ), once=True)
-                    ui.timer(0.2, lambda: ui.run_javascript("location.reload()"), once=True)
-                except Exception as e:
-                    ui.timer(0.1, lambda: ui.notify(f"Sorting failed: {e}", type="negative"), once=True)
-
-            threading.Thread(target=bg_task, daemon=True).start()
+                ordered, cost = await asyncio.to_thread(
+                    _run_smart_sorting,
+                    db_dict, current_descs,
+                    current_playlist_id, current_playlist_name,
+                    progress_cb=progress_cb,
+                )
+                current_sorted_descs[:] = ordered
+                save_result(
+                    current_playlist_id, current_playlist_name,
+                    ordered, cost,
+                )
+                ui.notify(f"Sorting complete! Cost: {cost:.4f}", type="positive")
+                ui.run_javascript("location.reload()")
+            except Exception as e:
+                ui.notify(f"Sorting failed: {e}", type="negative")
 
         ui.button("Run Sorting", on_click=run_sorting, color="green").classes("mb-4")
 

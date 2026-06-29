@@ -129,9 +129,9 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 SELECTED_AUDIO_DEVICE_INDEX = None
 
 # ─── Local music folder (default server path) ────────────────────────────────
-LOCAL_MUSIC_DIR = os.getenv("LOCAL_MUSIC_DIR", "").strip()
-if LOCAL_MUSIC_DIR:
-    LOCAL_MUSIC_DIR = str(BASE_DIR / LOCAL_MUSIC_DIR) if not pathlib.Path(LOCAL_MUSIC_DIR).is_absolute() else LOCAL_MUSIC_DIR
+LOCAL_MUSIC_DIR = os.getenv("LOCAL_MUSIC_DIR", str(BASE_DIR)).strip()
+if LOCAL_MUSIC_DIR and not pathlib.Path(LOCAL_MUSIC_DIR).is_absolute():
+    LOCAL_MUSIC_DIR = str(BASE_DIR / LOCAL_MUSIC_DIR)
 
 # ─── Duration tolerance ───────────────────────────────────────────────────────
 DURATION_TOLERANCE = 0.01  # 1%

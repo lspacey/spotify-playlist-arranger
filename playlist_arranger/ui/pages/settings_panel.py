@@ -8,6 +8,7 @@ from playlist_arranger.ui.state import get_settings
 from playlist_arranger.config import (
     save_settings,
     Settings,
+    BASE_DIR,
     DB_PATH_DEFAULT,
     EMBEDS_DIR_DEFAULT,
     CACHE_DIR_DEFAULT,
@@ -68,10 +69,15 @@ def build_settings_dialog():
                 label="Cache folder",
                 value=str(s.cache_dir),
             ).classes("w-full max-w-md")
+            local_music_input = ui.input(
+                label="Local music folder (default server path)",
+                value=str(s.local_music_dir),
+            ).classes("w-full max-w-md")
             ui.button("Reset to Defaults", on_click=lambda: (
                 db_input.set_value(str(DB_PATH_DEFAULT)),
                 embeds_input.set_value(str(EMBEDS_DIR_DEFAULT)),
                 cache_input.set_value(str(CACHE_DIR_DEFAULT)),
+                local_music_input.set_value(str(BASE_DIR)),
             )).classes("text-sm")
 
         # ─── SA algorithm parameters ────────────────────────────────────────
@@ -155,6 +161,7 @@ def build_settings_dialog():
             s_new.db_path = pathlib.Path(db_input.value)
             s_new.embeds_dir = pathlib.Path(embeds_input.value)
             s_new.cache_dir = pathlib.Path(cache_input.value)
+            s_new.local_music_dir = local_music_input.value
             s_new.sa_iterations_multiplier = int(sa_iter.value)
             s_new.sa_n_runs = int(sa_runs.value)
             s_new.sa_T_start = float(sa_T_start.value)

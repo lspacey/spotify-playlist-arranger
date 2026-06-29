@@ -22,29 +22,32 @@ def save_track_worker(
     y_full,
     y_start_snap=None,
     status_cb=None,
+    sr_override=None,
 ):
     """
     Extract features + MERT embedding, save to DB.
     track_info is a dict with 'id', 'name', 'artist', 'album', 'duration_ms'.
+    sr_override: if given, use this sample rate instead of audio.capture.actual_sr.
     """
+    sr = sr_override if sr_override is not None else actual_sr
     tid = track_info["id"]
     if status_cb:
         status_cb(f"Extracting features: {track_info['name'][:30]}...")
 
-    y_main = _trim_silence(y_full, sr=actual_sr, top_db=40)
-    full_feats = _extract_features_full(y_main, sr=actual_sr)
+    y_main = _trim_silence(y_full, sr=sr, top_db=40)
+    full_feats = _extract_features_full(y_main, sr=sr)
     y_start = (
         y_start_snap
-        if (y_start_snap is not None and len(y_start_snap) >= actual_sr)
-        else y_full[: actual_sr * config.SEG_SECONDS]
+        if (y_start_snap is not None and len(y_start_snap) >= sr)
+        else y_full[: sr * config.SEG_SECONDS]
     )
-    y_end = y_full[-actual_sr * config.SEG_SECONDS :]
-    start_feats = _extract_features(y_start, sr=actual_sr)
-    end_feats = _extract_features(y_end, sr=actual_sr)
+    y_end = y_full[-sr * config.SEG_SECONDS :]
+    start_feats = _extract_features(y_start, sr=sr)
+    end_feats = _extract_features(y_end, sr=sr)
 
     if status_cb:
         status_cb(f"Computing MERT embedding: {track_info['name'][:30]}...")
-    emb = _mert_embedding(y_main, sr=actual_sr)
+    emb = _mert_embedding(y_main, sr=sr)
     emb_file = None
     if emb is not None:
         emb_path = config.EMBEDS_DIR_DEFAULT / f"{tid}.npy"
