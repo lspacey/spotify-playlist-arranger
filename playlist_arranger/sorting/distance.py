@@ -7,7 +7,7 @@ from playlist_arranger.config import (
     ARTIST_PENALTY,
     ALBUM_PENALTY,
     CAMELOT_TO_IDX,
-    BASE_DIR,
+    HOME_DIR,
 )
 
 
@@ -126,7 +126,7 @@ def _load_embedding(tid: str, db: dict):
     ef = entry.get("embedding_file")
     if not ef:
         return None
-    p = BASE_DIR / ef
+    p = HOME_DIR / ef
     return np.load(str(p)).astype(np.float32) if p.exists() else None
 
 

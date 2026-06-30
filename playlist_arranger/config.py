@@ -7,20 +7,59 @@ import os
 import pathlib
 from dataclasses import dataclass, field
 
+# ─── Home directory (where .env lives) ─────────────────────────────────────────
+HOME_DIR = pathlib.Path(__file__).parent.parent.resolve()
+
 # ─── Load .env ────────────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv as _load_dotenv
 
-    _load_dotenv(pathlib.Path(__file__).parent.parent / ".env")
+    _load_dotenv(HOME_DIR / ".env")
 except ImportError:
     pass
 
-# ─── Base paths ────────────────────────────────────────────────────────────────
-BASE_DIR = pathlib.Path(__file__).parent.parent
-DB_PATH_DEFAULT = BASE_DIR / "database" / "tracks_db.sqlite"
-EMBEDS_DIR_DEFAULT = BASE_DIR / "embeddings"
-CACHE_DIR_DEFAULT = BASE_DIR / "cache"
-ANCHORS_DIR_DEFAULT = BASE_DIR / "anchors"
+# ─── Path resolution helpers ──────────────────────────────────────────────────
+def _to_portable(path: pathlib.Path) -> str:
+    """Convert absolute path to portable form for settings.json.
+
+    If the path is under HOME_DIR, represent it as a relative path
+    starting with ``.\\``. Otherwise return the absolute path as-is.
+    """
+    try:
+        rel = path.relative_to(HOME_DIR)
+        return ".\\" + str(rel)
+    except ValueError:
+        return str(path)
+
+
+def _resolve_path(raw: str | pathlib.Path) -> pathlib.Path:
+    """Resolve a path string from settings to an absolute Path.
+
+    - Absolute paths are kept as-is.
+    - Paths starting with ``.\\`` are resolved relative to HOME_DIR.
+    - Other relative paths are also resolved relative to HOME_DIR for safety.
+    """
+    if isinstance(raw, pathlib.Path):
+        # Already a Path – if it looks like a portable relative we still resolve
+        if raw.is_absolute():
+            return raw
+        return (HOME_DIR / str(raw).removeprefix(".\\")).resolve()
+    s = str(raw).strip()
+    if not s:
+        return HOME_DIR
+    if s.startswith(".\\"):
+        return (HOME_DIR / s[2:]).resolve()
+    p = pathlib.Path(s)
+    if p.is_absolute():
+        return p
+    return (HOME_DIR / s).resolve()
+
+
+# ─── Default paths (relative to HOME_DIR) ─────────────────────────────────────
+DB_PATH_DEFAULT = pathlib.Path(_resolve_path(".\\database\\tracks_db.sqlite"))
+EMBEDS_DIR_DEFAULT = pathlib.Path(_resolve_path(".\\embeddings"))
+CACHE_DIR_DEFAULT = pathlib.Path(_resolve_path(".\\cache"))
+ANCHORS_DIR_DEFAULT = pathlib.Path(_resolve_path(".\\anchors"))
 
 # Ensure dirs exist
 EMBEDS_DIR_DEFAULT.mkdir(exist_ok=True)
@@ -128,10 +167,15 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 # ─── Selected audio device index (default: first WASAPI loopback) ─────────────
 SELECTED_AUDIO_DEVICE_INDEX = None
 
-# ─── Local music folder (default server path) ────────────────────────────────
-LOCAL_MUSIC_DIR = os.getenv("LOCAL_MUSIC_DIR", str(BASE_DIR)).strip()
-if LOCAL_MUSIC_DIR and not pathlib.Path(LOCAL_MUSIC_DIR).is_absolute():
-    LOCAL_MUSIC_DIR = str(BASE_DIR / LOCAL_MUSIC_DIR)
+# ─── Local music folder ───────────────────────────────────────────────────────
+LOCAL_MUSIC_DEFAULT = ".\\local_music"
+_local_music_raw = os.getenv("LOCAL_MUSIC_DIR", "").strip()
+if _local_music_raw and not pathlib.Path(_local_music_raw).is_absolute():
+    LOCAL_MUSIC_DIR = str(_resolve_path(_local_music_raw))
+elif _local_music_raw:
+    LOCAL_MUSIC_DIR = _local_music_raw
+else:
+    LOCAL_MUSIC_DIR = str(_resolve_path(LOCAL_MUSIC_DEFAULT))
 
 # ─── Duration tolerance ───────────────────────────────────────────────────────
 DURATION_TOLERANCE = 0.01  # 1%
@@ -186,7 +230,9 @@ def load_settings() -> Settings:
             s = Settings()
             for key, val in data.items():
                 if key in ("db_path", "embeds_dir", "cache_dir", "anchors_dir"):
-                    val = pathlib.Path(val)
+                    val = _resolve_path(val)
+                elif key == "local_music_dir":
+                    val = str(_resolve_path(val))
                 if hasattr(s, key):
                     setattr(s, key, val)
             return s
@@ -196,11 +242,19 @@ def load_settings() -> Settings:
 
 
 def save_settings(settings: Settings) -> None:
-    """Persist settings to cache/settings.json atomically."""
+    """Persist settings to cache/settings.json atomically.
+
+    Paths are stored in portable form: ``.\\``-relative when under HOME_DIR,
+    absolute otherwise.
+    """
     from playlist_arranger.cache.store import atomic_write_json
 
-    data = {
-        k: str(v) if isinstance(v, pathlib.Path) else v
-        for k, v in settings.__dict__.items()
-    }
+    data = {}
+    for k, v in settings.__dict__.items():
+        if isinstance(v, pathlib.Path):
+            data[k] = _to_portable(v)
+        elif k == "local_music_dir" and v:
+            data[k] = _to_portable(pathlib.Path(v))
+        else:
+            data[k] = v
     atomic_write_json(CACHE_DIR_DEFAULT / "settings.json", data)

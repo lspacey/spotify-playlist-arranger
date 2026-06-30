@@ -26,7 +26,7 @@ def build_welcome() -> ui.column:
             for feat in features:
                 ui.label(feat).classes("text-base mb-1")
 
-        ui.label("Get started by selecting a source from the sidebar →").classes(
+        ui.label("← Get started by selecting a source from the sidebar").classes(
             "text-base text-gray-500 mt-6"
         )
     return container

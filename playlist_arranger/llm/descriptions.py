@@ -135,9 +135,9 @@ def generate_track_descriptions(tracks, pl_name, pl_id, progress_cb=None):
             # Build MERT embedding hint
             emb_hint = ""
             ef = db_entry.get("embedding_file")
-            if ef and (config.BASE_DIR / ef).exists():
+            if ef and (config.HOME_DIR / ef).exists():
                 try:
-                    emb = np.load(str(config.BASE_DIR / ef))
+                    emb = np.load(str(config.HOME_DIR / ef))
                     emb_hint = _emb_stats(emb)
                 except Exception:
                     pass

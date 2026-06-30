@@ -52,7 +52,7 @@ def save_track_worker(
     if emb is not None:
         emb_path = config.EMBEDS_DIR_DEFAULT / f"{tid}.npy"
         np.save(str(emb_path), np.array(emb, dtype=np.float32))
-        emb_file = str(emb_path.relative_to(config.BASE_DIR))
+        emb_file = str(emb_path.relative_to(config.HOME_DIR))
 
     entry = {
         "track_id": tid,

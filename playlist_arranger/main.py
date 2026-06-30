@@ -300,7 +300,7 @@ def main_page():
 
             # Database button -> opens dialog
             async def open_database():
-                with ui.dialog() as dialog, ui.card().classes("w-[800px] max-h-[90vh] overflow-y-auto"):
+                with ui.dialog() as dialog, ui.card().style("width: 1100px; max-width: 95vw; max-height: 90vh; overflow-y: auto"):
                     build_database_dialog()
                 dialog.open()
 
@@ -340,7 +340,7 @@ def main():
 
     ui.run(
         title="Playlist Arranger",
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=8082,
         reload=False,
         show=True,

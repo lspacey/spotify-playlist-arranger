@@ -68,7 +68,7 @@ def get_track_needs_analysis(track_id: str, real_duration_ms=None) -> str | None
     Uses DB directly.
     """
     from playlist_arranger.database import db as _db
-    from playlist_arranger.config import BASE_DIR, DURATION_TOLERANCE
+    from playlist_arranger.config import HOME_DIR, DURATION_TOLERANCE
 
     entry = _db.get_track(track_id)
     if not entry:
@@ -76,7 +76,7 @@ def get_track_needs_analysis(track_id: str, real_duration_ms=None) -> str | None
     emb_file = entry.get("embedding_file")
     if not emb_file:
         return "Missing file"
-    if not (BASE_DIR / emb_file).exists():
+    if not (HOME_DIR / emb_file).exists():
         return "Missing file"
     if real_duration_ms is not None:
         stored_ms = entry.get("duration_ms", 0)

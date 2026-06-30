@@ -1,6 +1,7 @@
 """Settings panel — paths, algorithm parameters, audio device, LLM config, env vars."""
 
 import os
+import pathlib
 
 from nicegui import ui
 
@@ -8,7 +9,7 @@ from playlist_arranger.ui.state import get_settings
 from playlist_arranger.config import (
     save_settings,
     Settings,
-    BASE_DIR,
+    HOME_DIR,
     DB_PATH_DEFAULT,
     EMBEDS_DIR_DEFAULT,
     CACHE_DIR_DEFAULT,
@@ -16,6 +17,9 @@ from playlist_arranger.config import (
     OLLAMA_MODEL,
     DEEPSEEK_MODEL,
     MISTRAL_MODEL,
+    _to_portable,
+    _resolve_path,
+    LOCAL_MUSIC_DEFAULT,
 )
 from playlist_arranger.audio.capture import list_loopback_devices
 from playlist_arranger.database.db import reload_db as _reload_db
@@ -57,27 +61,28 @@ def build_settings_dialog():
         # ─── Path settings ──────────────────────────────────────────────────
         with ui.card().classes("w-full"):
             ui.label("Paths").classes("text-lg font-bold mb-2")
+            ui.label(f"Working directory: {HOME_DIR}").classes("text-xs text-gray-500 dark:text-gray-400 mb-2")
             db_input = ui.input(
                 label="Database file path",
-                value=str(s.db_path),
+                value=_to_portable(s.db_path),
             ).classes("w-full max-w-md")
             embeds_input = ui.input(
                 label="Embeddings folder",
-                value=str(s.embeds_dir),
+                value=_to_portable(s.embeds_dir),
             ).classes("w-full max-w-md")
             cache_input = ui.input(
                 label="Cache folder",
-                value=str(s.cache_dir),
+                value=_to_portable(s.cache_dir),
             ).classes("w-full max-w-md")
             local_music_input = ui.input(
-                label="Local music folder (default server path)",
-                value=str(s.local_music_dir),
+                label="Local music folder",
+                value=_to_portable(pathlib.Path(s.local_music_dir)) if s.local_music_dir else LOCAL_MUSIC_DEFAULT,
             ).classes("w-full max-w-md")
             ui.button("Reset to Defaults", on_click=lambda: (
-                db_input.set_value(str(DB_PATH_DEFAULT)),
-                embeds_input.set_value(str(EMBEDS_DIR_DEFAULT)),
-                cache_input.set_value(str(CACHE_DIR_DEFAULT)),
-                local_music_input.set_value(str(BASE_DIR)),
+                db_input.set_value(_to_portable(DB_PATH_DEFAULT)),
+                embeds_input.set_value(_to_portable(EMBEDS_DIR_DEFAULT)),
+                cache_input.set_value(_to_portable(CACHE_DIR_DEFAULT)),
+                local_music_input.set_value(LOCAL_MUSIC_DEFAULT),
             )).classes("text-sm")
 
         # ─── SA algorithm parameters ────────────────────────────────────────
@@ -156,12 +161,11 @@ def build_settings_dialog():
 
         # ─── Save button ────────────────────────────────────────────────────
         async def do_save():
-            import pathlib
             s_new = Settings()
-            s_new.db_path = pathlib.Path(db_input.value)
-            s_new.embeds_dir = pathlib.Path(embeds_input.value)
-            s_new.cache_dir = pathlib.Path(cache_input.value)
-            s_new.local_music_dir = local_music_input.value
+            s_new.db_path = _resolve_path(db_input.value)
+            s_new.embeds_dir = _resolve_path(embeds_input.value)
+            s_new.cache_dir = _resolve_path(cache_input.value)
+            s_new.local_music_dir = str(_resolve_path(local_music_input.value))
             s_new.sa_iterations_multiplier = int(sa_iter.value)
             s_new.sa_n_runs = int(sa_runs.value)
             s_new.sa_T_start = float(sa_T_start.value)
