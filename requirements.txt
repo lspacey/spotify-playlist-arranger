@@ -1,59 +1,94 @@
-#    python -m venv venv
-#    venv\Scripts\activate
-#    pip install -r requirements.txt
-#    pip list
+# Playlist Arranger — dependency requirements
+# All versions pinned exactly (==) for reproducible builds.
+#
+#   python -m venv venv
+#   venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# ---------------------------------------------------------------------------
+# MERT constraint: transformers MUST stay below 4.44.0.
+# transformers >= 4.44.0 removed `conv_pos_batch_norm` from Wav2Vec2Config
+# (renamed internally), causing MERT-v1-95M to fail with:
+#   AttributeError: 'MERTConfig' object has no attribute 'conv_pos_batch_norm'
+# See: https://huggingface.co/m-a-p/MERT-v1-95M/discussions/4
+# ---------------------------------------------------------------------------
 
 # Spotify Web API
-spotipy>=2.23.0
+spotipy==2.26.0
 
 # Capture audio – WASAPI loopback (Windows)
 # If `pip install pyaudiowpatch` fails, you need Visual C++ Build Tools:
 # https://visualstudio.microsoft.com/visual-cpp-build-tools/
-pyaudiowpatch>=0.2.12
+pyaudiowpatch==0.2.12.8
 
 # Audio analysis
-librosa>=0.10.0
-numpy>=1.24.0
-soundfile>=0.12.0
+librosa==0.11.0
+numpy==2.4.6
+soundfile==0.14.0
 
 # Terminal UI
-rich>=13.0.0
+rich==15.0.0
 
 # Environment-variable loader
-python-dotenv>=1.0.0
+python-dotenv==1.2.2
 
 # Web UI framework
-nicegui>=1.4.0
+nicegui==3.13.0
 
 # Audio metadata (for local file support)
-mutagen>=1.47.0
+mutagen==1.48.1
 
 # MERT neural embeddings (for audio vector analysis)
-# ─── CPU-only (default) ────────────────────────────────────────────────────────
-torch>=2.0.0
-torchaudio>=2.0.0
-transformers>=4.30.0,<4.49
-accelerate>=0.20.0
+# ─── CPU-only (default) — torch + torchaudio as matched pair ───────────────────
+#   These versions must be upgraded together. Check PyTorch's compatibility
+#   matrix at: https://github.com/pytorch/pytorch/wiki/PyTorch-Versions
+#
+#   On machines WITHOUT an NVIDIA GPU, install the CPU builds:
+#     pip install torch==2.12.1 torchaudio==2.11.0
+torch==2.12.1
 
-# ─── CUDA acceleration (Windows / Linux) ───────────────────────────────────────
-#   Check your CUDA version:  nvidia-smi
-#   Visit https://pytorch.org/get-started/locally/ for the correct index URL.
+# torchaudio is a transitive dependency of torch — auto-installed on the same
+# CUDA index with the correct matched version. No separate pin needed.
+# torchaudio 2.11.0 is the correct matched pair for torch 2.12.1+cu130
+# (no 2.12.x torchaudio exists on the cu130 index).
+
+#   Note: torchvision is NOT required for this project and should not be installed.
+
+# ─── Transformers pinned for MERT compatibility (see constraint note above) ─────
+transformers==4.38.0
+
+# accelerate is a transitive dependency of transformers — auto-installed.
+# No separate pin needed.
+
+# ─── CUDA acceleration (Windows / Linux) — OPTIONAL ────────────────────────────
+#   RTX 5080 / 50-series Blackwell GPUs (sm_120) require CUDA >= 12.8.
+#   PyTorch >= 2.7.0 + cu128/cu130 wheels include sm_120 kernels.
+#   This project is confirmed working with torch 2.12.1+cu130 (CUDA 13.0).
 #
-#   Example – CUDA 12.1:
-#     pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
-#     pip install transformers>=4.30.0,<4.49 accelerate>=0.20.0
+#   To switch from CPU to CUDA on RTX 5080:
 #
-#   Example – CUDA 11.8:
-#     pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
-#     pip install transformers>=4.30.0,<4.49 accelerate>=0.20.0
+#     1. Uninstall CPU torch:
+#        pip uninstall torch torchaudio -y
 #
-#   Verify:  python -c "import torch; print(torch.cuda.is_available())"
-#   If False →  pip uninstall torch torchvision
-#               pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#     2. Install CUDA-enabled matched pair from the OFFICIAL PyTorch index:
+#        pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+#        → This installs torch 2.12.1+cu130 + torchaudio 2.11.0+cu130
+#
+#     3. Verify (expect: True, RTX 5080, sm_120 in arch list):
+#        python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_arch_list())"
+#
+#   For OLDER GPUs (RTX 20/30/40 series) use CUDA 12.1 wheels:
+#     pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+#   IMPORTANT: Only install PyTorch from the OFFICIAL index at download.pytorch.org.
+#   Do NOT install any third-party packages claiming to "fix" RTX 5080 compatibility.
+#
+#   The mert.py module auto-detects GPU availability and moves the model
+#   to CUDA when available. No config changes needed.
 
 # LLM backends (pick at least one)
-ollama>=0.1.0        # local LLM  (free, offline)
-openai>=1.0.0        # for DeepSeek / Mistral APIs
+ollama==0.6.2        # local LLM  (free, offline)
+openai==2.44.0       # for DeepSeek / Mistral APIs
 
 # HTTP requests (for Spotify API direct calls)
-requests>=2.28.0
+requests==2.34.2

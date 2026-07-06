@@ -31,9 +31,10 @@ embeddings/**/*.npy
 # User-specific local settings
 cache/settings.json
 
-# Application logs
+# Application logs and docs
 logs/
 *.log
+docs/
 
 # IDE and OS noise
 .vscode/

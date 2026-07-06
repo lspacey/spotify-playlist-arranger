@@ -41,12 +41,20 @@ git clone https://github.com/lspacey/spotify-playlist-arranger.git
 cd spotify-playlist-arranger
 ```
 
-### 2. Create a virtual environment
+### 2. Create a virtual environment (recommended)
 
 ```bash
 python -m venv venv
-venv\Scripts\activate
 ```
+
+Activate it:
+- **Windows (Command Prompt):** `venv\Scripts\activate.bat`
+- **Windows (PowerShell):** `venv\Scripts\Activate.ps1`
+- **macOS / Linux:** `source venv/bin/activate`
+
+> Your terminal prompt should now show `(venv)` at the beginning, indicating you are inside the virtual environment. All `pip install` and `python` commands from this point should be run inside the venv.
+
+To deactivate when done: `deactivate`
 
 ### 3. Install dependencies
 
@@ -54,7 +62,21 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> ⚠️ If you have an NVIDIA GPU and want CUDA acceleration, install PyTorch with the appropriate CUDA index. See the comments in `requirements.txt` for examples.
+> ⚠️ If `pyaudiowpatch` fails to install, you need [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+
+For machines with an NVIDIA GPU (especially RTX 50-series / Blackwell), replace the CPU PyTorch with the CUDA-enabled build **after** running the command above:
+
+| GPU Series | PyTorch Install Command |
+|---|---|
+| **RTX 5080 / 50-series (Blackwell)** | `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130` |
+| RTX 20/30/40 series | `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121` |
+
+Verify CUDA is active with:
+```bash
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_arch_list())"
+```
+> Should show `True`, `NVIDIA GeForce RTX 5080`, and `sm_120` in the arch list.
+> See `requirements.txt` for complete GPU setup details.
 
 ### 4. Set up your Spotify credentials
 
@@ -96,7 +118,7 @@ Double‑click **`start.bat`**, or run from the terminal:
 python -m playlist_arranger.main
 ```
 
-The web app opens at `http://127.0.0.1:8080`.
+The web app opens at `http://127.0.0.1:8082`.
 
 ### Workflow
 
