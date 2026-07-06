@@ -20,7 +20,14 @@ from playlist_arranger.sorting.anchors import (
 
 
 def build_anchor_editor():
-    """Build anchor editor page."""
+    """Build anchor editor page.
+    
+    IMPORTANT — Table refresh contract (NiceGUI 3.x compatibility):
+    Tables on this page are rebuilt via full page rebuild (clear+render_right_panel).
+    Do NOT mutate table `rows` lists in-place (e.g. .append(), .remove(),
+    `rows[i] = ...`) because NiceGUI 3.x will NOT detect in-place list mutations.
+    To update reactively, explicitly reassign `track_table.rows = new_rows`.
+    """
     # Load existing plan
     global current_anchor_plan
     if current_playlist_id and not current_anchor_plan:

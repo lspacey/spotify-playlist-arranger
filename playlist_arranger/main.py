@@ -9,7 +9,9 @@ import sys
 import threading
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+from playlist_arranger.config import setup_logging
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -45,9 +47,15 @@ def set_page(page_name: str) -> None:
 def render_right_panel() -> None:
     """Render the current page content in the right panel."""
     global _right_panel
-    if _right_panel:
-        _right_panel.clear()
-    else:
+    try:
+        if _right_panel:
+            _right_panel.clear()
+    except RuntimeError:
+        # Client disconnected or element stale — recreate later
+        logger.warning("Right panel client stale, will recreate on next render")
+        return
+
+    if _right_panel is None:
         return
 
     with _right_panel:

@@ -5,7 +5,9 @@ Loads .env, defines all constants, Settings dataclass.
 
 import os
 import pathlib
+import logging
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 
 # ─── Home directory (where .env lives) ─────────────────────────────────────────
 HOME_DIR = pathlib.Path(__file__).parent.parent.resolve()
@@ -179,6 +181,37 @@ else:
 
 # ─── Duration tolerance ───────────────────────────────────────────────────────
 DURATION_TOLERANCE = 0.01  # 1%
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip()
+LOG_FILE = HOME_DIR / "logs" / "app.log"
+
+
+def setup_logging() -> None:
+    """Configure RotatingFileHandler + console for playlist_arranger namespace."""
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    root_logger = logging.getLogger("playlist_arranger")
+    root_logger.setLevel(logging.DEBUG)  # handlers filter individually
+
+    # Console handler — respects LOG_LEVEL
+    console = logging.StreamHandler()
+    console.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    console.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    root_logger.addHandler(console)
+
+    # Rotating file handler — always DEBUG for maximum detail
+    file_handler = RotatingFileHandler(
+        str(LOG_FILE), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s (%(filename)s:%(lineno)d): %(message)s",
+    ))
+    root_logger.addHandler(file_handler)
 
 
 # ─── Settings dataclass ───────────────────────────────────────────────────────

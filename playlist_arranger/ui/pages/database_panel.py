@@ -2,8 +2,11 @@
 
 import asyncio
 import json
+import logging
 
 from nicegui import ui
+
+logger = logging.getLogger(__name__)
 
 from playlist_arranger.config import _resolve_path, load_settings
 from playlist_arranger.database import db as _db
@@ -71,6 +74,14 @@ def build_database_dialog():
         track_container = ui.column().classes("w-full")
 
         def refresh_tracks():
+            """Rebuild the track browser table with current DB state.
+            
+            IMPORTANT — Table refresh contract (NiceGUI 3.x compatibility):
+            This table is rebuilt via clear()+rebuild on every refresh. Do NOT
+            mutate `table_rows` in-place after table creation (e.g. .append(),
+            .remove()) because NiceGUI 3.x will NOT detect in-place list mutations.
+            To update reactively, explicitly reassign `track_table.rows = new_rows`.
+            """
             search = (search_input.value or "").lower().strip()
             all_data = _db.load_all()
             rows = []
@@ -118,10 +129,18 @@ def build_database_dialog():
                     })
 
                 def on_row_click(e):
-                    # NiceGUI table rowClick: e.args[0] is the clicked row dict
-                    row_data = e.args[0]
-                    if isinstance(row_data, dict) and "id" in row_data:
+                    # NiceGUI table rowClick: e.args[1] is the row data dict (e.args[0] is JS event)
+                    args = e.args
+                    row_data = None
+                    if isinstance(args, list) and len(args) > 1 and isinstance(args[1], dict):
+                        row_data = args[1]
+                    elif isinstance(args, list) and len(args) > 0 and isinstance(args[0], dict) and "id" in args[0]:
+                        row_data = args[0]
+                    if row_data and "id" in row_data:
+                        logger.info("Showing detail for track ID: %s", row_data["id"][:16])
                         show_track_detail(row_data["id"])
+                    else:
+                        logger.info("DB row clicked but could not extract ID from args: %s", str(args)[:120])
 
                 track_table = ui.table(
                     columns=cols, rows=table_rows, row_key="name", pagination=50,
@@ -159,14 +178,27 @@ def build_database_dialog():
                     ui.code(json.dumps(entry, ensure_ascii=False, indent=2), language="json").classes("w-full max-h-64 overflow-y-auto")
 
                 with ui.row().classes("gap-2 mt-2"):
-                    async def delete_track():
-                        _db.delete_track(tid)
-                        ui.notify("Track deleted", type="warning")
-                        detail_container.clear()
-                        refresh_tracks()
-                        count_label.set_text(f"Tracks: {_db.track_count()}")
+                    async def delete_track(_tid=tid):
+                        # Confirmation dialog
+                        result = await ui.run_javascript(f"confirm('Are you sure you want to delete this track?\\n\\nID: {_tid[:16]}...')", respond=True)
+                        if result:
+                            _db.delete_track(_tid)
+                            ui.notify("Track deleted", type="warning")
+                            detail_container.clear()
+                            refresh_tracks()
+                            count_label.set_text(f"Tracks: {_db.track_count()}")
 
-                    ui.button("Delete Track", on_click=delete_track, color="red").classes("text-sm")
+                    ui.button("🗑 Delete Track", on_click=delete_track, color="red").classes("text-sm")
+
+                    def copy_track_json(_tid=tid):
+                        entry = _db.get_track(_tid)
+                        if entry:
+                            js_data = json.dumps(entry, ensure_ascii=False)
+                            escaped = js_data.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "\\r")
+                            ui.run_javascript(f"navigator.clipboard.writeText('{escaped}').then(function(){{}}).catch(function(){{}})")
+                            ui.notify("Track JSON copied to clipboard", type="info")
+
+                    ui.button("📋 Copy JSON", on_click=copy_track_json, color="secondary").classes("text-sm")
 
         # Show all tracks immediately on open
         refresh_tracks()

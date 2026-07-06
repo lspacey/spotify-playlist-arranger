@@ -18,7 +18,15 @@ class TrackTable:
         self.container = None
 
     def render(self) -> ui.element:
-        """Create and return the track table UI element."""
+        """Create and return the track table UI element.
+
+        IMPORTANT — Table refresh contract (NiceGUI 3.x compatibility):
+        This table must be fully rebuilt (call render() again) when underlying data
+        changes. Do NOT mutate self.rows in-place (e.g. .append(), .remove(),
+        `rows[i] = ...`) as NiceGUI 3.x will NOT detect in-place list mutations.
+        To update rows reactively without a full rebuild, explicitly reassign
+        `self.table.rows = new_rows` after mutation.
+        """
         with ui.column().classes("w-full") as self.container:
             columns = [
                 {"name": "idx", "label": "#", "field": "idx", "sortable": True},

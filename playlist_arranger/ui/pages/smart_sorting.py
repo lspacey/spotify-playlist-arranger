@@ -19,7 +19,14 @@ from playlist_arranger.cache.store import save_result
 
 
 def build_smart_sorting():
-    """Build smart sorting page."""
+    """Build smart sorting page.
+    
+    IMPORTANT — Table refresh contract (NiceGUI 3.x compatibility):
+    The sorted results table is rebuilt via full page rebuild (clear+render_right_panel).
+    Do NOT mutate table `rows` lists in-place (e.g. .append(), .remove(),
+    `rows[i] = ...`) because NiceGUI 3.x will NOT detect in-place list mutations.
+    To update reactively, explicitly reassign `sorted_table.rows = new_rows`.
+    """
     container = ui.column().classes("w-full gap-4")
 
     with container:
