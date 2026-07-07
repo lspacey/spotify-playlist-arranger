@@ -39,6 +39,19 @@ _btn_listen = None
 _btn_analyze = None
 _np_card_container = None
 
+# Playlist expansion references for auto-expand (keyed by playlist_id)
+# Each value is (expansion_element, content_column)
+_playlist_expansions = {}
+
+# Set of playlist IDs that were auto-expanded (not manually by user)
+_auto_expanded_playlist_ids = set()
+
+# Captured client context for background thread UI operations
+_page_client = None
+
+# Last notified playlist_id for change detection
+_last_notified_playlist_id = None
+
 # ─── JS highlighting helpers ──────────────────────────────────────────────────
 
 _HIGHLIGHT_JS_INJECTED = False
@@ -78,22 +91,28 @@ def _inject_highlight_js():
         if (!plid) return;
         // Find playlist expansion header by data-pl-id
         const exp = document.querySelector(`[data-pl-id="${plid}"]`);
+        console.log('[highlight] playlist selector:', `[data-pl-id="${plid}"]`, 'found:', !!exp);
         if (exp) {
             exp.classList.add('pa-playlist-highlight');
             exp.style.backgroundColor = '#fef3c7'; // amber-100
+            console.log('[highlight] playlist header highlighted');
         }
         if (!tid) return;
         // Find track row by data-track-id
         const row = document.querySelector(`[data-track-id="${tid}"]`);
+        console.log('[highlight] track selector:', `[data-track-id="${tid}"]`, 'found:', !!row);
         if (row) {
             row.classList.add('pa-track-highlight');
             row.style.backgroundColor = '#dbeafe'; // blue-100
+            console.log('[highlight] track row highlighted');
         }
     };
     window._pa_checkExpandHighlight = function(plid) {
+        console.log('[checkExpandHighlight] called for plid:', plid, 'playing:', window._pa_playing_playlist_id, 'track:', window._pa_playing_track_id);
         if (plid === window._pa_playing_playlist_id && window._pa_playing_track_id) {
             setTimeout(() => {
                 const row = document.querySelector(`[data-track-id="${window._pa_playing_track_id}"]`);
+                console.log('[checkExpandHighlight] row found:', !!row);
                 if (row) {
                     row.classList.add('pa-track-highlight');
                     row.style.backgroundColor = '#dbeafe';
@@ -103,13 +122,93 @@ def _inject_highlight_js():
     };
     """)
 
+def _auto_expand_playlist(playlist_id: str, track_id: str):
+    """Auto-expand a collapsed playlist, loading its tracks and rendering table."""
+    entry = _playlist_expansions.get(playlist_id)
+    if entry is None:
+        return
+    exp, content_col = entry
+    if not exp.value:
+        # Load tracks and render before expanding
+        try:
+            tracks = _load_cached_playlist_tracks(playlist_id)
+            _state.current_playlist_id = playlist_id
+            _state.current_playlist_name = ""  # will be set by render
+            _state.current_playlist_source = "spotify"
+            _state.current_tracks[:] = tracks
+            content_col.clear()
+            with content_col:
+                _show_track_compact_table(
+                    tracks, playlist_id,
+                    _state.current_playlist_name, _render_playlists_set_page_cb,
+                )
+            exp.value = True
+            _auto_expanded_playlist_ids.add(playlist_id)
+            logger.debug(
+                "Auto-expand: track %s loaded %d tracks in playlist %s",
+                track_id[:8] if track_id else "?", len(tracks),
+                playlist_id[:8] if playlist_id else "?",
+            )
+        except Exception:
+            logger.exception("Auto-expand failed to load tracks for playlist %s", playlist_id[:8] if playlist_id else "?")
+
+
+def _collapse_playlist(playlist_id: str):
+    """Collapse a previously auto-expanded playlist and remove highlight."""
+    if playlist_id not in _auto_expanded_playlist_ids:
+        return
+    entry = _playlist_expansions.get(playlist_id)
+    if entry is None:
+        return
+    exp, _content_col = entry
+    exp.value = False
+    _auto_expanded_playlist_ids.discard(playlist_id)
+    # Clear JS highlight on the old playlist header
+    ui.run_javascript(f"window._pa_highlightPlayingTrack('', '')")
+    logger.debug("Collapsed playlist %s (was auto-expanded)", playlist_id[:8] if playlist_id else "?")
+
+
 def _notify_playing_track(playlist_id: str, track_id: str):
-    """Call JS to highlight the currently playing track in the playlist."""
-    _inject_highlight_js()
+    """Highlight and auto-expand from background thread via captured client context.
+    
+    Uses `with _page_client:` to enter the NiceGUI client slot from a background
+    thread. Handles playlist context changes: collapses old auto-expanded
+    playlist, expands new one, highlights current track row.
+    """
+    global _page_client, _last_notified_playlist_id
     plid = playlist_id or ""
     tid = track_id or ""
-    ui.run_javascript(f"window._pa_highlightPlayingTrack('{plid}', '{tid}')")
-    logger.debug("Highlight JS: pl=%s track=%s", plid[:8] if plid else '', tid[:8] if tid else '')
+
+    if _page_client is None:
+        logger.warning("No page client captured — skipping highlight/auto-expand")
+        return
+
+    # Detect playlist context change
+    playlist_changed = plid and plid != _last_notified_playlist_id
+
+    try:
+        with _page_client:
+            # Handle playlist context change
+            if playlist_changed:
+                if _last_notified_playlist_id:
+                    _collapse_playlist(_last_notified_playlist_id)
+                    logger.debug(
+                        "Playlist changed: collapsing %s (auto-expanded), expanding %s",
+                        _last_notified_playlist_id[:8], plid[:8],
+                    )
+                _last_notified_playlist_id = plid
+
+            # Inject highlight JS once, then call with current track
+            _inject_highlight_js()
+            logger.debug("Highlight JS injecting: pl=%s track=%s", plid[:8] if plid else '', tid[:8] if tid else '')
+            ui.run_javascript(f"window._pa_highlightPlayingTrack('{plid}', '{tid}')")
+            logger.debug("Highlight JS completed: pl=%s track=%s", plid[:8] if plid else '', tid[:8] if tid else '')
+
+            # Auto-expand (loads tracks + renders table + highlights row)
+            if plid:
+                _auto_expand_playlist(plid, tid)
+    except Exception:
+        logger.exception("_notify_playing_track() failed")
 
 
 # ─── Card logic: background polling thread ────────────────────────────────────
@@ -132,6 +231,7 @@ def _card_listen_thread():
     _saved_on_stop = False  # guard against double-save on stop + track-change
     _last_highlighted_id = None  # track change-only log guard for highlight
     _last_highlighted_pl = None  # playlist change-only log guard
+    _do_save_ref = None  # set to _do_save after it's defined
 
     def _do_save(track_id: str, audio, reason: str) -> None:
         """Save captured audio with trigger reason DEBUG log."""
@@ -156,132 +256,159 @@ def _card_listen_thread():
                           track_id[:8], reason, e)
 
     while not _listen_stop.is_set():
-        with _mode_lock:
-            lm = _listen_mode
-            am = _analyze_mode
-
-        if lm == 0:
-            # Not listening — sleep and loop
-            time.sleep(1.0)
-            _current_track = None
-            _current_track_elapsed = 0
-            _current_track_status = ""
-            continue
-
-        # Listen mode is ON — poll Spotify API
+        logger.debug("poll loop iteration start, listen_mode=%d", _listen_mode)
         try:
-            cp = _state.sp.current_playback() if _state.sp else None
-        except Exception:
-            time.sleep(POLL_FAST)
-            continue
-
-        if not cp or not cp.get("is_playing"):
-            # Nothing playing
-            _current_track = None
-            _current_track_elapsed = 0
-            _current_track_status = "No track playing"
-            last_track_id = None
-            track_analyzed = False
-            audio_collected = None
-            if last_playing_time > 0 and (time.time() - last_playing_time) > 60:
-                logger.info("Now Playing: auto-stopping after 60s of silence")
-                with _mode_lock:
-                    _listen_mode = 0
-                    _analyze_mode = 0
-                _listen_stop.set()
-                break
-            time.sleep(POLL_FAST)
-            continue
-
-        item = cp.get("item") or {}
-        tid = item.get("id")
-        progress_ms = cp.get("progress_ms", 0)
-        dur_ms = item.get("duration_ms", 0)
-
-        if not tid or not dur_ms:
-            time.sleep(POLL_FAST)
-            continue
-
-        # Update current track info and reset idle timer
-        last_playing_time = time.time()
-        _current_track = {
-            "id": tid,
-            "name": item.get("name", "?"),
-            "artist": ", ".join(a.get("name", "") for a in (item.get("artists") or [])),
-            "album": (item.get("album") or {}).get("name", ""),
-            "duration_ms": dur_ms,
-        }
-        _current_track_elapsed = progress_ms
-
-        # Extract Spotify context (playlist URI) for highlight tracking
-        context = cp.get("context") or {}
-        context_uri = context.get("uri", "")
-        # Parse playlist ID from context URI (e.g. "spotify:playlist:1a2b3c4d")
-        pl_id_from_context = ""
-        if context_uri.startswith("spotify:playlist:"):
-            pl_id_from_context = context_uri.split(":")[-1]
-
-        # Update highlight only when playlist or track actually changes
-        if pl_id_from_context != _last_highlighted_pl or tid != _last_highlighted_id:
-            _last_highlighted_pl = pl_id_from_context
-            _last_highlighted_id = tid
-            _notify_playing_track(pl_id_from_context, tid)
-
-        # Track change detection
-        if tid != last_track_id:
-            if last_track_id is not None and am == 1 and not _saved_on_stop:
-                _do_save(last_track_id, audio_collected, "track_change")
-            last_track_id = tid
-            track_start_wall = time.time() - progress_ms / 1000.0
-            track_duration = dur_ms
-            track_progress_ms = progress_ms
-            track_analyzed = False
-            audio_collected = np.array([], dtype=np.float32) if am == 1 else None
-
-        # Status line
-        dm, ds = divmod(dur_ms // 1000, 60)
-        em, es = divmod(progress_ms // 1000, 60)
-        remaining = max(0, dur_ms - progress_ms)
-        rm, rs = divmod(remaining // 1000, 60)
-        pct = min(progress_ms / max(dur_ms, 1) * 100, 100)
-
-        if am == 0:
-            _current_track_status = f"{em}:{es:02d} / {dm}:{ds:02d}  ({pct:.0f}%)"
-        else:
-            _current_track_status = f"🔍 {em}:{es:02d} / {dm}:{ds:02d}  ({pct:.0f}%)  recording..."
-
-        # Collect audio if analyzing
-        if am == 1 and _cap.audio_deque is not None:
-            with _cap.audio_lock:
-                new_samples = np.array(list(_cap.audio_deque), dtype=np.float32)
-                _cap.audio_deque.clear()
-            if len(new_samples) > 0:
-                mono = _to_mono(new_samples, _cap.actual_channels)
-                if audio_collected is None:
-                    audio_collected = mono
-                else:
-                    audio_collected = np.concatenate([audio_collected, mono])
-
-        # Adaptive polling interval
-        # Fast near track start (first 10%) and near end (last 10%)
-        if progress_ms < dur_ms * 0.10 or progress_ms > dur_ms * 0.90:
-            interval = POLL_FAST  # 2s
-        else:
-            interval = POLL_NORMAL  # 5s
-
-        # Sleep in small increments so we can respond to stop quickly
-        slept = 0.0
-        while slept < interval and not _listen_stop.is_set():
-            time.sleep(0.5)
-            slept += 0.5
             with _mode_lock:
-                if _listen_mode == 0:
+                lm = _listen_mode
+                am = _analyze_mode
+
+            if lm == 0:
+                # Not listening — sleep and loop
+                time.sleep(1.0)
+                _current_track = None
+                _current_track_elapsed = 0
+                _current_track_status = ""
+                continue
+
+            # Listen mode is ON — poll Spotify API
+            try:
+                cp = _state.sp.current_playback() if _state.sp else None
+            except Exception as e:
+                logger.warning("Spotify poll failed: %s", e)
+                time.sleep(POLL_FAST)
+                continue
+
+            if not cp or not cp.get("is_playing"):
+                # Nothing playing
+                _current_track = None
+                _current_track_elapsed = 0
+                _current_track_status = "No track playing"
+                last_track_id = None
+                track_analyzed = False
+                audio_collected = None
+                if last_playing_time > 0 and (time.time() - last_playing_time) > 60:
+                    logger.info("Now Playing: auto-stopping after 60s of silence")
+                    with _mode_lock:
+                        _listen_mode = 0
+                        _analyze_mode = 0
+                    _listen_stop.set()
                     break
+                time.sleep(POLL_FAST)
+                continue
+
+            item = cp.get("item") or {}
+            tid = item.get("id")
+            progress_ms = cp.get("progress_ms", 0)
+            dur_ms = item.get("duration_ms", 0)
+
+            if not tid or not dur_ms:
+                time.sleep(POLL_FAST)
+                continue
+
+            # Update current track info and reset idle timer
+            last_playing_time = time.time()
+            _current_track = {
+                "id": tid,
+                "name": item.get("name", "?"),
+                "artist": ", ".join(a.get("name", "") for a in (item.get("artists") or [])),
+                "album": (item.get("album") or {}).get("name", ""),
+                "duration_ms": dur_ms,
+            }
+            _current_track_elapsed = progress_ms
+            logger.debug(
+                "Spotify poll OK: is_playing=True track=%s progress=%d/%dms (%.1f%%)",
+                tid[:8] if tid else "?", progress_ms, dur_ms,
+                min(progress_ms / max(dur_ms, 1) * 100, 100),
+            )
+
+            # Extract Spotify context (playlist URI) for highlight tracking
+            context = cp.get("context") or {}
+            context_uri = context.get("uri", "")
+            # Parse playlist ID from context URI (e.g. "spotify:playlist:1a2b3c4d")
+            pl_id_from_context = ""
+            if context_uri.startswith("spotify:playlist:"):
+                pl_id_from_context = context_uri.split(":")[-1]
+
+            # Update highlight only when playlist or track actually changes
+            if pl_id_from_context != _last_highlighted_pl or tid != _last_highlighted_id:
+                _last_highlighted_pl = pl_id_from_context
+                _last_highlighted_id = tid
+                try:
+                    _notify_playing_track(pl_id_from_context, tid)
+                except Exception:
+                    logger.exception("_notify_playing_track() crashed in polling thread")
+
+            # Track change detection
+            if tid != last_track_id:
+                if last_track_id is not None and am == 1 and not _saved_on_stop:
+                    _do_save(last_track_id, audio_collected, "track_change")
+                last_track_id = tid
+                track_start_wall = time.time() - progress_ms / 1000.0
+                track_duration = dur_ms
+                track_progress_ms = progress_ms
+                track_analyzed = False
+                audio_collected = np.array([], dtype=np.float32) if am == 1 else None
+
+            # Status line
+            dm, ds = divmod(dur_ms // 1000, 60)
+            em, es = divmod(progress_ms // 1000, 60)
+            remaining = max(0, dur_ms - progress_ms)
+            rm, rs = divmod(remaining // 1000, 60)
+            pct = min(progress_ms / max(dur_ms, 1) * 100, 100)
+
+            if am == 0:
+                _current_track_status = f"{em}:{es:02d} / {dm}:{ds:02d}  ({pct:.0f}%)"
+            else:
+                _current_track_status = f"🔍 {em}:{es:02d} / {dm}:{ds:02d}  ({pct:.0f}%)  recording..."
+
+            # Collect audio if analyzing
+            if am == 1 and _cap.audio_deque is not None:
+                with _cap.audio_lock:
+                    new_samples = np.array(list(_cap.audio_deque), dtype=np.float32)
+                    _cap.audio_deque.clear()
+                if len(new_samples) > 0:
+                    mono = _to_mono(new_samples, _cap.actual_channels)
+                    if audio_collected is None:
+                        audio_collected = mono
+                    else:
+                        audio_collected = np.concatenate([audio_collected, mono])
+
+            # Adaptive polling interval
+            # Fast near track start (first 10%) and near end (last 10%)
+            if progress_ms < dur_ms * 0.10 or progress_ms > dur_ms * 0.90:
+                interval = POLL_FAST  # 2s
+            else:
+                interval = POLL_NORMAL  # 5s
+
+            # Sleep in small increments so we can respond to stop quickly
+            logger.debug("entering inner sleep, interval=%.1fs, track at %.0f%%", interval, pct)
+            slept = 0.0
+            while slept < interval and not _listen_stop.is_set():
+                time.sleep(0.5)
+                slept += 0.5
+                with _mode_lock:
+                    if _listen_mode == 0:
+                        logger.debug("inner sleep: _listen_mode became 0, breaking out of sleep")
+                        break
+            logger.debug("exiting inner sleep (slept=%.1fs)", slept)
+        except Exception:
+            logger.exception("polling thread body crashed — sleeping POLL_FAST and retrying")
+            time.sleep(POLL_FAST)
 
     # Cleanup on stop — save whatever audio was collected
     # (auto_stop flows here via the break above; manual_stop flows here via _listen_stop.set())
     stop_reason = "auto_stop" if not lm else "manual_stop"
     _do_save(last_track_id, audio_collected, stop_reason)
+    _reset_now_playing_state()
+
+
+def _reset_now_playing_state():
+    """Reset global Now Playing track state so UI shows idle after stop."""
+    global _current_track, _current_track_elapsed, _current_track_status
+    _current_track = None
+    _current_track_elapsed = 0
+    _current_track_status = ""
+    logger.debug("Now Playing state cleared after stop")
 
 
 def _save_captured_track(track_id: str, audio_data):
@@ -307,11 +434,14 @@ def _save_captured_track(track_id: str, audio_data):
 def _update_np_ui():
     """Called by ui.timer to refresh Now Playing card contents."""
     global _np_card_container
-    if _np_card_container is None:
-        return
-    _np_card_container.clear()
-    with _np_card_container:
-        _render_np_inner()
+    try:
+        if _np_card_container is None:
+            return
+        _np_card_container.clear()
+        with _np_card_container:
+            _render_np_inner()
+    except Exception:
+        logger.exception("_update_np_ui() failed — timer callback crashed")
 
 
 # ─── Now Playing card UI ──────────────────────────────────────────────────────
@@ -347,6 +477,7 @@ def _render_np_inner():
                     logger.info("Now Playing: listening started")
                 else:
                     # Stop listening + analyzing
+                    _reset_now_playing_state()
                     _listen_mode = 0
                     _analyze_mode = 0
                     _listen_stop.set()
@@ -526,7 +657,7 @@ def _load_cached_playlist_tracks(playlist_id: str) -> list:
             cache_file.write_text(json.dumps(tracks, ensure_ascii=False), encoding="utf-8")
             logger.info("Cached %d tracks for playlist %s (snapshot %s)", len(tracks), playlist_id[:8], snapshot_id[:8])
         except Exception:
-            logger.warning("Failed to write cache file")
+            logger.warning("Failed to write cache file: %s", e)
 
     return tracks
 
@@ -534,6 +665,8 @@ def _load_cached_playlist_tracks(playlist_id: str) -> list:
 # ─── Spotify section ──────────────────────────────────────────────────────────
 def build_spotify_section(set_page_cb):
     """Build Spotify source section using set_page_cb for navigation-only re-renders."""
+    global _page_client
+    _page_client = ui.context.client
     ui.label("Spotify Source").classes("text-2xl font-bold mb-2")
 
     # --- Connection status and button ---
@@ -626,8 +759,14 @@ def build_spotify_section(set_page_cb):
         _render_playlists(set_page_cb)
 
 
+# Module-level reference to set_page_cb for use by auto-expand
+_render_playlists_set_page_cb = None
+
+
 def _render_playlists(set_page_cb):
     """Render playlist list with expandable items. Loads tracks on expand."""
+    global _render_playlists_set_page_cb
+    _render_playlists_set_page_cb = set_page_cb
     ui.separator()
     ui.label("Your Playlists").classes("text-lg font-bold mb-2")
 
@@ -642,10 +781,9 @@ def _render_playlists(set_page_cb):
         label = f"{pl_name}" + (f" ({total} tracks)" if total is not None else "")
 
         with ui.expansion(label, value=pl_id == _state.current_playlist_id).classes("w-full") as exp:
-            exp.props('header-class="text-lg font-semibold"')
-            # Add data-pl-id attribute for JS highlighting
-            ui.run_javascript(f"document.querySelectorAll('[data-pl-id]').forEach(el => {{ if (!el.hasAttribute('data-pl-id-set')) {{ el.setAttribute('data-pl-id', ''); el.setAttribute('data-pl-id-set', '1'); }} }}); const expEls = document.querySelectorAll('.q-expansion-item'); if (expEls.length > 0) {{ expEls[expEls.length-1].setAttribute('data-pl-id', '{pl_id}'); }}")
+            exp.props(f'header-class="text-lg font-semibold" data-pl-id="{pl_id}"')
             content_col = ui.column().classes("w-full")
+            _playlist_expansions[pl_id] = (exp, content_col)
 
             async def on_expand(e, pid=pl_id, pn=pl_name, col=content_col):
                 if not e.args:
@@ -733,9 +871,17 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
     track_table.on("rowClick", on_table_click)
 
     # After table render, attach data-track-id to rows for JS highlighting
-    ui.timer(0.2, lambda: _attach_track_data_attrs(tracks), once=True)
-    # Also check highlight after expansion opens
-    ui.timer(0.3, lambda: ui.run_javascript(f"window._pa_checkExpandHighlight && window._pa_checkExpandHighlight('{pl_id}')"), once=True)
+    # Capture client context at call time so deferred timers have a valid slot
+    _table_client = ui.context.client
+    def _deferred_highlight():
+        """Re-apply track data attrs + check expand highlight with captured client."""
+        with _table_client:
+            _attach_track_data_attrs(tracks)
+            logger.debug("_checkExpandHighlight: firing for playlist %s", pl_id[:8] if pl_id else "?")
+            ui.run_javascript(
+                f"window._pa_checkExpandHighlight && window._pa_checkExpandHighlight('{pl_id}')"
+            )
+    ui.timer(0.3, _deferred_highlight, once=True)
 
     missing = sum(1 for t in tracks if _get_track_status(t) != "✓ OK")
     with ui.row().classes("w-full gap-2 mt-2"):
@@ -829,8 +975,17 @@ def _attach_track_data_attrs(tracks):
     js = ""
     for i, t in enumerate(tracks):
         tid = t["id"]
-        js += f"var r = document.querySelectorAll('[data-row-key] tr'); if (r[{i}]) {{ r[{i}].setAttribute('data-track-id', '{tid}'); }} "
+        js += (
+            f"var r = document.querySelectorAll('tr[data-row-key]'); "
+            f"if (r[{i}]) {{ r[{i}].setAttribute('data-track-id', '{tid}'); "
+            f"console.log('[attrs] set data-track-id={tid} on row ' + {i} + ' of ' + r.length); }} "
+            f"else {{ console.log('[attrs] SKIP row {i} — not enough rows (' + r.length + ')'); }}"
+        )
     if js:
+        js = (
+            "console.log('[attrs] found ' + document.querySelectorAll('tr[data-row-key]').length + ' rows for ' + "
+            + str(len(tracks)) + ' tracks); ' + js
+        )
         ui.run_javascript(js)
 
 # ─── Local files section (unchanged) ──────────────────────────────────────────
