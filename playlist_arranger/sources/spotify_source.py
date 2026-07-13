@@ -69,6 +69,27 @@ def _spotify_request_with_retries(sp, method, path, payload=None, max_retries=5)
     return None, "max retries exceeded"
 
 
+class SpotifyCallProxy:
+    """Thin proxy wrapping spotipy.Spotify to track API call count."""
+
+    def __init__(self, sp):
+        self._sp = sp
+        self.call_count = 0
+        self._lock = __import__("threading").Lock()
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        attr = getattr(self._sp, name)
+        if callable(attr):
+            def wrapper(*args, **kwargs):
+                with self._lock:
+                    self.call_count += 1
+                return attr(*args, **kwargs)
+            return wrapper
+        return attr
+
+
 def init_spotify(progress_cb=None):
     """Initialize Spotify client. progress_cb(msg) for UI feedback."""
     if not HAS_SPOTIPY:
@@ -87,7 +108,7 @@ def init_spotify(progress_cb=None):
     user = sp.current_user()
     if progress_cb:
         progress_cb(f"Authenticated as: {user['display_name']} ({user['id']})")
-    return sp, user["id"]
+    return SpotifyCallProxy(sp), user["id"]
 
 
 def get_own_playlists(sp, user_id):

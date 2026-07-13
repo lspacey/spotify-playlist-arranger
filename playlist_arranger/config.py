@@ -72,6 +72,9 @@ ANCHORS_DIR_DEFAULT.mkdir(exist_ok=True)
 SAMPLE_RATE = 44100
 MERT_SR = 24000
 BUFFER_SECONDS = 30
+SILENCE_RMS_THRESHOLD = 0.001  # RMS below this → silence (chosen via empirical testing: typical music RMS ~0.01-0.3, pure silence near 0.0001)
+MIN_COVERAGE_PCT = 0.90        # Track must be >= 90% captured to submit for analysis
+MAX_ANALYZE_BUFFER_S = 900      # Safety cap: max audio buffer duration (15 min, ~400 MB at 22050 Hz mono float32)
 
 POLL_NORMAL = 5.0
 POLL_FAST = 2.0
