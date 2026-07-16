@@ -65,20 +65,20 @@ def test_batch_advance_stale_track_id_noop():
 
 
 def test_batch_advance_starts_next_track():
-    """_batch_advance_to_next() sets _batch_current_track_id to queue[0]'s ID."""
+    """_batch_advance_to_next() advances position and picks from snapshot[0]."""
     _setup()
-    _state.analysis_queue.append(_make_track("first-track"))
-    _state.analysis_queue.append(_make_track("second-track"))
-
+    _ps._batch_queue_snapshot[:] = [_make_track("first-track"), _make_track("second-track")]
+    _ps._batch_position = -1
     _ps._batch_processing = True
 
     _ps._batch_advance_to_next()
 
-    assert _ps._batch_current_track_id == "first-track", "Should pick first track in queue"
+    assert _ps._batch_current_track_id == "first-track", "Should pick first track in snapshot"
     assert _ps._batch_expected_track_id == "first-track", "Expected track ID should match"
     assert _ps._batch_current_track_duration_ms == 300000, "Duration should match track"
     assert _ps._batch_watchdog_fired_by_track_id is None, "Watchdog should be reset"
     assert _ps._batch_track_start_time > 0, "Start time should be set"
+    assert _ps._batch_position == 0, "Position should advance to 0"
 
 
 def test_start_listening_idempotent():

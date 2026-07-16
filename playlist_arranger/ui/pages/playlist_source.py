@@ -43,6 +43,8 @@ _batch_track_start_time = 0.0            # time.time() when batch started curren
 _batch_expected_track_id: str | None = None  # track ID we told Spotify to play (interference detection)
 _batch_watchdog_fired_by_track_id: str | None = None  # prevents duplicate watchdog fires
 _batch_btn = None                        # reference to the Start/Stop Batch Analysis button
+_batch_queue_snapshot: list = []         # frozen copy of queue at batch start (sequencer uses this)
+_batch_position: int = -1                # current index in snapshot (-1 = not started)
 
 # ─── Live analyze context (moved to playlist_arranger/analysis/live_buffer.py) ──
 from playlist_arranger.analysis.live_buffer import LiveAnalyzeContext
@@ -71,9 +73,8 @@ def _on_analysis_complete(track_info: dict):
     _state.analysis_queue[:] = [t for t in _state.analysis_queue if t.get("id") != tid]
     removed = before - len(_state.analysis_queue)
     if removed == 0:
-        # Track already removed (user deleted it) — batch still needs to advance
-        if _batch_processing and tid == _batch_current_track_id:
-            _batch_advance_to_next(tid)
+        # Track already removed by user (batch advance is decoupled — polling
+        # thread handles track-changed detection independently).
         return
     _state.save_analysis_queue()
     logger.info("Auto-removed %d occurrence(s) of '%s' from analysis queue (after successful analysis)",
@@ -90,47 +91,10 @@ def _on_analysis_complete(track_info: dict):
             logger.exception("Failed to rebuild queue UI from analysis-complete callback")
 
 _live_ctx.on_analysis_complete_cb = _on_analysis_complete
-
-# Buffer-submitted callback — advances batch IMMEDIATELY (on submit, before worker completes)
-def _on_buffer_submitted(track_info: dict):
-    """Fired when buffer is submitted to async worker (coverage ≥ 90%).
-    Batch mode advances to next track immediately without waiting for MERT/LLM/DB save."""
-    tid = track_info.get("id", "") if isinstance(track_info, dict) else ""
-    if not tid:
-        return
-    global _batch_processing, _batch_current_track_id
-    if _batch_processing and tid == _batch_current_track_id:
-        logger.info("Batch: buffer submitted for '%s', advancing immediately", track_info.get("name", "?")[:30])
-        _batch_advance_to_next(tid)
-
-_live_ctx.on_buffer_submitted_cb = _on_buffer_submitted
-
-# Buffer-discarded callback — advances past skipped tracks (coverage < 90%)
-def _on_buffer_discarded(track_info: dict):
-    """Fired when buffer is skipped due to insufficient coverage.
-    Removes the track from queue, notifies user, and advances batch."""
-    tid = track_info.get("id", "") if isinstance(track_info, dict) else ""
-    if not tid:
-        return
-    global _batch_processing, _batch_current_track_id
-    if _batch_processing and tid == _batch_current_track_id:
-        logger.info("Batch: buffer discarded for '%s' (insufficient coverage), advancing",
-                    track_info.get("name", "?")[:30])
-        _state.analysis_queue[:] = [t for t in _state.analysis_queue if t.get("id") != tid]
-        _state.save_analysis_queue()
-        global _page_client
-        if _page_client is not None:
-            try:
-                with _page_client:
-                    _update_queue_label()
-                    _rebuild_queue_ui()
-                    ui.notify(f"Skipped '{track_info.get('name', '?')[:30]}' (insufficient coverage)",
-                              type="warning")
-            except Exception:
-                pass
-        _batch_advance_to_next(tid)
-
-_live_ctx.on_buffer_discarded_cb = _on_buffer_discarded
+# Batch advance is NOT coupled to buffer submission/discard callbacks.
+# Instead, batch advance is triggered by the polling thread (_card_listen_thread)
+# when it detects that the current batch track has stopped playing (natural end).
+# The worker (_on_analysis_complete) handles queue removal and status updates independently.
 
 # ─── Idempotent listen/analyze helpers ───────────────────────────────────────
 def _start_listening():
@@ -1146,6 +1110,7 @@ def _stop_batch_analysis():
     """Stop batch mode, pause playback, stop listen+analyze. Idempotent."""
     global _batch_processing, _batch_current_track_id, _batch_expected_track_id
     global _batch_watchdog_fired_by_track_id, _batch_btn
+    global _batch_queue_snapshot, _batch_position
 
     with _mode_lock:
         if not _batch_processing:
@@ -1154,6 +1119,9 @@ def _stop_batch_analysis():
         _batch_current_track_id = None
         _batch_expected_track_id = None
         _batch_watchdog_fired_by_track_id = None
+
+    _batch_queue_snapshot.clear()
+    _batch_position = -1
 
     _safe_pause_active_playback()
 
@@ -1169,9 +1137,20 @@ def _stop_batch_analysis():
 
 
 def _batch_advance_to_next(expected_track_id: str | None = None):
-    """Advance batch to the next track in the queue."""
+    """Advance batch sequencer to the NEXT position in the snapshot.
+
+    Batch advance is a pure sequencer: it steps through a frozen snapshot
+    of the queue taken at Start Batch Analysis time, commanding playback
+    of each track in order. It does NOT depend on queue state (which the
+    worker may be mutating asynchronously) — it uses _batch_queue_snapshot
+    and _batch_position exclusively.
+
+    Triggered by the polling thread (_card_listen_thread) when it detects
+    that the current batch track has stopped playing (natural end via
+    Spotfiy stopping playback after a single-track queue)."""
     global _batch_processing, _batch_current_track_id, _batch_current_track_duration_ms
     global _batch_track_start_time, _batch_expected_track_id, _batch_watchdog_fired_by_track_id
+    global _batch_queue_snapshot, _batch_position
 
     if not _batch_processing:
         return
@@ -1181,16 +1160,35 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
                      _batch_current_track_id[:8] if _batch_current_track_id else "?")
         return
 
-    if not _state.analysis_queue:
-        logger.info("Batch: queue empty — stopping batch analysis")
-        _stop_batch_analysis()
+    # Advance position
+    _batch_position += 1
+
+    # Check if we've reached the end of the snapshot
+    if _batch_position >= len(_batch_queue_snapshot):
+        logger.info("Batch: end of queue snapshot (%d tracks) — batch analysis complete",
+                    len(_batch_queue_snapshot))
+        with _mode_lock:
+            _batch_processing = False
+            _batch_current_track_id = None
+            _batch_expected_track_id = None
+            _batch_watchdog_fired_by_track_id = None
+        global _page_client, _batch_btn
+        if _page_client is not None and _batch_btn is not None:
+            try:
+                with _page_client:
+                    _batch_btn.set_text("Start Batch Analysis")
+                    _batch_btn.props('color=green')
+                    ui.notify("Batch analysis complete", type="positive")
+            except Exception:
+                logger.exception("Failed to update batch button on completion")
+        _rebuild_queue_ui()
         return
 
-    next_track = _state.analysis_queue[0]
+    next_track = _batch_queue_snapshot[_batch_position]
     tid = next_track.get("id", "")
     if not tid:
-        logger.warning("Batch: first queue entry has no ID — stopping")
-        _stop_batch_analysis()
+        logger.warning("Batch: snapshot entry at position %d has no ID — skipping", _batch_position)
+        _batch_advance_to_next()
         return
 
     _batch_current_track_id = tid
@@ -1203,14 +1201,15 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
         try:
             uri = f"spotify:track:{tid}"
             _state.sp.start_playback(device_id=_state.spotify_device_id, uris=[uri])
-            logger.info("Batch: started playback of '%s' (id=%s)",
+            logger.info("Batch [%d/%d]: started playback of '%s' (id=%s)",
+                        _batch_position + 1, len(_batch_queue_snapshot),
                         next_track.get("name", "?")[:40], tid[:8] if tid else "?")
         except Exception as e:
             logger.exception("Batch: failed to start playback: %s", e)
             _stop_batch_analysis()
             return
 
-    # Rebuild queue UI FIRST (to show "⏳ Processing" on the new first row)
+    # Rebuild queue UI FIRST (to show "⏳ Processing" status)
     _rebuild_queue_ui()
 
     # THEN set selection highlight on the fresh rows
@@ -1220,8 +1219,9 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
 
 
 def _on_start_batch():
-    """Start batch analysis: pause current playback, start listen+analyze, play first track."""
+    """Start batch analysis: snapshot queue, start listen+analyze, play first track."""
     global _batch_processing, _batch_btn
+    global _batch_queue_snapshot, _batch_position
 
     if not _state.analysis_queue:
         ui.notify("Queue is empty — add tracks first", type="warning")
@@ -1232,6 +1232,8 @@ def _on_start_batch():
         return
 
     _batch_processing = True
+    _batch_queue_snapshot[:] = list(_state.analysis_queue)
+    _batch_position = -1
 
     if _batch_btn is not None:
         _batch_btn.set_text("Stop Batch Analysis")
@@ -1242,7 +1244,7 @@ def _on_start_batch():
     _start_listening()
     _start_analyzing()
     _batch_advance_to_next()
-    logger.info("Batch analysis started — %d tracks in queue", len(_state.analysis_queue))
+    logger.info("Batch analysis started — %d tracks in snapshot", len(_batch_queue_snapshot))
 
 
 def _refresh_batch_btn_enabled():
