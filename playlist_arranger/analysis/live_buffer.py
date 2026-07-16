@@ -79,6 +79,18 @@ class LiveAnalyzeContext:
         # Used e.g. by UI to auto-remove analyzed tracks from the analysis queue.
         self.on_analysis_complete_cb: Callable | None = None
 
+        # Buffer-submitted callback — fired immediately when buffer is submitted
+        # to the async worker (before worker processing begins). Used by batch
+        # mode to advance to next track without waiting for worker completion.
+        # Signature: callable(track_info: dict) → None
+        self.on_buffer_submitted_cb: Callable | None = None
+
+        # Buffer-discarded callback — fired when buffer is skipped due to
+        # insufficient coverage (< MIN_COVERAGE_PCT). Used by batch mode to
+        # revert "⏳ Processing" status.
+        # Signature: callable(track_info: dict) → None
+        self.on_buffer_discarded_cb: Callable | None = None
+
     # ── Flush ──────────────────────────────────────────────────────────────────
 
     def _flush_analyze_buffer(self, buf: AnalyzeBuffer, coverage_pct: float) -> bool:
@@ -96,6 +108,14 @@ class LiveAnalyzeContext:
             self._submit_analyze_task(buf.track_info, y_full)
             logger.info("Track complete: coverage=%.1f%%, submitting for analysis: %s",
                         coverage_pct * 100, buf.track_info.get("name", "")[:50] if buf.track_info else "?")
+            # Fire buffer-submitted callback (batch mode advances immediately)
+            cb = self.on_buffer_submitted_cb
+            if cb:
+                try:
+                    cb(buf.track_info)
+                except Exception:
+                    logger.exception("on_buffer_submitted_cb crashed for %s",
+                                     buf.track_info.get("name", "?")[:30] if buf.track_info else "?")
             return True
         else:
             dur_ms = buf.track_info.get("duration_ms", 0) if buf.track_info else 0
@@ -104,6 +124,14 @@ class LiveAnalyzeContext:
                         coverage_pct * 100, MIN_COVERAGE_PCT * 100,
                         buf.track_info.get("name", "")[:50] if buf.track_info else "?",
                         duration_s, expected_s)
+            # Fire buffer-discarded callback (batch mode reverts Processing status)
+            cb = self.on_buffer_discarded_cb
+            if cb:
+                try:
+                    cb(buf.track_info)
+                except Exception:
+                    logger.exception("on_buffer_discarded_cb crashed for %s",
+                                     buf.track_info.get("name", "?")[:30] if buf.track_info else "?")
             return False
 
     # ── Sync / buffer lifecycle ────────────────────────────────────────────────

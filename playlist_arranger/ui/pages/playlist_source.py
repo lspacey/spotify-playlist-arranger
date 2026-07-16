@@ -61,7 +61,6 @@ _on_track_changed_cb = None  # callable(old_track_info, new_track_info) or None
 _live_ctx.on_track_changed_cb = _on_track_changed_cb
 
 # Analysis-complete callback — auto-removes track from queue after successful save
-# and advances batch to next track if in batch mode.
 def _on_analysis_complete(track_info: dict):
     """Called from analyze worker thread after save_track_worker succeeds.
     Removes ALL occurrences of the tracked track ID from the analysis queue."""
@@ -69,19 +68,16 @@ def _on_analysis_complete(track_info: dict):
     if not tid:
         return
     before = len(_state.analysis_queue)
-    # Remove ALL matching entries (handles duplicates allowed in queue)
     _state.analysis_queue[:] = [t for t in _state.analysis_queue if t.get("id") != tid]
     removed = before - len(_state.analysis_queue)
     if removed == 0:
-        # If in batch mode and this is the current batch track, still try to advance
-        # (the track may have been removed from the queue by the user but batch still needs to move on)
+        # Track already removed (user deleted it) — batch still needs to advance
         if _batch_processing and tid == _batch_current_track_id:
             _batch_advance_to_next(tid)
         return
     _state.save_analysis_queue()
     logger.info("Auto-removed %d occurrence(s) of '%s' from analysis queue (after successful analysis)",
                 removed, track_info.get("name", "?")[:40])
-    # Rebuild queue UI if visible (uses captured client context for thread safety)
     global _page_client
     if _page_client is not None:
         try:
@@ -93,12 +89,48 @@ def _on_analysis_complete(track_info: dict):
         except Exception:
             logger.exception("Failed to rebuild queue UI from analysis-complete callback")
 
-    # Batch mode: advance to next track
+_live_ctx.on_analysis_complete_cb = _on_analysis_complete
+
+# Buffer-submitted callback — advances batch IMMEDIATELY (on submit, before worker completes)
+def _on_buffer_submitted(track_info: dict):
+    """Fired when buffer is submitted to async worker (coverage ≥ 90%).
+    Batch mode advances to next track immediately without waiting for MERT/LLM/DB save."""
+    tid = track_info.get("id", "") if isinstance(track_info, dict) else ""
+    if not tid:
+        return
+    global _batch_processing, _batch_current_track_id
     if _batch_processing and tid == _batch_current_track_id:
+        logger.info("Batch: buffer submitted for '%s', advancing immediately", track_info.get("name", "?")[:30])
         _batch_advance_to_next(tid)
 
+_live_ctx.on_buffer_submitted_cb = _on_buffer_submitted
 
-_live_ctx.on_analysis_complete_cb = _on_analysis_complete
+# Buffer-discarded callback — advances past skipped tracks (coverage < 90%)
+def _on_buffer_discarded(track_info: dict):
+    """Fired when buffer is skipped due to insufficient coverage.
+    Removes the track from queue, notifies user, and advances batch."""
+    tid = track_info.get("id", "") if isinstance(track_info, dict) else ""
+    if not tid:
+        return
+    global _batch_processing, _batch_current_track_id
+    if _batch_processing and tid == _batch_current_track_id:
+        logger.info("Batch: buffer discarded for '%s' (insufficient coverage), advancing",
+                    track_info.get("name", "?")[:30])
+        _state.analysis_queue[:] = [t for t in _state.analysis_queue if t.get("id") != tid]
+        _state.save_analysis_queue()
+        global _page_client
+        if _page_client is not None:
+            try:
+                with _page_client:
+                    _update_queue_label()
+                    _rebuild_queue_ui()
+                    ui.notify(f"Skipped '{track_info.get('name', '?')[:30]}' (insufficient coverage)",
+                              type="warning")
+            except Exception:
+                pass
+        _batch_advance_to_next(tid)
+
+_live_ctx.on_buffer_discarded_cb = _on_buffer_discarded
 
 # ─── Idempotent listen/analyze helpers ───────────────────────────────────────
 def _start_listening():
@@ -106,7 +138,7 @@ def _start_listening():
     global _listen_mode, _listen_thread, _listen_stop
     with _mode_lock:
         if _listen_mode == 1:
-            return  # already listening
+            return
         _listen_mode = 1
         _listen_stop.clear()
         _listen_thread = threading.Thread(target=_card_listen_thread, daemon=True)
@@ -119,7 +151,7 @@ def _stop_listening():
     global _listen_mode, _listen_stop, _processing_stop, _analyze_mode
     with _mode_lock:
         if _listen_mode == 0:
-            return  # already stopped
+            return
         _processing_stop = True
         _listen_mode = 0
         if _analyze_mode:
@@ -139,9 +171,9 @@ def _start_analyzing():
     global _analyze_mode
     with _mode_lock:
         if _listen_mode != 1:
-            return  # can't analyze without listening
+            return
         if _analyze_mode == 1:
-            return  # already analyzing
+            return
         _analyze_mode = 1
         _live_ctx.start_poll_thread()
         logger.info("Now Playing: analysis started")
@@ -152,7 +184,7 @@ def _stop_analyzing():
     global _analyze_mode
     with _mode_lock:
         if _analyze_mode == 0:
-            return  # already stopped
+            return
         _analyze_mode = 0
         _live_ctx.stop_poll_thread()
         logger.info("Now Playing: analysis stopped")
@@ -184,9 +216,9 @@ _page_client = None
 _last_notified_playlist_id = None
 
 # Per-playlist table refs for native selection highlight from background thread
-_playlist_tables = {}       # pl_id → ui.table instance
-_playlist_rows_cache = {}   # pl_id → rows list for row lookup
-_now_playing_row_keys = {}  # pl_id → row_key value currently highlighted as "now playing" (excluded from user selection getter)
+_playlist_tables = {}
+_playlist_rows_cache = {}
+_now_playing_row_keys = {}
 
 def _auto_expand_playlist(playlist_id: str, track_id: str):
     """Auto-expand a collapsed playlist, loading its tracks and rendering table."""
@@ -220,7 +252,6 @@ def _collapse_playlist(playlist_id: str):
     exp, _content_col = entry
     exp.value = False
     _auto_expanded_playlist_ids.discard(playlist_id)
-    # Clear highlight: clear native table selection + playlist header highlight
     table = _playlist_tables.get(playlist_id)
     if table is not None:
         table.selected = []
@@ -243,7 +274,6 @@ def _notify_playing_track(playlist_id: str, track_id: str):
     tid = track_id or ""
 
     if _page_client is None:
-        logger.warning("No page client captured — skipping highlight/auto-expand")
         return
 
     playlist_changed = plid and plid != _last_notified_playlist_id
@@ -260,18 +290,9 @@ def _notify_playing_track(playlist_id: str, track_id: str):
                     _collapse_playlist(_last_notified_playlist_id)
                 _last_notified_playlist_id = plid
 
-            # ── Now-playing row highlight via Quasar native selection ───────
             has_tracks = bool(_state.current_tracks)
             plid_matches_current = plid == _state.current_playlist_id
             gate_open = plid and tid and has_tracks and plid_matches_current
-            logger.debug(
-                "notify gate: plid=%s tid=%s has_tracks=%s plid_matches_current=%s gate_open=%s",
-                plid[:8] if plid else plid,
-                tid[:8] if tid else tid,
-                has_tracks,
-                plid_matches_current,
-                gate_open,
-            )
             if gate_open:
                 rows_cache = _playlist_rows_cache.get(plid, [])
                 table = _playlist_tables.get(plid)
@@ -288,16 +309,7 @@ def _notify_playing_track(playlist_id: str, track_id: str):
                             current.append(match_row)
                         table.selected = current
                         _now_playing_row_keys[plid] = match_row["idx"]
-                        logger.debug("Native selection: row %d added (total selected=%d) for plid=%s",
-                                     track_index, len(current), plid[:8] if plid else plid)
-                    else:
-                        logger.warning(
-                            "track_index NOT FOUND: tid=%s not in current_tracks (sample_ids: %s)",
-                            tid[:8] if tid else tid,
-                            [t.get("id", "")[:8] for t in tracks[:5]],
-                        )
 
-            # ── Playlist header highlight (yellow background) ────────────────
             if plid:
                 js = (
                     "(function(){"
@@ -399,14 +411,6 @@ def _card_listen_thread():
 
             will_notify = pl_id_from_context != _last_highlighted_pl or tid != _last_highlighted_id
             if will_notify:
-                logger.debug(
-                    "Highlight check: plid=%s tid=%s last_plid=%s last_tid=%s will_notify=%s",
-                    pl_id_from_context[:8] if pl_id_from_context else pl_id_from_context,
-                    tid[:8] if tid else tid,
-                    _last_highlighted_pl[:8] if _last_highlighted_pl else _last_highlighted_pl,
-                    _last_highlighted_id[:8] if _last_highlighted_id else _last_highlighted_id,
-                    will_notify,
-                )
                 _last_highlighted_pl = pl_id_from_context
                 _last_highlighted_id = tid
                 try:
@@ -424,17 +428,14 @@ def _card_listen_thread():
                 if _batch_processing:
                     expected = _batch_expected_track_id
                     if expected is not None and tid == expected:
-                        # Expected batch advance — clear the expectation flag
                         _batch_expected_track_id = None
                         logger.info("Batch: expected track %s confirmed playing", tid[:8] if tid else "?")
                     elif expected is not None and tid != expected:
-                        # User interference — stop batch mode, don't touch listen/analyze
                         _batch_processing = False
                         _batch_expected_track_id = None
                         _batch_current_track_id = None
                         logger.warning("Batch stopped: user changed track manually (expected=%s, got=%s)",
                                        expected[:8] if expected else "?", tid[:8] if tid else "?")
-                        # Flip button back via UI timer
                         global _page_client, _batch_btn
                         if _page_client is not None and _batch_btn is not None:
                             try:
@@ -455,7 +456,6 @@ def _card_listen_thread():
                 last_track_id = tid
                 last_progress_ms = 0
 
-            # ── Seek-back / loop detection ──────────────────────────────────
             if tid == last_track_id and last_progress_ms > 0 and progress_ms < (last_progress_ms - 3000):
                 with _mode_lock:
                     buf = _live_ctx.analyze_buf
@@ -527,7 +527,6 @@ def _update_np_ui():
     except Exception:
         logger.exception("_update_np_ui() failed — timer callback crashed")
 
-    # ── API counter update ─────────────────────────────────────────────────
     try:
         if _api_counter_label is not None and _state.sp is not None:
             count = getattr(_state.sp, 'call_count', 0)
@@ -535,7 +534,6 @@ def _update_np_ui():
     except Exception:
         logger.exception("API counter update failed")
 
-    # ── Self-healing: re-sync now-playing row in table selection ──────────
     try:
         if _current_track is not None:
             tid = _current_track.get("id", "")
@@ -556,8 +554,6 @@ def _update_np_ui():
                             current.append(match_row)
                             table.selected = current
                             _now_playing_row_keys[plid] = match_row["idx"]
-                            logger.debug("Selection re-synced after refresh: track=%s row_idx=%d (total=%d)",
-                                         tid[:8] if tid else tid, track_index, len(current))
     except Exception:
         logger.exception("Selection re-sync check failed")
 
@@ -575,11 +571,9 @@ def _update_np_ui():
                         logger.warning(
                             "Batch watchdog: track %s exceeded expected duration (%.0fs + 50s grace), forcing advance",
                             _batch_current_track_id[:8] if _batch_current_track_id else "?", track_dur_s)
-                        # Remove the stuck track from queue if still present
                         _state.analysis_queue[:] = [t for t in _state.analysis_queue
                                                     if t.get("id") != _batch_current_track_id]
                         _state.save_analysis_queue()
-                        # Rebuild queue UI
                         if _page_client is not None:
                             try:
                                 with _page_client:
@@ -680,8 +674,6 @@ def _update_viz():
 
     rms = float(np.sqrt(np.mean(np.square(mono))) + 1e-12)
     peak = float(np.max(np.abs(mono)) + 1e-12)
-    rms_db = 20.0 * np.log10(rms)
-    peak_db = 20.0 * np.log10(peak)
 
     n_fft = min(512, len(mono))
     fft = np.abs(np.fft.rfft(mono, n=n_fft))
@@ -693,17 +685,11 @@ def _update_viz():
         lo, hi = band_edges[i], band_edges[i + 1]
         lo = max(0, min(lo, num_bins - 1))
         hi = max(0, min(hi, num_bins))
-        if hi > lo:
-            band_val = float(np.mean(fft[lo:hi]))
-        else:
-            band_val = 0.0
+        band_val = float(np.mean(fft[lo:hi])) if hi > lo else 0.0
         bands.append(band_val)
 
     max_val = float(np.max(bands) + 1e-12)
-    if max_val > 0:
-        bands = [min(1.0, b / (max_val * 1.5)) for b in bands]
-    else:
-        bands = [0.0] * num_bands
+    bands = [min(1.0, b / (max_val * 1.5)) for b in bands] if max_val > 0 else [0.0] * num_bands
 
     bands_json = _json.dumps(bands)
     js = (
@@ -994,20 +980,18 @@ def build_spotify_section(set_page_cb):
 _render_playlists_set_page_cb = None
 
 # ─── Queue for Analysis section ──────────────────────────────────────────────
-_queue_table_ref = None          # ui.table instance for the queue tracks
-_queue_rows_cache = []           # rows list for row_key lookup
-_queue_container = None          # the ui.column that holds the queue table + controls
-_queue_expansion_ref = None      # the ui.expansion for collapsible state
-_queue_label_ref = None          # ui.label showing "Queue for Analysis — N tracks"
+_queue_table_ref = None
+_queue_rows_cache = []
+_queue_container = None
+_queue_expansion_ref = None
+_queue_label_ref = None
 
 
 def _persist_queue():
-    """Save queue to disk after every mutation."""
     _state.save_analysis_queue()
 
 
 def _rebuild_queue_ui():
-    """Clear and re-render the queue table + controls inside the expansion body."""
     global _queue_table_ref, _queue_rows_cache, _queue_container
     if _queue_container is None:
         return
@@ -1018,7 +1002,6 @@ def _rebuild_queue_ui():
 
 
 def _add_selected_to_queue(pl_id: str, tracks: list):
-    """Append checked tracks (in row order) to the analysis queue."""
     selected_rows = _get_selected_rows(pl_id)
     if not selected_rows:
         ui.notify("No tracks selected", type="warning")
@@ -1040,7 +1023,6 @@ def _add_selected_to_queue(pl_id: str, tracks: list):
 
 
 def _update_queue_label():
-    """Refresh the expansion label text with current queue count."""
     global _queue_label_ref, _queue_expansion_ref
     n = len(_state.analysis_queue)
     label = f"Queue for Analysis — {n} track{'s' if n != 1 else ''}"
@@ -1051,7 +1033,6 @@ def _update_queue_label():
 
 
 def _render_queue_table():
-    """Render the track table inside the queue section."""
     global _queue_table_ref, _queue_rows_cache
     if not _state.analysis_queue:
         ui.label("Queue is empty").classes("text-sm text-gray-400 italic")
@@ -1068,7 +1049,6 @@ def _render_queue_table():
     for i, t in enumerate(_state.analysis_queue, 1):
         dur_ms = t.get("duration_ms", 0)
         dur_str = f"{dur_ms // 60000}:{(dur_ms // 1000) % 60:02d}" if dur_ms else "?"
-        # "⏳ Processing" override for the current batch track
         if _batch_processing and t.get("id") == _batch_current_track_id:
             status = "⏳ Processing"
         else:
@@ -1108,18 +1088,19 @@ def _stop_batch_analysis():
         _batch_expected_track_id = None
         _batch_watchdog_fired_by_track_id = None
 
-    # Pause Spotify playback
     if _state.sp and _state.spotify_device_id:
         try:
             _state.sp.pause_playback(device_id=_state.spotify_device_id)
-        except Exception:
-            logger.exception("Failed to pause playback during batch stop")
+        except Exception as e:
+            err_msg = str(e)
+            if "403" in err_msg:
+                logger.debug("No active playback to pause during batch stop — continuing (403)")
+            else:
+                logger.info("Could not pause playback during batch stop: %s", err_msg)
 
-    # Stop analyze and listen
     _stop_analyzing()
     _stop_listening()
 
-    # Flip button
     if _batch_btn is not None:
         _batch_btn.set_text("Start Batch Analysis")
         _batch_btn.props('color=green')
@@ -1129,11 +1110,10 @@ def _stop_batch_analysis():
 
 
 def _batch_advance_to_next(expected_track_id: str | None = None):
-    """Advance batch to the next track in the queue. Called after analysis completes."""
+    """Advance batch to the next track in the queue."""
     global _batch_processing, _batch_current_track_id, _batch_current_track_duration_ms
     global _batch_track_start_time, _batch_expected_track_id, _batch_watchdog_fired_by_track_id
 
-    # Staleness guard: if batch already stopped or we've moved past this track
     if not _batch_processing:
         return
     if expected_track_id is not None and expected_track_id != _batch_current_track_id:
@@ -1142,13 +1122,11 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
                      _batch_current_track_id[:8] if _batch_current_track_id else "?")
         return
 
-    # If queue is empty, stop batch
     if not _state.analysis_queue:
         logger.info("Batch: queue empty — stopping batch analysis")
         _stop_batch_analysis()
         return
 
-    # Get next track from queue
     next_track = _state.analysis_queue[0]
     tid = next_track.get("id", "")
     if not tid:
@@ -1160,11 +1138,8 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
     _batch_current_track_duration_ms = next_track.get("duration_ms", 0)
     _batch_track_start_time = time.time()
     _batch_watchdog_fired_by_track_id = None
-
-    # Set expected track ID for interference detection
     _batch_expected_track_id = tid
 
-    # Start playback on Spotify device
     if _state.sp and _state.spotify_device_id:
         try:
             uri = f"spotify:track:{tid}"
@@ -1176,16 +1151,13 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
             _stop_batch_analysis()
             return
 
-    # Highlight current track row in queue table
+    # Rebuild queue UI FIRST (to show "⏳ Processing" on the new first row)
+    _rebuild_queue_ui()
+
+    # THEN set selection highlight on the fresh rows
     global _queue_table_ref, _queue_rows_cache
     if _queue_table_ref is not None and _queue_rows_cache:
-        row_idx = next((i for i, r in enumerate(_queue_rows_cache, 1) if i == 1), None)
-        if row_idx is not None:
-            # Clear previous selection, highlight first row
-            _queue_table_ref.selected = [_queue_rows_cache[0]]
-
-    # Rebuild queue UI to show "⏳ Processing" status
-    _rebuild_queue_ui()
+        _queue_table_ref.selected = [_queue_rows_cache[0]]
 
 
 def _on_start_batch():
@@ -1202,40 +1174,37 @@ def _on_start_batch():
 
     _batch_processing = True
 
-    # Flip button
     if _batch_btn is not None:
         _batch_btn.set_text("Stop Batch Analysis")
         _batch_btn.props('color=red')
 
-    # Pause whatever's currently playing
+    # Pause whatever's currently playing (403 is expected if nothing was playing)
     try:
         _state.sp.pause_playback(device_id=_state.spotify_device_id)
-    except Exception:
-        logger.exception("Failed to pause playback at batch start")
+    except Exception as e:
+        err_msg = str(e)
+        if "403" in err_msg:
+            logger.debug("No active playback to pause — continuing (403)")
+        else:
+            logger.info("Could not pause playback at batch start: %s", err_msg)
 
-    # Start listen + analyze
     _start_listening()
     _start_analyzing()
-
-    # Start first track
     _batch_advance_to_next()
     logger.info("Batch analysis started — %d tracks in queue", len(_state.analysis_queue))
 
 
 def _render_queue_controls():
-    """Render the control buttons above the queue table."""
     global _batch_btn
     with ui.row().classes("w-full gap-2 mb-2"):
-        # ── 1. Start / Stop Batch Analysis ─────────────────────────────────
         _batch_btn = ui.button(
             "Start Batch Analysis" if not _batch_processing else "Stop Batch Analysis",
             on_click=lambda: _stop_batch_analysis() if _batch_processing else _on_start_batch(),
             color="red" if _batch_processing else "green",
         ).classes("text-sm")
         can_batch = len(_state.analysis_queue) > 0 and _state.spotify_device_id is not None
-        _batch_btn.set_enabled(can_batch or _batch_processing)  # always enabled when running (to stop)
+        _batch_btn.set_enabled(can_batch or _batch_processing)
 
-        # ── 2. Remove Selected Tracks ───────────────────────────────────────
         def _on_remove_selected():
             global _queue_table_ref
             if _queue_table_ref is None:
@@ -1263,7 +1232,6 @@ def _render_queue_controls():
         remove_btn.set_enabled(False)
         ui.timer(0.5, _refresh_remove_btn)
 
-        # ── 3. Remove All Tracks ────────────────────────────────────────────
         def _on_remove_all():
             _state.analysis_queue.clear()
             _persist_queue()
@@ -1275,7 +1243,6 @@ def _render_queue_controls():
 
 
 def _render_analysis_queue():
-    """Render the 'Queue for Analysis' section as a collapsible expansion panel."""
     global _queue_expansion_ref, _queue_label_ref, _queue_container
     n = len(_state.analysis_queue)
     label = f"Queue for Analysis — {n} track{'s' if n != 1 else ''}"
@@ -1340,7 +1307,6 @@ def _render_playlists(set_page_cb):
 
 
 def _get_selected_rows(pl_id: str):
-    """Return list of user-checked row dicts, excluding the now-playing row (which shares .selected)."""
     table = _playlist_tables.get(pl_id)
     if table is None:
         return []
@@ -1379,7 +1345,6 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
     _playlist_rows_cache[pl_id] = rows
 
     def on_row_dblclick(e):
-        logger.debug("row-dblclick fired: raw e.args=%r", e.args)
         row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else {}
         row_idx = row_data.get("idx", 0) - 1
         if 0 <= row_idx < len(tracks):
@@ -1395,8 +1360,6 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
                     current.append(row_data)
                 track_table.selected = current
                 _now_playing_row_keys[pl_id] = row_data["idx"]
-                logger.debug("Optimistic selection applied on double-click: track=%s (total=%d)",
-                             row_data.get("name", "")[:30], len(current))
 
     track_table.on("rowDblclick", on_row_dblclick)
 
@@ -1455,7 +1418,6 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
     ui.timer(2.0, _refresh_status_cells)
 
 
-# TODO: unused after Queue for Analysis feature (2026-07-16) — remove if confirmed obsolete
 def _run_spotify_analysis(tracks):
     pl_id = _state.current_playlist_id
     pl_name = _state.current_playlist_name
