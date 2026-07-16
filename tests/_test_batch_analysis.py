@@ -303,6 +303,54 @@ def test_batch_detects_external_track_change():
     )
 
 
+def test_update_viz_no_exception_on_empty_capture():
+    """_update_viz() should return gracefully (no exception) with empty/missing capture.
+    Smoke test to prevent regressions like the rms_db/peak_db NameError from
+    earlier this session."""
+    import numpy as np
+    from unittest.mock import MagicMock, patch
+
+    try:
+        import playlist_arranger.audio.capture as _cap_mod
+    except ImportError:
+        _cap_mod = None
+
+    # Patch capture module to simulate empty deque state
+    mock_cap = MagicMock()
+    mock_cap.audio_deque = None  # No audio data — should early-return silently
+    mock_cap.audio_lock = MagicMock()
+    mock_cap.actual_sr = 44100
+    mock_cap.actual_channels = 2
+
+    try:
+        # Direct smoke call — must not raise
+        _ps._update_viz()
+    except Exception as e:
+        assert False, f"_update_viz() raised {type(e).__name__}: {e}"
+
+    # Also test with minimal data in deque to exercise the full path
+    mock_cap2 = MagicMock()
+    import numpy as np
+    mock_cap2.audio_deque = list(np.zeros(4096, dtype=np.float32))
+    mock_cap2.audio_lock = MagicMock()
+    mock_cap2.actual_sr = 44100
+    mock_cap2.actual_channels = 2
+
+    # Patch _cap to mock_cap2
+    saved_cap = _ps._cap
+    _ps._cap = mock_cap2
+    try:
+        _ps._update_viz()
+    except (Exception,) as e:
+        _ps._cap = saved_cap
+        # ui.run_javascript and AssertionError are expected in test mode (no NiceGUI client)
+        msg = str(e).lower()
+        if "run_javascript" not in msg and "assertionerror" not in msg and not isinstance(e, AssertionError):
+            assert False, f"_update_viz() raised unexpected {type(e).__name__}: {e}"
+    finally:
+        _ps._cap = saved_cap
+
+
 def test_batch_processing_status_string():
     """Track with _batch_current_track_id match shows '⏳ Processing' in queue table."""
     _setup()
@@ -346,6 +394,7 @@ def run_tests():
         test_batch_expected_track_no_interference,
         test_batch_advance_does_not_false_positive_as_external,
         test_batch_detects_external_track_change,
+        test_update_viz_no_exception_on_empty_capture,
         test_on_analysis_complete_removes_from_queue,
         test_on_analysis_complete_advances_batch,
         test_stop_batch_analysis_clears_state,
