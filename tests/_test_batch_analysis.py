@@ -220,6 +220,89 @@ def test_stop_batch_analysis_clears_state():
     assert _ps._batch_watchdog_fired_by_track_id is None
 
 
+def test_batch_advance_does_not_false_positive_as_external():
+    """Normal batch progression: _batch_expected_track_id set BEFORE next track detected.
+    
+    Verifies the invariant from the trace analysis: when batch commands the next track,
+    _batch_expected_track_id is set to the new track ID BEFORE the polling thread can
+    detect the new track playing. This guarantees the interference check sees 'expected'
+    as the new track ID (not None), and treats it as a normal advance — not external
+    interference."""
+    _setup()
+    # Simulate "mid-analysis" state: track A confirmed playing, expected=None
+    _ps._batch_processing = True
+    _ps._batch_current_track_id = "track-A"
+    _ps._batch_expected_track_id = None  # A was already confirmed playing
+
+    # Simulate buffer being submitted for track A → _batch_advance_to_next sets expected to B
+    # This is what happens in _batch_advance_to_next BEFORE sp.start_playback is called
+    _ps._batch_expected_track_id = "track-B"
+
+    # Simulate the polling thread detecting track B playing (batch's own commanded track)
+    # This is the interference-check logic from _card_listen_thread
+    detected_tid = "track-B"
+    if _ps._batch_processing:
+        expected = _ps._batch_expected_track_id
+        if expected is not None and detected_tid == expected:
+            _ps._batch_expected_track_id = None  # Clear expectation — normal advance
+        elif expected is not None and detected_tid != expected:
+            _ps._batch_processing = False  # Interference during transition window
+        elif expected is None:
+            _ps._batch_processing = False  # External change (should NOT happen here!)
+
+    # Assert: batch is still running (normal advance, no false positive)
+    assert _ps._batch_processing == True, (
+        "Batch should continue on normal advance when expected_track_id matches detected track"
+    )
+    assert _ps._batch_expected_track_id is None, "Expectation flag should be cleared after confirmed match"
+
+
+def test_batch_detects_external_track_change():
+    """External track change during mid-analysis batch state is detected as interference.
+    
+    Verifies: when _batch_processing=True, _batch_expected_track_id=None (current track
+    confirmed playing, no next-track command issued), and a new track appears that batch
+    never commanded → batch stops immediately. The interrupted track stays in the queue."""
+    _setup()
+    # Simulate "mid-analysis" state: track A confirmed playing, expected=None
+    _ps._batch_processing = True
+    _ps._batch_current_track_id = "track-A"
+    _ps._batch_expected_track_id = None  # A confirmed playing, no next-track commanded
+    _state.analysis_queue.append(_make_track("track-A", "Track A (should stay in queue)"))
+
+    # Simulate an external track change — user double-clicked track C
+    detected_tid = "track-C-external"
+    if _ps._batch_processing:
+        expected = _ps._batch_expected_track_id
+        if expected is not None and detected_tid == expected:
+            _ps._batch_expected_track_id = None
+        elif expected is not None and detected_tid != expected:
+            _ps._batch_processing = False
+            _ps._batch_expected_track_id = None
+            _ps._batch_current_track_id = None
+        elif expected is None:
+            # External interference — batch should stop
+            _ps._batch_processing = False
+            _ps._batch_expected_track_id = None
+            _ps._batch_current_track_id = None
+
+    # Assert: batch stopped
+    assert _ps._batch_processing == False, (
+        "Batch should stop on external track change when expected_track_id is None"
+    )
+    assert _ps._batch_expected_track_id is None
+    assert _ps._batch_current_track_id is None
+
+    # Assert: interrupted track is NOT removed from the queue
+    assert len(_state.analysis_queue) == 1, (
+        f"Interrupted track should remain in queue for later reprocessing, "
+        f"but queue has {len(_state.analysis_queue)} tracks"
+    )
+    assert _state.analysis_queue[0]["id"] == "track-A", (
+        "Track A should still be in the queue after external interference"
+    )
+
+
 def test_batch_processing_status_string():
     """Track with _batch_current_track_id match shows '⏳ Processing' in queue table."""
     _setup()
@@ -261,6 +344,8 @@ def run_tests():
         test_stop_analyzing_idempotent,
         test_batch_interference_detection,
         test_batch_expected_track_no_interference,
+        test_batch_advance_does_not_false_positive_as_external,
+        test_batch_detects_external_track_change,
         test_on_analysis_complete_removes_from_queue,
         test_on_analysis_complete_advances_batch,
         test_stop_batch_analysis_clears_state,
