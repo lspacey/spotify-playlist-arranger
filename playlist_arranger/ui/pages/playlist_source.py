@@ -51,6 +51,36 @@ _live_ctx = LiveAnalyzeContext(
 _on_track_changed_cb = None  # callable(old_track_info, new_track_info) or None
 _live_ctx.on_track_changed_cb = _on_track_changed_cb
 
+# Analysis-complete callback — auto-removes track from queue after successful save
+def _on_analysis_complete(track_info: dict):
+    """Called from analyze worker thread after save_track_worker succeeds.
+    Removes ALL occurrences of the tracked track ID from the analysis queue."""
+    tid = track_info.get("id", "") if isinstance(track_info, dict) else ""
+    if not tid:
+        return
+    before = len(_state.analysis_queue)
+    # Remove ALL matching entries (handles duplicates allowed in queue)
+    _state.analysis_queue[:] = [t for t in _state.analysis_queue if t.get("id") != tid]
+    removed = before - len(_state.analysis_queue)
+    if removed == 0:
+        return
+    _state.save_analysis_queue()
+    logger.info("Auto-removed %d occurrence(s) of '%s' from analysis queue (after successful analysis)",
+                removed, track_info.get("name", "?")[:40])
+    # Rebuild queue UI if visible (uses captured client context for thread safety)
+    global _page_client
+    if _page_client is not None:
+        try:
+            with _page_client:
+                _update_queue_label()
+                _rebuild_queue_ui()
+                ui.notify(f"'{track_info.get('name', '?')[:30]}' removed from queue (analysis complete)",
+                          type="positive")
+        except Exception:
+            logger.exception("Failed to rebuild queue UI from analysis-complete callback")
+
+_live_ctx.on_analysis_complete_cb = _on_analysis_complete
+
 # UI element references (updated by polling thread)
 _track_name_label = None
 _track_progress_label = None

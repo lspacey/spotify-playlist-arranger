@@ -74,6 +74,11 @@ class LiveAnalyzeContext:
         # Signature: callable(old_track_info, new_track_info) → None
         self.on_track_changed_cb: Callable | None = None
 
+        # Analysis-complete callback — fired after save_track_worker succeeds
+        # Signature: callable(track_info: dict) → None
+        # Used e.g. by UI to auto-remove analyzed tracks from the analysis queue.
+        self.on_analysis_complete_cb: Callable | None = None
+
     # ── Flush ──────────────────────────────────────────────────────────────────
 
     def _flush_analyze_buffer(self, buf: AnalyzeBuffer, coverage_pct: float) -> bool:
@@ -257,6 +262,16 @@ class LiveAnalyzeContext:
                 audio_s = len(y_full) / max(22050, 1)
                 logger.info("Analysis complete: %s, %ds audio, took %.2fs",
                             track_info.get("name", "?")[:50], int(audio_s), elapsed)
+
+                # Fire analysis-complete callback (e.g. auto-remove from queue)
+                cb = self.on_analysis_complete_cb
+                if cb:
+                    try:
+                        cb(track_info)
+                    except Exception:
+                        logger.exception("on_analysis_complete_cb crashed for %s",
+                                         track_info.get("name", "?")[:30])
+
             except Exception:
                 logger.exception("Analyze worker failed for %s", track_info.get("name", "?"))
 
