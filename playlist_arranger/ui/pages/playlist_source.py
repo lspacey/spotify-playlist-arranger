@@ -1037,8 +1037,8 @@ def _render_queue_controls():
                     del _state.analysis_queue[i]
             _persist_queue()
             _update_queue_label()
-            _rebuild_queue_ui()
             ui.notify(f"Removed {len(to_remove)} track(s) from queue", type="positive")
+            _rebuild_queue_ui()  # after notify — rebuild destroys this button's container
 
         def _refresh_remove_btn():
             nonlocal remove_btn
@@ -1055,8 +1055,8 @@ def _render_queue_controls():
             _state.analysis_queue.clear()
             _persist_queue()
             _update_queue_label()
-            _rebuild_queue_ui()
             ui.notify("Queue cleared", type="positive")
+            _rebuild_queue_ui()  # after notify — rebuild destroys this button's container
 
         ui.button("Remove All Tracks from Queue", on_click=_on_remove_all, color="red").classes("text-sm").set_enabled(len(_state.analysis_queue) > 0)
 
