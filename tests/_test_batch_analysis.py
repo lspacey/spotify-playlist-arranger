@@ -14,7 +14,9 @@ from playlist_arranger.config import CACHE_DIR_DEFAULT
 
 
 def _setup():
-    """Initialize batch state for a clean test run."""
+    """Initialize batch state for a clean test run.
+    Also monkey-patches save_analysis_queue to a no-op to prevent
+    test fixtures from leaking into the real cache/analysis_queue.json."""
     _ps._batch_processing = False
     _ps._batch_current_track_id = None
     _ps._batch_current_track_duration_ms = 0
@@ -23,6 +25,8 @@ def _setup():
     _ps._batch_watchdog_fired_by_track_id = None
     _ps._batch_btn = None
     _state.analysis_queue[:] = []
+    # Prevent test track fixtures from polluting the real queue file on disk
+    _state.save_analysis_queue = lambda: None
 
 
 def _make_track(tid="test123", name="Test Track", dur=300000):
