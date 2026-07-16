@@ -1,9 +1,19 @@
 # Active Context
 
 ## Current Work Focus
-End of session — buffer lifecycle fixes, API call counter, and audio visualizer complete. Docs updated, ready to commit to `local-files-support`.
+Queue for Analysis feature implemented (2026-07-16). Batch execution logic deferred — "Start Batch Analysis" is a stub. Test suite fixed (6 tests broken by 2026-07-13 `LiveAnalyzeContext` refactor). Ready to commit to `local-files-support`.
 
 ## Recent Changes
+- **2026-07-16 (Queue for Analysis feature)**:
+  - New expandable "Queue for Analysis" section above "Your Playlists" (collapsed by default, stays collapsed on add, preserves open state if user manually expands)
+  - Repurposed per-playlist "Analyze X missing" button → "Add Selected Tracks to Queue for Analysis" (enabled only when ≥1 row checked, 0.5s timer poll)
+  - Queue label: "Queue for Analysis — N tracks" updated after every mutation
+  - Three control buttons: Start Batch Analysis (stub — logs + notify only; real execution to be done in follow-up), Remove Selected Tracks (enabled when ≥1 checked in queue), Remove All Tracks (enabled when queue non-empty)
+  - Queue persists to `cache/analysis_queue.json` via `atomic_write_json`; loaded on startup in `main.py`
+  - Queue table fully isolated from now-playing highlight system (NOT registered in `_playlist_tables`/`_now_playing_row_keys`)
+  - `_run_spotify_analysis()` tagged as TODO (unreferenced — original "Analyze X missing" caller removed)
+  - **Test suite fix**: 6 tests in `tests/_run_tests.py` updated for `LiveAnalyzeContext` API — were silently broken since 2026-07-13 refactor (referenced removed module-level globals like `_ps._analyze_buffer`, now all via `_ctx._analyze_buf`). Full suite: 6/6 passing.
+
 - **2026-07-13 (Buffer lifecycle fixes + features)**:
   - **Bug fix 1**: `sync_analyze_buffer(None)` in "not playing" polling branch — buffer flushes immediately on playback stop
   - **Bug fix 2**: Removed `SILENCE_RMS_THRESHOLD` from `collect_samples()`; replaced with `_is_playing` threading.Event gate to prevent pause-silence pollution
@@ -75,6 +85,21 @@ End of session — buffer lifecycle fixes, API call counter, and audio visualize
 
 ## Important Patterns and Preferences
 - All dependency versions are strictly pinned (`==`) for reproducible builds
+- **Refactor rule**: When extracting internal state into new classes/contexts (e.g. `LiveAnalyzeContext`), update dependent tests in the SAME commit — tests silently drifted for 3 days after the 2026-07-13 refactor before being caught (2026-07-16). Do NOT defer test updates to a follow-up.
+- **LiveAnalyzeContext old→new API mapping** (2026-07-13 refactor, tests fixed 2026-07-16):
+  | Old API (`_ps.<attr>`) | New API (`_ctx.<attr>` via `_ps._live_ctx`) |
+  |---|---|
+  | `_ps._analyze_buffer` | `_ctx._analyze_buf` (AnalyzeBuffer dataclass instance) |
+  | `_ps._analyze_track_id` | `_ctx._analyze_buf.track_id` |
+  | `_ps._analyze_samples_count` | `_ctx._analyze_buf.samples_count` |
+  | `_ps._analyze_sample_rate` | `_ctx._analyze_buf.sample_rate` |
+  | `_ps._analyze_track_duration_ms` | `_ctx._analyze_buf.track_info["duration_ms"]` |
+  | `_ps._start_analyze_buffer(id, sr)` | `_ctx.sync_analyze_buffer(track_info)` |
+  | `_ps._on_track_changed_analyze(old, new)` | `_ctx.on_track_changed(old, new)` |
+  | `_ps._analyze_poll_stop` | `_ctx._analyze_poll_stop` (direct access — same attr name) |
+  | `_ps._analyze_worker_task` | `_ctx._analyze_worker_task` (under `_ctx._analyze_worker_lock`) |
+  | `_ps._analyze_worker_busy` | `_ctx._analyze_worker_busy` (under `_ctx._analyze_worker_lock`) |
+  | `_ps._analyze_worker_lock` | `_ctx._analyze_worker_lock` |
 - Module-level `HAS_*` booleans for optional dependency handling (graceful degradation)
 - Progress callbacks (`progress_cb`) pattern throughout the codebase for UI feedback
 - Atomic file writes (`atomic_write_json`) for all persisted JSON — write to `.tmp`, then rename

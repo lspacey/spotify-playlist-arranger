@@ -902,11 +902,178 @@ def build_spotify_section(set_page_cb):
 
 _render_playlists_set_page_cb = None
 
+# ─── Queue for Analysis section ──────────────────────────────────────────────
+_queue_table_ref = None          # ui.table instance for the queue tracks
+_queue_rows_cache = []           # rows list for row_key lookup
+_queue_container = None          # the ui.column that holds the queue table + controls
+_queue_expansion_ref = None      # the ui.expansion for collapsible state
+_queue_label_ref = None          # ui.label showing "Queue for Analysis — N tracks"
+
+
+def _persist_queue():
+    """Save queue to disk after every mutation."""
+    _state.save_analysis_queue()
+
+
+def _rebuild_queue_ui():
+    """Clear and re-render the queue table + controls inside the expansion body."""
+    global _queue_table_ref, _queue_rows_cache, _queue_container
+    if _queue_container is None:
+        return
+    _queue_container.clear()
+    with _queue_container:
+        _render_queue_table()
+        _render_queue_controls()
+
+
+def _add_selected_to_queue(pl_id: str, tracks: list):
+    """Append checked tracks (in row order) to the analysis queue."""
+    selected_rows = _get_selected_rows(pl_id)
+    if not selected_rows:
+        ui.notify("No tracks selected", type="warning")
+        return
+
+    # Map selected row idx values back to track dicts in row order
+    selected_idxs = sorted(r["idx"] for r in selected_rows)
+    added = 0
+    for idx in selected_idxs:
+        i = idx - 1  # rows are 1-indexed
+        if 0 <= i < len(tracks):
+            _state.analysis_queue.append(tracks[i])
+            added += 1
+
+    _persist_queue()
+    _update_queue_label()
+    _rebuild_queue_ui()
+    ui.notify(f"Added {added} track(s) to queue", type="positive")
+    logger.info("Added %d track(s) to analysis queue (total=%d)", added, len(_state.analysis_queue))
+
+
+def _update_queue_label():
+    """Refresh the expansion label text with current queue count."""
+    global _queue_label_ref, _queue_expansion_ref
+    n = len(_state.analysis_queue)
+    label = f"Queue for Analysis — {n} track{'s' if n != 1 else ''}"
+    if _queue_label_ref is not None:
+        _queue_label_ref.set_text(label)
+    if _queue_expansion_ref is not None:
+        _queue_expansion_ref.set_text(label)
+
+
+def _render_queue_table():
+    """Render the track table inside the queue section."""
+    global _queue_table_ref, _queue_rows_cache
+    if not _state.analysis_queue:
+        ui.label("Queue is empty").classes("text-sm text-gray-400 italic")
+        return
+
+    columns = [
+        {"name": "idx", "label": "#", "field": "idx", "sortable": True},
+        {"name": "name", "label": "Track", "field": "name"},
+        {"name": "artist", "label": "Artist", "field": "artist"},
+        {"name": "duration", "label": "Dur", "field": "duration"},
+        {"name": "status", "label": "Status", "field": "status"},
+    ]
+    rows = []
+    for i, t in enumerate(_state.analysis_queue, 1):
+        dur_ms = t.get("duration_ms", 0)
+        dur_str = f"{dur_ms // 60000}:{(dur_ms // 1000) % 60:02d}" if dur_ms else "?"
+        status = _get_track_status(t)
+        rows.append({"idx": i, "name": t.get("name", "")[:42], "artist": t.get("artist", "")[:40],
+                     "duration": dur_str, "status": status})
+
+    _queue_table_ref = ui.table(
+        columns=columns, rows=rows, row_key="idx",
+        selection="multiple",
+        pagination={"rowsPerPage": 0},
+    ).classes("w-full").props("dense")
+    _queue_rows_cache = rows
+
+    # Double-click → play track from queue
+    def on_row_dblclick(e):
+        row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else {}
+        row_idx = row_data.get("idx", 0) - 1
+        if 0 <= row_idx < len(_state.analysis_queue):
+            track = _state.analysis_queue[row_idx]
+            client = ui.context.client
+            ui.timer(0.0, lambda t=track, c=client: asyncio.ensure_future(_play_track(t, client=c)), once=True)
+
+    _queue_table_ref.on("rowDblclick", on_row_dblclick)
+
+
+def _render_queue_controls():
+    """Render the three control buttons above the queue table."""
+    with ui.row().classes("w-full gap-2 mb-2"):
+        # ── 1. Start Batch Analysis ────────────────────────────────────────
+        def _on_start_batch():
+            logger.info("Batch analysis started — stub (execution logic not yet implemented)")
+            ui.notify("Batch analysis started (stub — real execution coming soon)", type="positive")
+
+        can_batch = len(_state.analysis_queue) > 0 and _state.spotify_device_id is not None
+        ui.button("Start Batch Analysis", on_click=_on_start_batch, color="green").classes("text-sm").set_enabled(can_batch)
+
+        # ── 2. Remove Selected Tracks ───────────────────────────────────────
+        def _on_remove_selected():
+            global _queue_table_ref
+            if _queue_table_ref is None:
+                return
+            selected = list(_queue_table_ref.selected) if hasattr(_queue_table_ref, 'selected') else []
+            if not selected:
+                return
+            to_remove = sorted((r["idx"] for r in selected), reverse=True)
+            for idx in to_remove:
+                i = idx - 1
+                if 0 <= i < len(_state.analysis_queue):
+                    del _state.analysis_queue[i]
+            _persist_queue()
+            _update_queue_label()
+            _rebuild_queue_ui()
+            ui.notify(f"Removed {len(to_remove)} track(s) from queue", type="positive")
+
+        def _refresh_remove_btn():
+            nonlocal remove_btn
+            if _queue_table_ref is not None:
+                selected = list(_queue_table_ref.selected) if hasattr(_queue_table_ref, 'selected') else []
+                remove_btn.set_enabled(len(selected) > 0)
+
+        remove_btn = ui.button("Remove Selected Tracks from Queue", on_click=_on_remove_selected, color="orange").classes("text-sm")
+        remove_btn.set_enabled(False)
+        ui.timer(0.5, _refresh_remove_btn)
+
+        # ── 3. Remove All Tracks ────────────────────────────────────────────
+        def _on_remove_all():
+            _state.analysis_queue.clear()
+            _persist_queue()
+            _update_queue_label()
+            _rebuild_queue_ui()
+            ui.notify("Queue cleared", type="positive")
+
+        ui.button("Remove All Tracks from Queue", on_click=_on_remove_all, color="red").classes("text-sm").set_enabled(len(_state.analysis_queue) > 0)
+
+
+def _render_analysis_queue():
+    """Render the 'Queue for Analysis' section as a collapsible expansion panel."""
+    global _queue_expansion_ref, _queue_label_ref, _queue_container
+    n = len(_state.analysis_queue)
+    label = f"Queue for Analysis — {n} track{'s' if n != 1 else ''}"
+
+    with ui.expansion(label, value=False).classes("w-full mb-4") as _queue_expansion_ref:
+        _queue_expansion_ref.props('header-class="text-lg font-semibold"')
+        _queue_label_ref = ui.label(label)  # dummy — expansion label is the primary display
+        _queue_container = ui.column().classes("w-full")
+        with _queue_container:
+            _render_queue_table()
+            _render_queue_controls()
+
 
 def _render_playlists(set_page_cb):
     global _render_playlists_set_page_cb
     _render_playlists_set_page_cb = set_page_cb
     ui.separator()
+
+    # ── Queue for Analysis (above "Your Playlists") ──────────────────────
+    _render_analysis_queue()
+
     ui.label("Your Playlists").classes("text-lg font-bold mb-2")
 
     from playlist_arranger.sources.spotify_source import get_own_playlists
@@ -1016,12 +1183,27 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
 
     missing = sum(1 for t in tracks if _get_track_status(t) != "✓ OK")
     with ui.row().classes("w-full gap-2 mt-2"):
-        if missing > 0:
-            ui.button(f"Analyze {missing} missing", on_click=lambda: _run_spotify_analysis(tracks), color="yellow").classes("text-sm")
+        # ── "Add Selected to Queue" button (replaces old "Analyze X missing") ──
+        def _build_add_to_queue_btn():
+            btn = ui.button(
+                "Add Selected Tracks to Queue for Analysis",
+                on_click=lambda: _add_selected_to_queue(pl_id, tracks),
+                color="yellow",
+            ).classes("text-sm")
+            btn.set_enabled(len(_get_selected_rows(pl_id)) > 0)
+            # Re-evaluate enabled state periodically (checkbox changes don't
+            # trigger a full re-render, so we poll the selection count)
+            def _refresh_btn_enabled():
+                btn.set_enabled(len(_get_selected_rows(pl_id)) > 0)
+            ui.timer(0.5, _refresh_btn_enabled)
+            return btn
+
+        _build_add_to_queue_btn()
         if _backup_exists(pl_id):
             ui.button("Recover from backup", on_click=lambda: _recover_from_backup(pl_id, set_page_cb), color="purple").classes("text-sm")
 
 
+# TODO: unused after Queue for Analysis feature (2026-07-16) — remove if confirmed obsolete
 def _run_spotify_analysis(tracks):
     pl_id = _state.current_playlist_id
     pl_name = _state.current_playlist_name

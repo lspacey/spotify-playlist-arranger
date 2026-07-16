@@ -24,6 +24,10 @@ from playlist_arranger.ui.pages.playlist_source import (
     build_spotify_section,
     build_local_section,
 )
+# Load persisted analysis queue on startup
+_state.load_analysis_queue()
+logger.info("Analysis queue loaded: %d track(s)", len(_state.analysis_queue))
+
 from playlist_arranger.ui.pages.anchor_editor import build_anchor_editor
 from playlist_arranger.ui.pages.smart_sorting import build_smart_sorting
 from playlist_arranger.ui.pages.database_panel import build_database_dialog

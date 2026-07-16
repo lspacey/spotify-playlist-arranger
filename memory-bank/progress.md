@@ -33,8 +33,9 @@
 - ✅ Two-column layout rebalanced to 30%/70% (left: Spotify connect/device, right: audio device + visualizer + Now Playing) for wider right column
 
 ## What's Left to Build
-- [ ] Play queue feature — multi-select checkboxes now active, `_get_selected_rows()` ready (filters out now-playing row)
-- [ ] Expand test suite (currently covers Analyze/Listen buffer lifecycle, not full pipeline)
+- [x] **Queue for Analysis feature** — expandable section above "Your Playlists", populated via per-playlist "Add Selected Tracks to Queue for Analysis" button (replaces "Analyze X missing"). Includes Start Batch Analysis (stub — real execution deferred), Remove Selected, Remove All controls. Persists to `cache/analysis_queue.json`. Fully isolated from now-playing highlight system. (2026-07-16)
+- [ ] **Batch analysis execution logic** — "Start Batch Analysis" is currently a stub (logs + notifies only). Real implementation needs to play each queued track sequentially, wait for playback, feed existing analyze buffer pipeline per track, advance to next. **Next major piece of work.**
+- [x] Expand test suite: 6 Analyze-mode regression tests updated to `LiveAnalyzeContext` API (were broken since 2026-07-13 refactor — referenced removed module-level globals like `_ps._analyze_buffer`, now access via `_ctx._analyze_buf`)
 - [ ] Cross-platform audio capture (macOS/Linux support)
 - [ ] Batch LLM description generation optimization (concurrent API calls)
 - [ ] Export sorted playlist as M3U with relative paths
