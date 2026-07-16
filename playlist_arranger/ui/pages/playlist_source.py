@@ -1075,6 +1075,51 @@ def _render_queue_table():
 
 
 # ─── Batch analysis helpers ──────────────────────────────────────────────────
+def _is_actively_playing_on_device(device_id: str | None) -> bool:
+    """Check Spotify API for active playback on a specific device.
+
+    Returns True only if: response is not None, is_playing is True,
+    AND device.id matches the given device_id.
+    """
+    if not _state.sp or not device_id:
+        return False
+    try:
+        cp = _state.sp.current_playback()
+    except Exception:
+        logger.debug("_is_actively_playing_on_device: current_playback() call failed — assuming not playing")
+        return False
+    if cp is None:
+        return False
+    if not cp.get("is_playing"):
+        return False
+    cp_device = cp.get("device") or {}
+    return cp_device.get("id") == device_id
+
+
+def _safe_pause_active_playback():
+    """Pause playback only if Spotify reports active playback on the selected device.
+
+    Reads current_playback() first (GET /me/player) to check is_playing + device match.
+    Skips the pause_playback() PUT entirely if nothing is actively playing, avoiding
+    doomed-to-fail 403 responses.
+    """
+    if not _state.sp or not _state.spotify_device_id:
+        return
+    if _is_actively_playing_on_device(_state.spotify_device_id):
+        try:
+            _state.sp.pause_playback(device_id=_state.spotify_device_id)
+            logger.debug("Paused active playback on device %s", _state.spotify_device_id[:8] if _state.spotify_device_id else "?")
+        except Exception as e:
+            err_msg = str(e)
+            if "403" in err_msg:
+                logger.debug("Pause playback failed with 403 (race condition, playback likely stopped between GET and PUT)")
+            else:
+                logger.info("Could not pause playback: %s", err_msg)
+    else:
+        logger.debug("No active playback on device %s — skipping pause",
+                     _state.spotify_device_id[:8] if _state.spotify_device_id else "?")
+
+
 def _stop_batch_analysis():
     """Stop batch mode, pause playback, stop listen+analyze. Idempotent."""
     global _batch_processing, _batch_current_track_id, _batch_expected_track_id
@@ -1088,15 +1133,7 @@ def _stop_batch_analysis():
         _batch_expected_track_id = None
         _batch_watchdog_fired_by_track_id = None
 
-    if _state.sp and _state.spotify_device_id:
-        try:
-            _state.sp.pause_playback(device_id=_state.spotify_device_id)
-        except Exception as e:
-            err_msg = str(e)
-            if "403" in err_msg:
-                logger.debug("No active playback to pause during batch stop — continuing (403)")
-            else:
-                logger.info("Could not pause playback during batch stop: %s", err_msg)
+    _safe_pause_active_playback()
 
     _stop_analyzing()
     _stop_listening()
@@ -1178,15 +1215,7 @@ def _on_start_batch():
         _batch_btn.set_text("Stop Batch Analysis")
         _batch_btn.props('color=red')
 
-    # Pause whatever's currently playing (403 is expected if nothing was playing)
-    try:
-        _state.sp.pause_playback(device_id=_state.spotify_device_id)
-    except Exception as e:
-        err_msg = str(e)
-        if "403" in err_msg:
-            logger.debug("No active playback to pause — continuing (403)")
-        else:
-            logger.info("Could not pause playback at batch start: %s", err_msg)
+    _safe_pause_active_playback()
 
     _start_listening()
     _start_analyzing()
