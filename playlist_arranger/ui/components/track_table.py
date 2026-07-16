@@ -51,15 +51,9 @@ class TrackTable:
                     if dur_ms
                     else "?"
                 )
-                from playlist_arranger.ui.state import get_track_needs_analysis
+                from playlist_arranger.ui.state import get_track_status as _get_ts
 
-                reason = get_track_needs_analysis(
-                    t["id"], t.get("duration_ms")
-                )
-                if reason:
-                    status = f"⚠ {reason}"
-                else:
-                    status = "✓ In DB"
+                status = _get_ts(t)
 
                 row = {
                     "idx": i,

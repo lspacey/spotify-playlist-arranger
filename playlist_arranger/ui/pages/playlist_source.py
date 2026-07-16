@@ -718,28 +718,8 @@ async def _play_track(track, client=None):
 
 
 def _get_track_status(track: dict) -> str:
-    tid = track["id"]
-    entry = _db.get_track(tid)
-    if not entry:
-        return "✗ Not in DB"
-    missing = []
-    features = entry.get("features")
-    if not features or not isinstance(features, dict) or not features:
-        missing.append("no features")
-    s = load_settings()
-    emb_path = s.embeds_dir / f"{tid}.npy"
-    if not emb_path.exists():
-        missing.append("no embedding")
-    real_dur = track.get("duration_ms", 0)
-    stored_dur = entry.get("duration_ms", 0)
-    if real_dur > 0 and stored_dur > 0:
-        from playlist_arranger.config import DURATION_TOLERANCE
-        diff = abs(stored_dur - real_dur) / real_dur
-        if diff > DURATION_TOLERANCE:
-            missing.append("duration mismatch")
-    if missing:
-        return f"✗ {', '.join(missing)}"
-    return "✓ OK"
+    """Delegates to state.get_track_status() (unified 7-priority check)."""
+    return _state.get_track_status(track)
 
 
 def _load_cached_playlist_tracks(playlist_id: str) -> list:
@@ -1199,8 +1179,49 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
             return btn
 
         _build_add_to_queue_btn()
+
+        # ── "Add Not OK Tracks to Queue" button ─────────────────────────────
+        def _add_not_ok_to_queue():
+            not_ok = [t for t in tracks if _state.get_track_status(t) != "✓ OK"]
+            if not not_ok:
+                ui.notify("All tracks are OK — nothing to add", type="info")
+                return
+            before = len(_state.analysis_queue)
+            for t in not_ok:
+                _state.analysis_queue.append(t)
+            _persist_queue()
+            _update_queue_label()
+            _rebuild_queue_ui()
+            added = len(_state.analysis_queue) - before
+            ui.notify(f"Added {added} track(s) to queue", type="positive")
+            logger.info("Added %d not-OK track(s) to analysis queue (total=%d)", added, len(_state.analysis_queue))
+
+        ui.button(
+            "Add Not OK Tracks to Queue for Analysis",
+            on_click=_add_not_ok_to_queue,
+            color="yellow",
+        ).classes("text-sm")
+
         if _backup_exists(pl_id):
             ui.button("Recover from backup", on_click=lambda: _recover_from_backup(pl_id, set_page_cb), color="purple").classes("text-sm")
+
+    # ── Periodic status refresh for visible rows (cell-level, preserves selection) ──
+    def _refresh_status_cells():
+        """Recompute status for each visible row and update table.rows.
+        Quasar preserves checkbox selection when row_key (idx) stays the same."""
+        nonlocal rows, track_table
+        updated = False
+        for i, t in enumerate(tracks):
+            new_status = _get_track_status(t)
+            if rows[i].get("status") != new_status:
+                rows[i]["status"] = new_status
+                updated = True
+        if updated:
+            track_table.rows = rows  # reassign triggers Quasar re-render, preserves selection
+            # Update cached rows for highlight system
+            _playlist_rows_cache[pl_id] = rows
+
+    ui.timer(2.0, _refresh_status_cells)
 
 
 # TODO: unused after Queue for Analysis feature (2026-07-16) — remove if confirmed obsolete

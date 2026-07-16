@@ -105,28 +105,87 @@ def has_anchor_plan() -> bool:
     return len(current_anchor_plan) > 0
 
 
-def get_track_needs_analysis(track_id: str, real_duration_ms=None) -> str | None:
-    """
-    Return a reason string if the track needs (re)analysis, or None if it is fine.
-    Uses DB directly.
+# ─── Expected feature keys (from audio/features.py _extract_features_full) ─────
+_EXPECTED_FEATURE_KEYS = frozenset({
+    "bpm", "beat_reg", "centroid_hz", "rolloff_hz", "bandwidth_hz", "zcr",
+    "onset_str", "bass", "mid", "high", "chroma_key", "chroma_idx",
+    "chroma_vals", "mode", "camelot", "mfcc13", "flatness", "harm_ratio",
+    "dynamic_range", "chroma_cens", "tempo_complexity", "mfcc20",
+    "rms_db", "rms_norm",
+})
+
+
+def get_track_status(track: dict) -> str:
+    """Unified per-track status check used by playlist tables, queue table, and TrackTable.
+
+    Evaluates in priority order (first failure wins):
+      1. Not in DB        → "✗ Not in DB"
+      2. Corrupt DB entry → "✗ Corrupt DB entry"
+      3. No embedding ref → "✗ No embedding"
+      4. Embedding missing → "✗ Embedding file missing"
+      5. No features       → "✗ Incomplete features"
+      6. Missing feature keys → "✗ Incomplete features"
+      7. Duration mismatch → "✗ Duration mismatch"
+      All pass → "✓ OK"
     """
     from playlist_arranger.database import db as _db
     from playlist_arranger.config import load_settings, DURATION_TOLERANCE
+    import pathlib as _pl
 
-    entry = _db.get_track(track_id)
-    if not entry:
-        return "Missing in db"
+    tid = track.get("id", "")
+    if not tid:
+        return "✗ Missing ID"
+
+    entry = _db.get_track(tid)
+
+    # 1. Not in DB
+    if entry is None:
+        return "✗ Not in DB"
+
+    # Edge case: entry is not a dict or is empty
+    if not isinstance(entry, dict) or not entry:
+        return "✗ Corrupt DB entry"
+
+    # 3. No embedding reference
     emb_file = entry.get("embedding_file")
     if not emb_file:
-        return "Missing file"
+        return "✗ No embedding"
+
+    # 4. Embedding file path set but file missing/corrupt
     s = load_settings()
-    emb_path = s.embeds_dir / f"{track_id}.npy"
+    emb_path = _pl.Path(s.embeds_dir / f"{tid}.npy")
     if not emb_path.exists():
-        return "Missing file"
+        return "✗ Embedding file missing"
+
+    # 5. No features dict
+    features = entry.get("features")
+    if not isinstance(features, dict) or not features:
+        return "✗ Incomplete features"
+
+    # 6. Check for complete feature key set
+    existing_keys = set(features.keys())
+    if not _EXPECTED_FEATURE_KEYS.issubset(existing_keys):
+        return "✗ Incomplete features"
+
+    # 7. Duration mismatch
+    real_dur = track.get("duration_ms", 0)
+    stored_dur = entry.get("duration_ms", 0)
+    if real_dur > 0 and stored_dur > 0:
+        diff = abs(stored_dur - real_dur) / real_dur
+        if diff > DURATION_TOLERANCE:
+            return "✗ Duration mismatch"
+
+    return "✓ OK"
+
+
+# Backward-compatible alias used by components/track_table.py and main.py
+def get_track_needs_analysis(track_id: str, real_duration_ms=None) -> str | None:
+    """Legacy wrapper — delegates to get_track_status() with minimal track dict."""
+    track = {"id": track_id}
     if real_duration_ms is not None:
-        stored_ms = entry.get("duration_ms", 0)
-        if stored_ms > 0:
-            diff = abs(stored_ms - real_duration_ms) / real_duration_ms
-            if diff > DURATION_TOLERANCE:
-                return "Wrong time"
-    return None
+        track["duration_ms"] = real_duration_ms
+    status = get_track_status(track)
+    if status == "✓ OK":
+        return None
+    # Map new status strings to legacy reasons
+    return status.replace("✗ ", "")

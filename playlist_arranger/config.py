@@ -183,7 +183,7 @@ else:
     LOCAL_MUSIC_DIR = str(_resolve_path(LOCAL_MUSIC_DEFAULT))
 
 # ─── Duration tolerance ───────────────────────────────────────────────────────
-DURATION_TOLERANCE = 0.01  # 1%
+DURATION_TOLERANCE = 0.10  # 10%
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip()
