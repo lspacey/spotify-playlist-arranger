@@ -333,7 +333,8 @@ def _card_listen_thread():
     """Background thread: polls Spotify API for track info + highlight only."""
     global _current_track, _current_track_elapsed, _current_track_status
     global _listen_mode, _analyze_mode, _listen_stop, _processing_stop
-    global _batch_processing, _batch_expected_track_id
+    global _batch_processing, _batch_expected_track_id, _batch_btn
+    global _page_client
     from playlist_arranger.config import POLL_FAST, POLL_NORMAL
 
     last_track_id = None
@@ -428,15 +429,16 @@ def _card_listen_thread():
                 if _batch_processing:
                     expected = _batch_expected_track_id
                     if expected is not None and tid == expected:
+                        # Expected batch advance — clear the expectation flag
                         _batch_expected_track_id = None
                         logger.info("Batch: expected track %s confirmed playing", tid[:8] if tid else "?")
                     elif expected is not None and tid != expected:
+                        # User changed track while we were waiting for our commanded track
                         _batch_processing = False
                         _batch_expected_track_id = None
                         _batch_current_track_id = None
                         logger.warning("Batch stopped: user changed track manually (expected=%s, got=%s)",
                                        expected[:8] if expected else "?", tid[:8] if tid else "?")
-                        global _page_client, _batch_btn
                         if _page_client is not None and _batch_btn is not None:
                             try:
                                 with _page_client:
@@ -445,6 +447,24 @@ def _card_listen_thread():
                                     ui.notify("Batch stopped — track changed manually", type="warning")
                             except Exception:
                                 logger.exception("Failed to update batch button after interference")
+                    elif expected is None:
+                        # Batch is active but no expected track pending — this means
+                        # the currently-playing track changed externally (user switched
+                        # tracks while batch was mid-analysis). Stop batch to prevent
+                        # cascading auto-advances through the queue.
+                        _batch_processing = False
+                        _batch_expected_track_id = None
+                        _batch_current_track_id = None
+                        logger.warning("Batch stopped: external track change detected during active batch (track=%s)",
+                                       tid[:8] if tid else "?")
+                        if _page_client is not None and _batch_btn is not None:
+                            try:
+                                with _page_client:
+                                    _batch_btn.set_text("Start Batch Analysis")
+                                    _batch_btn.props('color=green')
+                                    ui.notify("Batch analysis stopped — playback was changed externally", type="warning")
+                            except Exception:
+                                logger.exception("Failed to update batch button after external interference")
 
                 _live_ctx.sync_analyze_buffer(new_track_info)
                 cb = _on_track_changed_cb
@@ -1225,6 +1245,17 @@ def _on_start_batch():
     logger.info("Batch analysis started — %d tracks in queue", len(_state.analysis_queue))
 
 
+def _refresh_batch_btn_enabled():
+    """Re-evaluate the batch button enabled state based on current conditions.
+    Called by a periodic timer so the button enables/reacts when device is selected
+    or queue is modified, without requiring a full UI rebuild."""
+    global _batch_btn
+    if _batch_btn is None:
+        return
+    can_batch = len(_state.analysis_queue) > 0 and _state.spotify_device_id is not None
+    _batch_btn.set_enabled(can_batch or _batch_processing)
+
+
 def _render_queue_controls():
     global _batch_btn
     with ui.row().classes("w-full gap-2 mb-2"):
@@ -1233,8 +1264,10 @@ def _render_queue_controls():
             on_click=lambda: _stop_batch_analysis() if _batch_processing else _on_start_batch(),
             color="red" if _batch_processing else "green",
         ).classes("text-sm")
-        can_batch = len(_state.analysis_queue) > 0 and _state.spotify_device_id is not None
-        _batch_btn.set_enabled(can_batch or _batch_processing)
+        _refresh_batch_btn_enabled()
+        # Periodically refresh the button enabled state so it reacts to
+        # device selection / queue restore without requiring a full UI rebuild.
+        ui.timer(1.0, _refresh_batch_btn_enabled)
 
         def _on_remove_selected():
             global _queue_table_ref
