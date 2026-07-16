@@ -674,6 +674,8 @@ def _update_viz():
 
     rms = float(np.sqrt(np.mean(np.square(mono))) + 1e-12)
     peak = float(np.max(np.abs(mono)) + 1e-12)
+    rms_db = 20.0 * np.log10(rms)
+    peak_db = 20.0 * np.log10(peak)
 
     n_fft = min(512, len(mono))
     fft = np.abs(np.fft.rfft(mono, n=n_fft))
