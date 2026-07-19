@@ -731,21 +731,61 @@ def _get_track_status(track: dict) -> str:
 
 
 def _load_cached_playlist_tracks(playlist_id: str) -> list:
-    from playlist_arranger.sources.spotify_source import get_playlist_tracks as _fetch_tracks
+    from playlist_arranger.sources.spotify_source import get_playlist_tracks as _fetch_tracks, _is_track_playable
+    logger.info("Expanding playlist %s", playlist_id[:8])
     try:
-        pl_data = _state.sp.playlist(playlist_id, fields="snapshot_id")
+        pl_data = _state.sp.playlist(playlist_id, fields="snapshot_id,name")
         snapshot_id = pl_data.get("snapshot_id", "")
+        pl_name = pl_data.get("name", "?")
     except Exception:
         snapshot_id = ""
+        pl_name = "?"
+    logger.info("Playlist %s: %s (snapshot=%s)", playlist_id[:8], pl_name, snapshot_id[:8] if snapshot_id else "?")
+
     if snapshot_id:
         cache_file = CACHE_DIR_DEFAULT / f"{playlist_id}-{snapshot_id}.tracks.json"
         if cache_file.exists():
             try:
-                return json.loads(cache_file.read_text(encoding="utf-8"))
+                tracks = json.loads(cache_file.read_text(encoding="utf-8"))
+                count = len(tracks)
+                if count == 0:
+                    logger.warning(
+                        "CACHE EMPTY: %s contains 0 tracks — playlist %s may have been "
+                        "cached during a transient error. Deleting stale cache to force "
+                        "re-fetch.", cache_file, playlist_id[:8]
+                    )
+                    try:
+                        cache_file.unlink()
+                    except Exception:
+                        pass
+                    # Fall through to re-fetch from Spotify below
+                else:
+                    logger.info("Loaded %d tracks from cache: %s (%s)", count, cache_file, pl_name)
+                    return tracks
             except Exception:
-                logger.warning("Corrupted cache file, re-fetching")
-    logger.info("Fetching tracks from Spotify for playlist %s", playlist_id[:8])
-    tracks = _fetch_tracks(_state.sp, playlist_id)
+                logger.warning("Corrupted cache file %s, re-fetching", cache_file)
+                try:
+                    cache_file.unlink()
+                except Exception:
+                    pass
+                # Fall through to re-fetch from Spotify below
+
+    logger.info("Fetching tracks from Spotify API for playlist %s (%s)", playlist_id[:8], pl_name)
+    raw_tracks = _fetch_tracks(_state.sp, playlist_id)
+    raw_count = len(raw_tracks)
+    logger.info("Spotify API returned %d raw tracks for playlist %s (%s)", raw_count, playlist_id[:8], pl_name)
+
+    # Filter unplayable tracks (local files with no market data)
+    filtered = [t for t in raw_tracks if _is_track_playable(t)]
+    skipped = raw_count - len(filtered)
+    if skipped > 0:
+        logger.info("After unplayable filter: %d tracks remain, %d skipped (playlist %s)",
+                    len(filtered), skipped, playlist_id[:8])
+    if not filtered:
+        logger.warning("EMPTY RESULT: 0 playable tracks for playlist %s (%s) — "
+                       "raw count=%d, skipped=%d", playlist_id[:8], pl_name, raw_count, skipped)
+
+    # Remove any stale cache files (previous snapshot) before writing new one
     pattern = str(CACHE_DIR_DEFAULT / f"{playlist_id}-*.tracks.json")
     for old_file in _glob.glob(pattern):
         try:
@@ -756,10 +796,11 @@ def _load_cached_playlist_tracks(playlist_id: str) -> list:
         cache_file = CACHE_DIR_DEFAULT / f"{playlist_id}-{snapshot_id}.tracks.json"
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
-            cache_file.write_text(json.dumps(tracks, ensure_ascii=False), encoding="utf-8")
+            cache_file.write_text(json.dumps(filtered, ensure_ascii=False), encoding="utf-8")
+            logger.info("Cached %d tracks to %s", len(filtered), cache_file)
         except Exception as e:
             logger.warning("Failed to write cache file: %s", e)
-    return tracks
+    return filtered
 
 
 def build_spotify_section(set_page_cb):

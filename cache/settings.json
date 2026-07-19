@@ -16,7 +16,7 @@
   "album_penalty": 0.3,
   "duration_tolerance": 0.01,
   "local_music_dir": ".\\local_music",
-  "llm_backend": "deepseek",
+  "llm_backend": "mistral",
   "ollama_model": "gemma4:26b",
   "deepseek_model": "deepseek-v4-flash",
   "mistral_model": "mistal-large-latest",

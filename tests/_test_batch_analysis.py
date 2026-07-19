@@ -1557,6 +1557,107 @@ def test_batch_advance_no_ui_calls_from_bg_thread():
     )
 
 
+# ── Cache recovery tests ──────────────────────────────────────────────────────
+
+def test_stale_empty_cache_auto_deleted_and_refetched():
+    """When a 0-track cache file exists, _load_cached_playlist_tracks deletes
+    the stale file and falls through to fetch from Spotify (mocked)."""
+    _setup()
+    pid = "testpid0000000000000000"
+    snap = "AAAAtest12345678901234567890test12"
+    cache_file = CACHE_DIR_DEFAULT / f"{pid}-{snap}.tracks.json"
+
+    # Create a stale 0-track cache file
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text("[]", encoding="utf-8")
+    assert cache_file.exists()
+
+    saved_sp = _state.sp
+    try:
+        class MockSP:
+            def playlist(self, playlist_id, fields=""):
+                return {"snapshot_id": snap, "name": "Test Playlist"}
+
+        _state.sp = MockSP()
+
+        # Mock fetch returning non-empty data + make all tracks playable
+        import playlist_arranger.sources.spotify_source as _sps
+        original_fetch = _sps.get_playlist_tracks
+        original_playable = _sps._is_track_playable
+
+        def mock_fetch(sp, pid):
+            return [
+                {"id": "track1", "name": "T1", "artist": "A1",
+                 "album": "B1", "duration_ms": 200000},
+                {"id": "track2", "name": "T2", "artist": "A2",
+                 "album": "B2", "duration_ms": 180000},
+            ]
+
+        _sps.get_playlist_tracks = mock_fetch
+        _sps._is_track_playable = lambda t: True
+
+        try:
+            from playlist_arranger.ui.pages.playlist_source import _load_cached_playlist_tracks
+            tracks = _load_cached_playlist_tracks(pid)
+
+            assert len(tracks) == 2, f"Expected 2 tracks from API, got {len(tracks)}"
+            assert cache_file.exists(), "New cache should exist after re-fetch"
+            cached_data = json.loads(cache_file.read_text(encoding="utf-8"))
+            assert len(cached_data) == 2, f"Cache should have 2 tracks, got {len(cached_data)}"
+        finally:
+            _sps.get_playlist_tracks = original_fetch
+            _sps._is_track_playable = original_playable
+    finally:
+        _state.sp = saved_sp
+        # Clean up test cache files
+        pattern = str(CACHE_DIR_DEFAULT / f"{pid}-*.tracks.json")
+        for f in __import__("glob").glob(pattern):
+            try:
+                pathlib.Path(f).unlink()
+            except Exception:
+                pass
+
+
+def test_normal_cache_hit_logs_info():
+    """A normal cache hit with N>0 tracks returns correct cached data."""
+    _setup()
+    pid = "testpid2b0000000000000000"
+    snap = "AAAAhit12345678901234567890hit12"
+    cache_file = CACHE_DIR_DEFAULT / f"{pid}-{snap}.tracks.json"
+
+    cache_data = [
+        {"id": "t1", "name": "Track 1", "artist": "A1", "album": "B1", "duration_ms": 100000},
+        {"id": "t2", "name": "Track 2", "artist": "A2", "album": "B2", "duration_ms": 200000},
+    ]
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(cache_data), encoding="utf-8")
+    assert cache_file.exists()
+
+    saved_sp = _state.sp
+    try:
+        class MockSP:
+            def playlist(self, playlist_id, fields=""):
+                return {"snapshot_id": snap, "name": "Cached Playlist"}
+
+        _state.sp = MockSP()
+
+        from playlist_arranger.ui.pages.playlist_source import _load_cached_playlist_tracks
+        tracks = _load_cached_playlist_tracks(pid)
+
+        assert len(tracks) == 2, f"Expected 2 tracks from cache, got {len(tracks)}"
+        assert tracks[0]["name"] == "Track 1"
+        assert tracks[1]["name"] == "Track 2"
+        assert cache_file.exists()
+    finally:
+        _state.sp = saved_sp
+        pattern = str(CACHE_DIR_DEFAULT / f"{pid}-*.tracks.json")
+        for f in __import__("glob").glob(pattern):
+            try:
+                pathlib.Path(f).unlink()
+            except Exception:
+                pass
+
+
 class _MockUI:
     """Records all attribute accesses to detect ui.* calls from bg threads."""
     def __init__(self, calls_list):
@@ -1640,6 +1741,8 @@ def run_tests():
         test_is_track_playable_empty_markets_no_is_playable_field,
         test_is_track_playable_normal_true,
         test_is_track_playable_cached_flat_dict_defaults_true,
+        test_stale_empty_cache_auto_deleted_and_refetched,
+        test_normal_cache_hit_logs_info,
     ]
     passed = 0
     failed = 0
