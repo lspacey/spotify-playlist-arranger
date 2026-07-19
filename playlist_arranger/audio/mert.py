@@ -1,10 +1,12 @@
 """MERT neural embedding model wrapper."""
 
 import threading
+import warnings
 import numpy as np
 
 try:
     from transformers import AutoModel, Wav2Vec2FeatureExtractor
+    from transformers import logging as hf_logging
     import torch
 
     HAS_MERT = True
@@ -41,12 +43,32 @@ def load_mert(progress_cb=None):
         device = _get_device()
         if progress_cb:
             progress_cb(f"Loading MERT model on {device}...")
-        _mert_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-            "m-a-p/MERT-v1-95M", trust_remote_code=True
-        )
-        _mert_model = AutoModel.from_pretrained(
-            "m-a-p/MERT-v1-95M", trust_remote_code=True
-        )
+
+        # ── Scoped suppression of known-safe startup noise ──────────────
+        # (1) FutureWarning from huggingface_hub (internal default with
+        #     transformers 4.38.0 + newer huggingface_hub — our code never
+        #     passes resume_download=)
+        # (2) transformers INFO/WARNING: nnAudio CQT message (unused
+        #     optional dependency) + MERT weight mismatch messages (model
+        #     is used purely as frozen feature extractor — no training)
+        old_hf_verbosity = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                ".*resume_download.*",
+                FutureWarning,
+                module="huggingface_hub",
+            )
+            _mert_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+                "m-a-p/MERT-v1-95M", trust_remote_code=True
+            )
+            _mert_model = AutoModel.from_pretrained(
+                "m-a-p/MERT-v1-95M", trust_remote_code=True
+            )
+        hf_logging.set_verbosity(old_hf_verbosity)
+        # ── End scoped suppression ─────────────────────────────────────
+
         _mert_model.to(device)
         _mert_model.eval()
     if progress_cb:

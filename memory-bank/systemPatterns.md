@@ -66,12 +66,33 @@ Custom JS-based row styling (DOM manipulation via `ui.run_javascript()`) proved 
 ### 9. Canvas + Fixed-Layout Stats for High-Frequency Visualization
 For 300ms visual updates, `ui.html(canvas)` + `ui.run_javascript()` avoids NiceGUI component rebuild overhead. Fixed native canvas dimensions (120×60) with matching CSS prevent browser stretching. Stats labels use fixed `w-24` width to prevent layout reflow when values change. Silence gate (`max(abs(mono)) < 1e-10`) shows "—" placeholders instead of computing misleading `20*log10(near_zero)`.
 
-### 8. Simulated Annealing for ATSP (`sorting/solver.py`)
+### 10. Reentrant Lock Pattern for Batch State
+`_batch_lock = threading.RLock()` (reentrant) protects all `_batch_*` module-level globals. RLock (not Lock) is critical because `_batch_advance_to_next()` holds the lock and then calls `_stop_batch_analysis()` which also acquires it, which then calls `_rebuild_queue_ui()` (re-acquires for UI sync). A standard `Lock` would deadlock on the re-acquire in that call chain.
+
+### 11. Snapshot + Position Sequencer for Batch Advance
+`_batch_advance_to_next(caller_track_id)` uses `_batch_current_track_id` as a position tracker rather than a queue index. Worker completion is decoupled from advance — the function rejects stale calls by checking `_batch_current_track_id == caller_track_id`. Queue snapshot is taken at advance time (not batch start), allowing live queue growth during batch run. This prevents double-advance on race conditions between worker completion and watchdog/stop signals.
+
+### 12. Read-Before-Write for Spotify API Calls
+`_safe_pause_active_playback()` checks current Spotify playback state before sending a pause command — avoids unnecessary API calls when already paused (reduces rate limit pressure on Spotify Web API). Pattern: query → conditional mutate, not blind mutate.
+
+### 13. `ui_pending_queue` Drain Pattern for Background Thread → Main Thread Communication
+Background threads (polling, worker, watchdog) push UI update actions into a thread-safe `collections.deque` protected by `_ui_pending_lock`. A main-thread `ui.timer()` (NiceGUI) drains and executes them via `_batch_drain_ui_queue()`. This prevents "UI updates must be called from main thread" errors. A separate `_ui_context_lock` serializes main-thread access from bg-thread callback sites that interact with NiceGUI async context.
+
+### 14. Interference Detection via Expected Track ID
+`_batch_expected_track_id` records what Spotify was told to play. The polling thread compares actual playback track ID against this expectation. If they diverge (interference: user manually changed track, or Spotify played wrong thing), a banner warning is shown and logged. `_batch_watchdog_fired_by_track_id` deduplicates watchdog fires per track.
+
+### 15. Production-Clean Verification
+`tests/_verify_production_clean.py` uses a `hasattr` simulation import to verify that development-only attributes (like `_fake_save_track_worker` injection points) are not present in production code paths. This prevents test injection points from accidentally shipping.
+
+### 16. Test Data Isolation
+Before each test, `_setup()` resets all batch globals to their idle state and patches `_state.save_analysis_queue` with a no-op lambda. Queue file is fully cleaned between tests. This prevents test data from leaking into the production `cache/analysis_queue.json` file — a real bug that was caught and fixed (`12b3d79`).
+
+### 17. Simulated Annealing for ATSP (`sorting/solver.py`)
 The core sorting algorithm uses SA to solve the Asymmetric TSP with anchor constraints. Two move types:
 - **2-opt reversal** within a slot (60% probability)
 - **Track relocation** between slots (40% probability)
 
-### 7. Cache with Invalidation (`sorting/distance.py`)
+### 18. Cache with Invalidation (`sorting/distance.py`)
 `_SORTING_CACHE` caches distance matrices keyed by playlist ID and track ID tuple. Invalidation happens when track IDs change.
 
 ## Component Relationships

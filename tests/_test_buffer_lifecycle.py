@@ -10,6 +10,14 @@ import threading
 import numpy as np
 from playlist_arranger.analysis.live_buffer import LiveAnalyzeContext, AnalyzeBuffer
 
+# ── Production-data isolation ─────────────────────────────────────────────────
+# Fake save_track_worker injected into LiveAnalyzeContext so the worker
+# thread never touches the real database or embeddings folder.
+def _fake_save_track_worker(track_info, playlist_name, playlist_uri,
+                             y_full, y_start_snap=None, status_cb=None,
+                             sr_override=None):
+    pass
+
 # ── Mock capture module ───────────────────────────────────────────────────────
 class MockCapture:
     actual_sr = 44100
@@ -23,12 +31,15 @@ _mode_lock = threading.Lock()
 _mode_flag = [True]  # mutable wrapper so is_analyze_mode reads live
 
 def _new_ctx():
-    """Return a fresh LiveAnalyzeContext with a clean mode_lock and flag."""
+    """Return a fresh LiveAnalyzeContext with a clean mode_lock and flag.
+    Injects fake save_track_worker to prevent touching production DB."""
     lock = threading.Lock()
     flag = [True]
     cap = MockCapture()
     cap.actual_sr = 44100
-    return LiveAnalyzeContext(mode_lock=lock, is_analyze_mode=lambda: flag[0], capture_module=cap), lock, flag
+    ctx = LiveAnalyzeContext(mode_lock=lock, is_analyze_mode=lambda: flag[0],
+                              capture_module=cap, save_track_worker_fn=_fake_save_track_worker)
+    return ctx, lock, flag
 
 
 results = []
@@ -55,7 +66,7 @@ try:
     ctx.sync_analyze_buffer(None)
 
     with ctx._analyze_worker_lock:
-        task_was_queued = ctx._analyze_worker_task is not None
+        task_was_queued = len(ctx._analyze_worker_queue) > 0
 
     if task_was_queued:
         results.append("FAIL: test_seekback_submitted_true — buffer was re-flushed despite submitted=True")
@@ -85,13 +96,18 @@ try:
 
     ctx.sync_analyze_buffer(None)
 
-    with ctx._analyze_worker_lock:
-        task_was_queued = ctx._analyze_worker_task is not None
-
-    if task_was_queued:
+    # Verify the buffer was flushed — check submitted flag on the buffer
+    # rather than queue state, since the async worker may have already
+    # popped the task by the time we inspect the queue.
+    if buf.submitted:
         results.append("PASS: test_seekback_submitted_false — unsubmitted buffer correctly flushed on drain")
     else:
         results.append("FAIL: test_seekback_submitted_false — unsubmitted buffer was NOT flushed")
+
+    # Clean up the worker thread if it's still running
+    with ctx._analyze_worker_lock:
+        ctx._analyze_worker_queue.clear()
+        ctx._analyze_worker_busy = False
 
 except Exception as e:
     results.append(f"FAIL: test_seekback_submitted_false — {e}")

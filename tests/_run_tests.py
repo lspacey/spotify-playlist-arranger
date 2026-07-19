@@ -15,12 +15,24 @@ import dataclasses
 from playlist_arranger.ui.pages import playlist_source as _ps
 from playlist_arranger.analysis.live_buffer import AnalyzeBuffer
 
+# ── Production-data isolation ─────────────────────────────────────────────────
+# Fake save_track_worker injected into LiveAnalyzeContext so the worker
+# thread never touches the real database or embeddings folder.
+def _fake_save_track_worker(track_info, playlist_name, playlist_uri,
+                             y_full, y_start_snap=None, status_cb=None,
+                             sr_override=None):
+    pass
+
 # ── Helper ────────────────────────────────────────────────────────────────────
 _ctx = _ps._live_ctx
 
 
 def _reset_all():
     """Reset both playlist_source globals and live context state."""
+    # Inject fake save_track_worker into the shared context so any
+    # flush/submit path in these tests cannot touch the real DB/embeddings.
+    _ctx._save_track_worker_fn = _fake_save_track_worker
+    
     # Module-level globals (still on _ps)
     _ps._analyze_mode = 0
     _ps._listen_mode = 0
@@ -32,7 +44,7 @@ def _reset_all():
     _ctx._analyze_buf = None
     _ctx._is_playing.set()  # default: playing
     with _ctx._analyze_worker_lock:
-        _ctx._analyze_worker_task = None
+        _ctx._analyze_worker_queue.clear()
         _ctx._analyze_worker_busy = False
 
 
@@ -97,7 +109,7 @@ def test_mid_track_coverage_discarded_below_threshold():
 
     # Old buffer's insufficient coverage should NOT have submitted a worker task
     with _ctx._analyze_worker_lock:
-        task = _ctx._analyze_worker_task
+        task = _ctx._analyze_worker_queue.popleft() if _ctx._analyze_worker_queue else None
     assert task is None, f"Expected no task (insufficient coverage), got {task!r}"
 
 
@@ -131,10 +143,9 @@ def test_mid_track_full_coverage_submits():
 
     # 95% coverage should have submitted a worker task
     with _ctx._analyze_worker_lock:
-        task = _ctx._analyze_worker_task
-        submitted = _ctx._analyze_worker_busy or task is not None
+        submitted = _ctx._analyze_worker_busy or len(_ctx._analyze_worker_queue) > 0
         # Cleanup
-        _ctx._analyze_worker_task = None
+        _ctx._analyze_worker_queue.clear()
         _ctx._analyze_worker_busy = False
 
     assert submitted, "95% coverage should submit — got no worker task"
@@ -257,10 +268,9 @@ def test_flush_uses_old_track_duration_not_new():
 
     # The old buffer (95% of 285600ms) should have submitted
     with _ctx._analyze_worker_lock:
-        task = _ctx._analyze_worker_task
-        submitted = _ctx._analyze_worker_busy or task is not None
+        submitted = _ctx._analyze_worker_busy or len(_ctx._analyze_worker_queue) > 0
         # Cleanup
-        _ctx._analyze_worker_task = None
+        _ctx._analyze_worker_queue.clear()
         _ctx._analyze_worker_busy = False
 
     assert submitted, (

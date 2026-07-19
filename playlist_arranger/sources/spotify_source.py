@@ -129,15 +129,48 @@ def get_own_playlists(sp, user_id):
     return playlists
 
 
+def _is_track_playable(item: dict) -> bool:
+    """Return True if a Spotify playlist-item/track is playable.
+
+    Handles both raw Spotify envelope items (with ``item`` sub-object — the
+    Spotify Web API places the track under the ``"item"`` key, not ``"track"``)
+    and already-flattened track dicts loaded from cache (no extra fields).
+    """
+    # Distinguish raw envelope (has "item" key) vs flattened cached track
+    track = item.get("item") if "item" in item else item
+    if track is None:
+        return False
+    if track.get("is_playable") is False:
+        return False
+    restrictions = track.get("restrictions")
+    if restrictions:
+        return False
+    if "is_playable" not in track and "item" in item:
+        # Only apply the available_markets fallback on raw Spotify responses
+        # (the envelope has an "item" key).  Cached/flattened dicts never have
+        # is_playable/available_markets, so we skip this check for them.
+        available_markets = track.get("available_markets")
+        if available_markets is not None and len(available_markets) == 0:
+            return False
+    return True
+
+
 def get_playlist_tracks(sp, playlist_id):
-    """Fetch all tracks from a playlist. Skips local files, episodes, and null items."""
+    """Fetch all tracks from a playlist.
+
+    Skips local files, episodes, null items, and **unplayable** tracks
+    (deleted, region-restricted, market-unavailable).  Uses ``market="from_token"``
+    so the Spotify API includes the ``is_playable`` field for reliable detection.
+    """
     tracks = []
     limit = 100
     offset = 0
+    skipped_unplayable = 0
 
     while True:
         try:
-            result = sp.playlist_items(playlist_id, limit=limit, offset=offset)
+            result = sp.playlist_items(playlist_id, limit=limit, offset=offset,
+                                       market="from_token")
         except Exception as exc:
             raise RuntimeError(f"API error fetching tracks: {exc}") from exc
 
@@ -148,13 +181,20 @@ def get_playlist_tracks(sp, playlist_id):
                 continue
             t = item.get("item")
             if not t:
+                skipped_unplayable += 1
                 continue
             if item.get("is_local"):
+                skipped_unplayable += 1
                 continue
             if t.get("type") != "track":
+                skipped_unplayable += 1
                 continue
             tid = t.get("id")
             if not tid:
+                skipped_unplayable += 1
+                continue
+            if not _is_track_playable(item):
+                skipped_unplayable += 1
                 continue
             tracks.append(
                 {
@@ -173,6 +213,9 @@ def get_playlist_tracks(sp, playlist_id):
         offset += limit
         time.sleep(0.3)
 
+    if skipped_unplayable:
+        logger.info("Skipped %d unplayable/unavailable track(s) from playlist %s",
+                     skipped_unplayable, playlist_id[:8] if playlist_id else "?")
     return tracks
 
 

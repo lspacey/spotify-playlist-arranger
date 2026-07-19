@@ -8,6 +8,7 @@ Design: LiveAnalyzeContext owns all buffer state as instance attributes,
 not module globals — so multiple concurrent contexts (e.g. one for Spotify
 live capture, one for local file batch) don't interfere."""
 
+import collections
 import dataclasses
 import threading
 import time
@@ -48,10 +49,14 @@ class LiveAnalyzeContext:
       - capture: the audio.capture module reference (for actual_sr/audio_deque etc.)
     """
 
-    def __init__(self, mode_lock: threading.Lock, is_analyze_mode: Callable[[], bool], capture_module):
+    def __init__(self, mode_lock: threading.Lock, is_analyze_mode: Callable[[], bool], capture_module,
+                 save_track_worker_fn: Callable | None = None):
         self.mode_lock = mode_lock
         self.is_analyze_mode = is_analyze_mode
         self.capture = capture_module
+        # Optional injection of save_track_worker for test isolation.
+        # When None (production), _worker_loop imports the real function.
+        self._save_track_worker_fn = save_track_worker_fn
 
         # Buffer state
         self._analyze_buf: AnalyzeBuffer | None = None
@@ -60,9 +65,11 @@ class LiveAnalyzeContext:
         self._is_playing = threading.Event()
         self._is_playing.set()  # default: playing (poller clears on pause, sets on resume)
 
-        # Worker state
+        # Worker state — FIFO deque ensures NO collected audio data is ever
+        # silently dropped. Every submitted task represents real, valid,
+        # already-collected audio that must be processed and saved.
         self._analyze_worker_busy: bool = False
-        self._analyze_worker_task: dict | None = None
+        self._analyze_worker_queue: collections.deque = collections.deque()
         self._analyze_worker_lock = threading.Lock()
         self._analyze_worker_thread: threading.Thread | None = None
 
@@ -94,7 +101,12 @@ class LiveAnalyzeContext:
     # ── Flush ──────────────────────────────────────────────────────────────────
 
     def _flush_analyze_buffer(self, buf: AnalyzeBuffer, coverage_pct: float) -> bool:
-        """Flush a completed AnalyzeBuffer: concatenate chunks, submit if coverage is sufficient."""
+        """Flush a completed AnalyzeBuffer: concatenate chunks, submit if coverage is sufficient.
+        
+        CALLER MUST hold self.mode_lock — this method does not acquire it internally.
+        This serializes with collect_samples() and sync_analyze_buffer() which
+        also mutate _analyze_buf under mode_lock."""
+        assert self.mode_lock.locked(), "CALLER MUST hold self.mode_lock before calling _flush_analyze_buffer()"
         import numpy as np
         if not buf.chunks:
             logger.debug("Flush skipped: empty buffer")
@@ -108,6 +120,9 @@ class LiveAnalyzeContext:
             self._submit_analyze_task(buf.track_info, y_full)
             logger.info("Track complete: coverage=%.1f%%, submitting for analysis: %s",
                         coverage_pct * 100, buf.track_info.get("name", "")[:50] if buf.track_info else "?")
+            # Mark submitted BEFORE firing callback (prevents double-flush in
+            # concurrent paths like flush_before_stop + sync_analyze_buffer).
+            buf.submitted = True
             # Fire buffer-submitted callback (batch mode advances immediately)
             cb = self.on_buffer_submitted_cb
             if cb:
@@ -264,16 +279,22 @@ class LiveAnalyzeContext:
     # ── Async processing worker ────────────────────────────────────────────────
 
     def _worker_loop(self):
-        """Single long-lived thread: pulls tasks from queue, processes, loops."""
-        from playlist_arranger.analysis.worker import save_track_worker
+        """Single long-lived thread: drains the FIFO queue completely,
+        processing every submitted task. NEVER drops any task — every
+        enqueued task represents real, already-collected audio data."""
+        # Use injected function if provided (test isolation), otherwise
+        # import the real save_track_worker (production).
+        if self._save_track_worker_fn is not None:
+            save_track_worker = self._save_track_worker_fn
+        else:
+            from playlist_arranger.analysis.worker import save_track_worker  # noqa: F811
 
         while True:
             task = None
             while task is None:
                 with self._analyze_worker_lock:
-                    if self._analyze_worker_task is not None:
-                        task = self._analyze_worker_task
-                        self._analyze_worker_task = None
+                    if self._analyze_worker_queue:
+                        task = self._analyze_worker_queue.popleft()
                     else:
                         self._analyze_worker_busy = False
                 if task is None:
@@ -304,17 +325,18 @@ class LiveAnalyzeContext:
                 logger.exception("Analyze worker failed for %s", track_info.get("name", "?"))
 
     def _submit_analyze_task(self, track_info, y_full):
-        """Queue an analyze task for the async worker (maxsize=1, drops oldest pending)."""
+        """Enqueue an analyze task for the async worker.
+        
+        Uses a FIFO deque — every submitted task represents real, valid,
+        already-collected audio data. No task is ever silently dropped."""
         with self._analyze_worker_lock:
-            if self._analyze_worker_busy or self._analyze_worker_task is not None:
-                if self._analyze_worker_task is not None:
-                    logger.info("Analyze worker busy, replacing pending task for %s with %s",
-                                self._analyze_worker_task["track_info"].get("name", "?")[:30],
-                                track_info.get("name", "?")[:30])
-                self._analyze_worker_task = {"track_info": track_info, "y_full": y_full}
-            else:
+            self._analyze_worker_queue.append({"track_info": track_info, "y_full": y_full})
+            n = len(self._analyze_worker_queue)
+            if n > 1:
+                logger.info("Analyze worker queue: %d pending tasks (appended '%s')",
+                            n, track_info.get("name", "?")[:30] if track_info else "?")
+            if not self._analyze_worker_busy:
                 self._analyze_worker_busy = True
-                self._analyze_worker_task = {"track_info": track_info, "y_full": y_full}
                 self._analyze_worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
                 self._analyze_worker_thread.start()
 
@@ -350,19 +372,26 @@ class LiveAnalyzeContext:
         logger.info("Analyze poll thread started")
 
     def stop_poll_thread(self):
-        """Stop the WASAPI → buffer feeding thread and flush/discard buffer."""
+        """Stop the WASAPI → buffer feeding thread.
+        
+        Does NOT discard the buffer — the caller must call flush_before_stop()
+        first to flush any collected audio data before calling this."""
         self._analyze_poll_stop.set()
-        self._analyze_buf = None
         logger.info("Analyze poll thread stopped")
 
     def flush_before_stop(self):
-        """Flush current buffer if unsubmitted (for manual Stop button)."""
-        if self._analyze_buf is not None and not self._analyze_buf.submitted:
-            dur_ms = self._analyze_buf.track_info.get("duration_ms", 0) if self._analyze_buf.track_info else 0
-            expected_samples = int(self._analyze_buf.sample_rate * dur_ms / 1000.0) if dur_ms else 0
-            coverage = self._analyze_buf.samples_count / expected_samples if expected_samples > 0 else 0.0
-            self._flush_analyze_buffer(self._analyze_buf, coverage)
-        self._analyze_buf = None
+        """Flush current buffer if unsubmitted (for manual Stop button).
+        
+        Holds self.mode_lock to serialize with collect_samples() and
+        sync_analyze_buffer() — prevents races where the poll thread
+        is mid-write to _analyze_buf while we flush."""
+        with self.mode_lock:
+            if self._analyze_buf is not None and not self._analyze_buf.submitted:
+                dur_ms = self._analyze_buf.track_info.get("duration_ms", 0) if self._analyze_buf.track_info else 0
+                expected_samples = int(self._analyze_buf.sample_rate * dur_ms / 1000.0) if dur_ms else 0
+                coverage = self._analyze_buf.samples_count / expected_samples if expected_samples > 0 else 0.0
+                self._flush_analyze_buffer(self._analyze_buf, coverage)
+            self._analyze_buf = None
 
     @property
     def analyze_buf(self):

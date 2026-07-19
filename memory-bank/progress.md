@@ -33,9 +33,10 @@
 - ✅ Two-column layout rebalanced to 30%/70% (left: Spotify connect/device, right: audio device + visualizer + Now Playing) for wider right column
 
 ## What's Left to Build
-- [x] **Queue for Analysis feature** — expandable section above "Your Playlists", populated via per-playlist "Add Selected Tracks to Queue for Analysis" button (replaces "Analyze X missing"). Includes Start Batch Analysis (stub — real execution deferred), Remove Selected, Remove All controls. Persists to `cache/analysis_queue.json`. Fully isolated from now-playing highlight system. (2026-07-16)
-- [ ] **Batch analysis execution logic** — "Start Batch Analysis" is currently a stub (logs + notifies only). Real implementation needs to play each queued track sequentially, wait for playback, feed existing analyze buffer pipeline per track, advance to next. **Next major piece of work.**
-- [x] Expand test suite: 6 Analyze-mode regression tests updated to `LiveAnalyzeContext` API (were broken since 2026-07-13 refactor — referenced removed module-level globals like `_ps._analyze_buffer`, now access via `_ctx._analyze_buf`)
+- [x] **Queue for Analysis feature** — expandable section above "Your Playlists", populated via per-playlist "Add Selected Tracks to Queue for Analysis" button (replaces "Analyze X missing"). Persists to `cache/analysis_queue.json`. Fully isolated from now-playing highlight system. (2026-07-16)
+- [x] **Batch analysis execution logic** — Real sequential playback via `_batch_advance_to_next()` with snapshot+position sequencer, interference detection (`_batch_expected_track_id`), watchdog timer, live queue rendering, thread-safety (RLock), auto-remove analyzed tracks from queue. (2026-07-17/18)
+- [x] Expand test suite: 6 Analyze-mode regression tests + ~50 batch-specific regression tests in `tests/_test_batch_analysis.py` (batch advance, interference, watchdog, queue lifecycle, thread-safety, race conditions, flush-during-stop patterns)
+- [x] Production-clean verification: `tests/_verify_production_clean.py` ensures `hasattr` checks return False in production
 - [ ] Cross-platform audio capture (macOS/Linux support)
 - [ ] Batch LLM description generation optimization (concurrent API calls)
 - [ ] Export sorted playlist as M3U with relative paths
@@ -47,15 +48,17 @@
 - [ ] Packaging (single .exe via PyInstaller, or MSIX)
 
 ## Current Status
-The application is feature-complete for its core workflow. Users can:
+The application is feature-complete for its core workflow with **batch analysis now fully implemented**. Users can:
 1. Connect to Spotify or browse local files
-2. Analyze tracks (spotify playback capture or local file analysis)
+2. **Batch analyze** — queue tracks from multiple playlists, then run "Start Batch Analysis" for sequential automatic capture (or analyze one-at-a-time via the Now Playing card)
 3. Generate AI descriptions
 4. Create anchors manually or with AI
 5. Run smart sorting
 6. Save results back to Spotify or export M3U
 
-The application has been tested with RTX 5080 GPU acceleration. All primary features are functional. Three critical analyze-mode bugs were fixed (2026-07-12) with 6 regression tests passing.
+Batch analysis includes: interference detection (warns if Spotify plays wrong track), watchdog timer (alerts if track is stuck), live queue position highlighting, thread-safety via reentrant RLock, auto-removal of analyzed tracks from queue, and production-clean verification. Test suite: ~50 batch-specific regression tests + 5 buffer lifecycle tests + 6 analyze-mode regression tests — all passing.
+
+The application has been tested with RTX 5080 GPU acceleration. All primary features are functional.
 
 ## Known Issues
 - MERT model is incompatible with `transformers >= 4.44.0` (pinned to 4.38.0 as workaround)
@@ -65,6 +68,8 @@ The application has been tested with RTX 5080 GPU acceleration. All primary feat
 - WASAPI loopback capture is Windows-only — no macOS/Linux support
 - `torchvision` warning: explicitly excluded from requirements but may be auto-installed as transitive dependency
 - `LiveAnalyzeContext._analyze_buf` unprotected property — callers MUST hold `mode_lock` before reading; `get_locked_buf()` assertion catches violations in dev
+- Batch analysis queue operates on live `state.analysis_queue` — tracks added mid-batch are discovered when `_batch_advance_to_next()` re-checks the queue (not a frozen snapshot)
+- Interference detection tolerance is hardcoded; could be made configurable via settings
 
 > **2026-07-13 — Buffer lifecycle fixes (continue implementation)**
 > - **Bug fix 1**: `sync_analyze_buffer(None)` called in "not playing" branch of polling loop — flushes buffer immediately on playback stop (previously waited for track change that never came)
@@ -92,3 +97,7 @@ The application has been tested with RTX 5080 GPU acceleration. All primary feat
 12. **Prefer native mechanisms over custom JS**: JS-based row styling has been unreliable in this codebase — Quasar native `.selected` is maintained by the framework and survives DOM re-renders
 13. **Pause-aware audio gating**: Replaced RMS silence filter (which caused coverage undercounting during quiet passages) with `_is_playing` threading.Event gate — polls Spotify playback state rather than analyzing audio energy. Defaults to True so buffer collection works out of the box, cleared on pause, set on resume.
 14. **Canvas-based visualization over component rebuilds**: For high-frequency UI updates (300ms), `ui.html(canvas)` + `ui.run_javascript()` avoids NiceGUI component rebuild overhead. Fixed canvas dimensions + CSS matching prevent browser scaling artifacts. Fixed-width stat labels prevent layout reflow when values change.
+15. **Reentrant RLock for batch analysis**: `_batch_lock` (RLock, not Lock) protects batch state globals. Reentrant needed because `_batch_advance_to_next()` holds the lock, calls `_stop_batch_analysis()` which also acquires it, which calls `_rebuild_queue_ui()` (re-acquires for UI sync). Standard `Lock` would deadlock on re-acquire.
+16. **Snapshot+position sequencer pattern**: Batch advance uses `_batch_current_track_id` as a position tracker rather than queue index. Worker completion is decoupled from advance — the advance function is called with the completed track_id; it checks `_batch_current_track_id == caller_track_id` to reject stale calls. Queue snapshot taken at advance time, not at batch start — allows live queue growth during batch run.
+17. **Read-before-write for API calls**: `_safe_pause_active_playback()` checks current Spotify playback state before sending a pause command — avoids unnecessary API calls when already paused (reduces rate limit pressure).
+18. **`ui_pending_queue` drain pattern**: Background threads push UI update actions into a thread-safe deque; a main-thread `ui.timer` drains and executes them. Prevents "UI updates must be called from main thread" errors. Includes `_ui_context_lock` (separate from `_batch_lock`) for serializing main-thread access from bg-thread callback sites.

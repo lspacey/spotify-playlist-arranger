@@ -2,6 +2,7 @@
 
 import logging
 import pathlib
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,8 @@ def get_settings():
 
 
 analysis_queue: list = []
+analysis_queue_lock = threading.Lock()
+analysis_current_track_id: str | None = None  # set ONLY when worker starts after coverage passes
 
 
 def clear_playlist():

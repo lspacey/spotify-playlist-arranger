@@ -350,14 +350,18 @@ def main():
 
     threading.Thread(target=_preload_mert, daemon=True).start()
 
-    ui.run(
-        title="Playlist Arranger",
-        host="127.0.0.1",
-        port=8082,
-        reload=False,
-        show=True,
-    )
-    logger.info("Playlist Arranger stopped")
+    try:
+        ui.run(
+            title="Playlist Arranger",
+            host="127.0.0.1",
+            port=8082,
+            reload=False,
+            show=True,
+        )
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested (Ctrl-C) — exiting cleanly.")
+    else:
+        logger.info("Playlist Arranger stopped")
 
 
 if __name__ == "__main__":

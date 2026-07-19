@@ -1,9 +1,27 @@
 # Active Context
 
 ## Current Work Focus
-Queue for Analysis feature implemented (2026-07-16). Batch execution logic deferred — "Start Batch Analysis" is a stub. Test suite fixed (6 tests broken by 2026-07-13 `LiveAnalyzeContext` refactor). Ready to commit to `local-files-support`.
+Batch analysis execution fully implemented (2026-07-17/18). The "Start Batch Analysis" stub has been replaced with real sequential playback logic including interference detection, watchdog timer, live queue rendering, and comprehensive thread-safety (RLock). Test suite expanded to cover ~50 batch-specific regression tests. Package split (`playlist_source.py` → package) was attempted and reverted — keeping single-file module for now. All work on `local-files-support` branch.
 
 ## Recent Changes
+- **2026-07-18 (Batch analysis — package split + reversion)**:
+  - Attempted `playlist_source.py` → `playlist_source/` package conversion (`91879b2`), reverted in HEAD (`9f1fc9b`) — single-file module retained
+  - 17 commits total on branch covering full batch analysis implementation
+
+- **2026-07-17/18 (Real batch analysis execution)**:
+  - **Thread-safety**: `_batch_lock` (reentrant RLock) protecting all `_batch_*` globals — reentrant needed because `_batch_advance_to_next` → `_stop_batch_analysis` → `_rebuild_queue_ui` call chain
+  - **Snapshot+position sequencer**: `_batch_advance_to_next()` uses `_batch_current_track_id` as position tracker; snapshot of queue position taken before playback, decoupled from worker completion — stale track_id check prevents double-advance
+  - **Interference detection**: `_batch_expected_track_id` tracks what Spotify was told to play; if playback reports a different track, watchdog fires warning (banner + log) with configurable tolerance
+  - **Watchdog timer**: Separate polling thread monitors `_batch_current_track_duration_ms + tolerance`; fires once per track via `_batch_watchdog_fired_by_track_id` dedup
+  - **Live queue rendering**: `_needs_queue_highlight` flag + `_ui_pending_queue` drain mechanism for batch position updates from background threads
+  - **`_safe_pause_active_playback()`**: Read-before-write pause pattern — checks current playback state before sending pause to avoid unnecessary API calls
+  - **Auto-remove analyzed tracks**: `_on_analysis_complete` callback removes track from queue after successful analysis save
+  - **7-priority track status**: Unified status checking logic (`Status.BAD_GENRE` → `UNKNOWN` → `NEEDS_REANALYSIS` → `DIFFERENT_VERSION` → `LAST_RUN` → `UNPLAYABLE_LOCAL` → `OK`) with "Add Not OK Tracks" button
+  - **Status refresh timer**: Periodic UI refresh of track status indicators
+  - **4 bugs fixed** from live testing: `_update_viz()` NameError, pause pattern races, batch state cleanup, test data isolation
+  - **2 regression tests** for batch interference false-positive invariant
+  - **Production-clean verification**: `tests/_verify_production_clean.py` ensures `hasattr` checks return False in production
+
 - **2026-07-16 (Queue for Analysis feature)**:
   - New expandable "Queue for Analysis" section above "Your Playlists" (collapsed by default, stays collapsed on add, preserves open state if user manually expands)
   - Repurposed per-playlist "Analyze X missing" button → "Add Selected Tracks to Queue for Analysis" (enabled only when ≥1 row checked, 0.5s timer poll)
@@ -49,7 +67,7 @@ Queue for Analysis feature implemented (2026-07-16). Batch execution logic defer
 - **2026-07-12**: Major refactor of Now Playing card — three-stage decoupling of Listen/Analyze into independent threads with async worker queue; added silence detection, unlimited buffer with safety cap, track change callback, 90% coverage threshold
 - **2026-07-10**: Memory bank initialized (7 files) + API doc summaries created
 - **2026-07-10**: Context7 MCP server configured and verified working
-- Latest git commit: `0f4fb5f3ab98d5bc049639436d816b13374ee0e6`
+- Latest git commit (HEAD, `local-files-support`): `9f1fc9b Revert "Convert playlist_source.py to playlist_source/ package"`
 
 ### Now Playing Architecture (2026-07-12)
 | Component | Thread | Responsibility |
