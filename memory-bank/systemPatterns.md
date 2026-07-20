@@ -92,7 +92,33 @@ The core sorting algorithm uses SA to solve the Asymmetric TSP with anchor const
 - **2-opt reversal** within a slot (60% probability)
 - **Track relocation** between slots (40% probability)
 
-### 18. Cache with Invalidation (`sorting/distance.py`)
+### 18. Module Decomposition via Dependency Injection (2026-07-20)
+
+Three modules were extracted from `playlist_source.py` as pure moves (no behavior changes). Each uses a `configure()` function receiving callbacks from `playlist_source` at module init time to avoid circular imports:
+
+| Extracted Module | Lines | Responsibility |
+|---|---|---|
+| `analysis/batch_analyzer.py` | 208 | Batch state globals, `_batch_advance_to_next()`, `_stop_batch_analysis()`, watchdog, UI drain queue |
+| `ui/audio_viz.py` | 141 | Canvas JS setup, `_update_viz()`, FFT band computation |
+| `ui/playlist_highlight.py` | 207 | `_sync_row_highlight()`, `_notify_playing_track()`, auto-expand/collapse, playlist table refs |
+
+Pattern:
+```python
+# In extracted module:
+def configure(callback_fn=None, ...):
+    global _callback_fn
+    _callback_fn = callback_fn
+
+# In playlist_source.py at module init:
+from playlist_arranger.analysis.batch_analyzer import configure
+configure(stop_analyzing_fn=_stop_analyzing, ...)
+```
+This avoids circular imports while keeping the extraction transparent to existing callers.
+
+### 19. Track Playability Filtering (2026-07-20)
+`_load_cached_playlist_tracks()` applies `_is_track_playable()` to raw Spotify API results, filtering out local files with no market data before caching. Also detects and auto-deletes stale empty cache files (0 tracks from transient errors) and corrupt cache files (JSON parse failures), forcing clean re-fetch from Spotify API.
+
+### 20. Cache with Invalidation (`sorting/distance.py`)
 `_SORTING_CACHE` caches distance matrices keyed by playlist ID and track ID tuple. Invalidation happens when track IDs change.
 
 ## Component Relationships

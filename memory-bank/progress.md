@@ -48,7 +48,7 @@
 - [ ] Packaging (single .exe via PyInstaller, or MSIX)
 
 ## Current Status
-The application is feature-complete for its core workflow with **batch analysis now fully implemented**. Users can:
+The application is feature-complete for its core workflow with **batch analysis now fully implemented** and the monolithic `playlist_source.py` partially decomposed into focused modules. Users can:
 1. Connect to Spotify or browse local files
 2. **Batch analyze** — queue tracks from multiple playlists, then run "Start Batch Analysis" for sequential automatic capture (or analyze one-at-a-time via the Now Playing card)
 3. Generate AI descriptions
@@ -56,7 +56,18 @@ The application is feature-complete for its core workflow with **batch analysis 
 5. Run smart sorting
 6. Save results back to Spotify or export M3U
 
-Batch analysis includes: interference detection (warns if Spotify plays wrong track), watchdog timer (alerts if track is stuck), live queue position highlighting, thread-safety via reentrant RLock, auto-removal of analyzed tracks from queue, and production-clean verification. Test suite: ~50 batch-specific regression tests + 5 buffer lifecycle tests + 6 analyze-mode regression tests — all passing.
+Batch analysis includes: interference detection (warns if Spotify plays wrong track), watchdog timer (alerts if track is stuck), live queue position highlighting, thread-safety via reentrant RLock, auto-removal of analyzed tracks from queue, and production-clean verification.
+
+**Recent refactoring (2026-07-20)**: Three modules extracted from `playlist_source.py`:
+- `analysis/batch_analyzer.py` — batch state and sequencer logic
+- `ui/audio_viz.py` — canvas visualization and FFT updates
+- `ui/playlist_highlight.py` — row highlighting, auto-expand, notify
+
+**New tools directory** (`tools/`): `_add_dedup.py` (deduplication), `_diagnose_unplayable.py` (track playability diagnostics), `_move_ph_step1/2/3.py` (multi-step playlist migration helper).
+
+**Cache robustness (2026-07-20)**: Empty cache files and corrupt cache files are auto-detected and deleted, forcing clean re-fetch. Unplayable tracks (local files with no market data) are filtered during playlist loading.
+
+**Test suite**: ~50 batch-specific regression tests in `tests/_test_batch_analysis.py` + 5 buffer lifecycle tests + 6 analyze-mode regression tests + `tests/_verify_production_clean.py` (hasattr guard) + `tests/_capture_hashes.py` (hash snapshot utility) — all passing. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 13 cache files).
 
 The application has been tested with RTX 5080 GPU acceleration. All primary features are functional.
 

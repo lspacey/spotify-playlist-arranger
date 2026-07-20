@@ -1,9 +1,35 @@
 # Active Context
 
 ## Current Work Focus
-Batch analysis execution fully implemented (2026-07-17/18). The "Start Batch Analysis" stub has been replaced with real sequential playback logic including interference detection, watchdog timer, live queue rendering, and comprehensive thread-safety (RLock). Test suite expanded to cover ~50 batch-specific regression tests. Package split (`playlist_source.py` → package) was attempted and reverted — keeping single-file module for now. All work on `local-files-support` branch.
+Batch analysis execution fully implemented (2026-07-17/18), followed by module extraction refactoring and stability fixes (2026-07-20). The monolithic `playlist_source.py` has been partially decomposed by extracting batch analysis logic, audio visualization, and playlist highlight/auto-expand logic into separate modules using dependency injection. Unplayable track filtering and cache robustness improvements added. Test suite expanded to ~50 batch-specific regression tests + hash snapshot baseline. All work on `local-files-support` branch.
 
 ## Recent Changes
+- **2026-07-20 (Minor fixes — HEAD: `0921edf`)**:
+  - **Unplayable track filtering**: `_load_cached_playlist_tracks()` now calls `_is_track_playable()` on raw Spotify API results, filtering out local files with no market data. With detailed logging of raw→filtered counts and warnings for empty results.
+  - **Empty cache detection**: Cache files with 0 tracks are auto-detected and deleted (stale write from transient error), forcing re-fetch from Spotify API.
+  - **Corrupted cache handling**: `json.loads` failures now delete the corrupt cache file and re-fetch instead of silently falling through.
+  - **Stale cache cleanup**: Previous snapshot cache files are deleted before writing new snapshot cache.
+  - **Playlist name in logs**: Added playlist name extraction alongside snapshot_id for clearer debugging output.
+  - **Additional batch regression tests**: 103 lines of new tests in `_test_batch_analysis.py`.
+
+- **2026-07-20 (Bug fixes, stability, internal changes — `c86d35b`)**:
+  - **Module extraction refactoring** (pure moves, no behavior changes):
+    - `playlist_arranger/analysis/batch_analyzer.py` (208 lines) — batch state globals, `_batch_advance_to_next()`, `_stop_batch_analysis()`, watchdog, UI drain queue, all extracted from `playlist_source.py`
+    - `playlist_arranger/ui/audio_viz.py` (141 lines) — canvas JS setup, `_update_viz()`, FFT band computation extracted from `playlist_source.py`
+    - `playlist_arranger/ui/playlist_highlight.py` (207 lines) — `_sync_row_highlight()`, `_notify_playing_track()`, auto-expand/collapse, playlist table refs, all extracted from `playlist_source.py`
+  - **Dependency injection pattern** used in all three new modules: `configure()` function receives callbacks from `playlist_source` at module init time, avoiding circular imports.
+  - **`playlist_source.py`**: significantly reduced (709 lines changed, deletions > additions), now delegates to extracted modules
+  - **New tools directory**: `tools/` with `_add_dedup.py`, `_diagnose_unplayable.py`, `_move_ph_step1/2/3.py` — utility scripts for maintenance operations
+  - **Test hash snapshot**: `tests/_pre_suite_hash.json` captures current DB state (674 embeddings, 13 cache files) for regression baseline comparison
+  - **`tests/_capture_hashes.py`**: script to regenerate hash snapshots
+  - **`tests/_gen_t` deleted**: old test generator script removed
+  - **Test expansion**: `_test_batch_analysis.py` grew by 1691 lines; `_test_buffer_lifecycle.py` updated (30 lines); `_run_tests.py` updated (26 lines)
+  - **Memory bank updated**: activeContext.md, progress.md, systemPatterns.md
+
+- **2026-07-18 (Batch button fix — `e5bba17`)**:
+  - Root cause: `_refresh_batch_btn_enabled()` silently aborted when `_queue_container.clear()` destroyed old button before periodic timer fired with stale reference, raising uncaught exception
+  - Fix: call `_refresh_batch_btn_enabled()` as final step in `_rebuild_queue_ui()` after the with-block; wrap `.set_enabled()` in try/except for stale element references
+
 - **2026-07-18 (Batch analysis — package split + reversion)**:
   - Attempted `playlist_source.py` → `playlist_source/` package conversion (`91879b2`), reverted in HEAD (`9f1fc9b`) — single-file module retained
   - 17 commits total on branch covering full batch analysis implementation
@@ -67,7 +93,7 @@ Batch analysis execution fully implemented (2026-07-17/18). The "Start Batch Ana
 - **2026-07-12**: Major refactor of Now Playing card — three-stage decoupling of Listen/Analyze into independent threads with async worker queue; added silence detection, unlimited buffer with safety cap, track change callback, 90% coverage threshold
 - **2026-07-10**: Memory bank initialized (7 files) + API doc summaries created
 - **2026-07-10**: Context7 MCP server configured and verified working
-- Latest git commit (HEAD, `local-files-support`): `9f1fc9b Revert "Convert playlist_source.py to playlist_source/ package"`
+- Latest git commit (HEAD, `local-files-support`): `0921edf minor fixes`
 
 ### Now Playing Architecture (2026-07-12)
 | Component | Thread | Responsibility |
