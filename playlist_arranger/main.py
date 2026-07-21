@@ -83,26 +83,20 @@ def render_right_panel() -> None:
 
 
 async def run_descriptions() -> None:
-    """Generate track descriptions (async, logs progress to logger)."""
-    import asyncio
-    progress = ProgressPanel("Generating Descriptions...")
-    with _right_panel:
-        progress.render()
-    try:
-        from playlist_arranger.llm.descriptions import generate_track_descriptions
-        descs = await asyncio.to_thread(
-            generate_track_descriptions,
-            _state.current_tracks,
-            _state.current_playlist_name,
-            _state.current_playlist_id,
-            progress_cb=lambda msg: logger.info(msg),
-        )
-        _state.current_descs[:] = descs
-        progress.done(f"Generated {len(descs)} descriptions")
-        set_page("anchors")
-    except Exception as e:
-        progress.error(str(e))
-        logger.exception("Description generation failed")
+    """Generate track descriptions (temporarily stubbed — old pipeline removed).
+
+    TODO(anchors-refactor): wire this to desc_queue_add_many() +
+    populate current_descs from DB — old descriptions.py removed 2026-07-21.
+    """
+    ui.notify(
+        "Description generation is being upgraded — "
+        "please use the per-track desc icon for now",
+        type="warning",
+    )
+    logger.info(
+        "run_descriptions() called but generation pipeline is temporarily stubbed "
+        "(old descriptions.py module removed 2026-07-21)"
+    )
 
 
 async def run_analysis() -> None:

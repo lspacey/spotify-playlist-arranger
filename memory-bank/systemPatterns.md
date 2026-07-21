@@ -121,6 +121,50 @@ This avoids circular imports while keeping the extraction transparent to existin
 ### 20. Cache with Invalidation (`sorting/distance.py`)
 `_SORTING_CACHE` caches distance matrices keyed by playlist ID and track ID tuple. Invalidation happens when track IDs change.
 
+### 21. Thread-Safe FIFO Queue with Dedupe (`analysis/desc_generator.py`)
+A thread-safe background worker queue for description generation uses:
+- `queue.Queue` (blocking `.get(timeout=1.0)`) for the FIFO data structure
+- `set[str]` for deduplication (O(1) contains check)
+- Single `threading.Lock` guarding ALL `_desc_queue_set` mutations + `len()` reads
+- `desc_queue_add()`: check-and-add under lock — atomic dedupe, returns `bool`
+- `desc_queue_add_many()`: batch add under one lock acquisition
+- `desc_queue_clear()`: locks once, drains entire queue with `get_nowait()` in a while loop, clears set, resets processing globals
+
+Worker thread:
+- Daemon thread started idempotently (`_desc_worker_start_lock` + boolean guard)
+- Blocks on `_desc_queue.get(timeout=1.0)` when queue empty (no busy-loop)
+- Removes item from dedupe set AFTER dequeueing (it's now "in-progress", not "queued")
+- Updates `desc_generator_current_track_id/name` globals for UI display
+- Worker stop: `_desc_worker_stop` threading.Event checked at top of loop and during retry sleeps — clean shutdown, no forceful thread kill
+
+### 22. Live Dialog Update via Module Globals (2026-07-22)
+For pushing newly-generated descriptions from a background worker callback into an open dialog:
+- `desc_dialog.py` exports `_current_open_track_id` (str|None), `_current_textarea`, `_current_generated_label` module globals
+- On dialog open: `show_desc_dialog()` stores track_id + element refs
+- On dialog close: `_close_dialog_state()` resets all to None (called via `dialog.on("update:model-value", ...)` because `ui.dialog()` does NOT accept `on_close`)
+- Worker callback `_push_desc_to_open_dialog(track_id)`:
+  1. Guard: `_current_open_track_id != track_id` → early return (different track or closed)
+  2. Guard: `_current_textarea is None` → early return (stale ref after close)
+  3. Read fresh `desc_text` from DB via `db.get_track(track_id)`
+  4. Set `textarea.value = desc_text` + `generated_label.set_text(f"Generated: {formatted_date}")`
+  5. Runs inside `_ui_context_lock` + `_ph._page_client` (same pattern as `_on_analysis_complete`)
+
+Race condition handling:
+- Dialog closed between gen start/finish → `_current_open_track_id` is None → skipped
+- User swaps dialog from X to Y while X generates → `_current_open_track_id` is Y, not X → skipped
+- Same track re-opened → `show_desc_dialog()` refreshes refs to new dialog's elements
+
+### 23. Layout Stability: Buttons-First in Rows (2026-07-22)
+In NiceGUI `ui.row()`, children are laid out left-to-right in creation order. Place **fixed-width** elements (buttons) BEFORE **variable-width** elements (labels) so label content changes don't shift button positions. Applied in `_render_desc_status()`: buttons ("Stop and clean the queue", "Update all in background") created first, then labels wrapped in a `ui.column()`.
+
+### 24. NiceGUI Dialog Lifecycle Pattern
+`ui.dialog()` does NOT accept `on_close` keyword argument. To detect dialog close:
+```python
+with ui.dialog(value=True) as dialog:
+    dialog.on("update:model-value", lambda e: handler() if not e.args else None)
+```
+`e.args` is falsy when the model-value changes to indicate dialog closed. This fires `_close_dialog_state()` on close only.
+
 ## Component Relationships
 
 ### Data Flow: Spotify Track Analysis

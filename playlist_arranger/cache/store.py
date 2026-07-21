@@ -21,33 +21,6 @@ def _get_anchors_dir() -> pathlib.Path:
     return ANCHORS_DIR_DEFAULT
 
 
-def load_descriptions(playlist_id: str) -> list | None:
-    """Load previously saved track descriptions from anchors/descriptions_<pl_id>.json."""
-    desc_file = _get_anchors_dir() / f"descriptions_{playlist_id}.json"
-    if desc_file.exists():
-        try:
-            data = json.loads(desc_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "tracks" in data:
-                return data["tracks"]
-            if isinstance(data, list):
-                return data
-        except Exception:
-            pass
-    return None
-
-
-def save_descriptions(playlist_id: str, playlist_name: str, tracks: list, model: str):
-    """Save track descriptions to anchors/descriptions_<pl_id>.json."""
-    desc_file = _get_anchors_dir() / f"descriptions_{playlist_id}.json"
-    data = {
-        "playlist_id": playlist_id,
-        "playlist_name": playlist_name,
-        "model": model,
-        "tracks": tracks,
-    }
-    atomic_write_json(desc_file, data)
-
-
 def backup_exists(playlist_id: str) -> bool:
     """Check if a backup file exists for this playlist."""
     bk_file = _get_anchors_dir() / f"backup_{playlist_id}.json"

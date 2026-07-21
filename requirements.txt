@@ -13,54 +13,42 @@
 # See: https://huggingface.co/m-a-p/MERT-v1-95M/discussions/4
 # ---------------------------------------------------------------------------
 
-# Spotify Web API
-spotipy==2.26.0
+# ── Core framework ─────────────────────────────────────────────────────────
+nicegui==3.13.0        # web UI framework
 
-# Capture audio – WASAPI loopback (Windows)
+# ── Spotify Web API ────────────────────────────────────────────────────────
+spotipy==2.26.0
+requests==2.34.2       # direct HTTP calls with retry/rate-limit handling
+
+# ── Audio capture (Windows only) ───────────────────────────────────────────
 # If `pip install pyaudiowpatch` fails, you need Visual C++ Build Tools:
 # https://visualstudio.microsoft.com/visual-cpp-build-tools/
 pyaudiowpatch==0.2.12.8
 
-# Audio analysis
-librosa==0.11.0
+# ── Audio analysis ─────────────────────────────────────────────────────────
+librosa==0.11.0        # feature extraction (BPM, key, spectral, MFCC, chroma)
 numpy==2.4.6
-soundfile==0.14.0
+soundfile==0.14.0      # audio file I/O
+mutagen==1.48.1        # MP3/FLAC metadata (for local file support)
 
-# Terminal UI
-rich==15.0.0
-
-# Environment-variable loader
-python-dotenv==1.2.2
-
-# Web UI framework
-nicegui==3.13.0
-
-# Audio metadata (for local file support)
-mutagen==1.48.1
-
-# MERT neural embeddings (for audio vector analysis)
-# ─── CPU-only (default) — torch + torchaudio as matched pair ───────────────────
+# ── MERT neural embeddings (audio vector analysis) ─────────────────────────
+# ─── CPU-only (default) — torch + torchaudio as matched pair ───────────────
 #   These versions must be upgraded together. Check PyTorch's compatibility
 #   matrix at: https://github.com/pytorch/pytorch/wiki/PyTorch-Versions
 #
 #   On machines WITHOUT an NVIDIA GPU, install the CPU builds:
 #     pip install torch==2.12.1 torchaudio==2.11.0
 torch==2.12.1
-
-# torchaudio is a transitive dependency of torch — auto-installed on the same
-# CUDA index with the correct matched version. No separate pin needed.
-# torchaudio 2.11.0 is the correct matched pair for torch 2.12.1+cu130
-# (no 2.12.x torchaudio exists on the cu130 index).
+torchaudio==2.11.0      # matched-pair dependency — installed alongside torch,
+                        # used internally by torch for audio backend (sox_io)
 
 #   Note: torchvision is NOT required for this project and should not be installed.
 
-# ─── Transformers pinned for MERT compatibility (see constraint note above) ─────
+# ─── HuggingFace transformers pinned for MERT compatibility ────────────────
 transformers==4.38.0
+accelerate==1.14.0      # required by transformers pipeline (auto-detected)
 
-# accelerate is a transitive dependency of transformers — auto-installed.
-# No separate pin needed.
-
-# ─── CUDA acceleration (Windows / Linux) — OPTIONAL ────────────────────────────
+# ─── CUDA acceleration (Windows / Linux) — OPTIONAL ────────────────────────
 #   RTX 5080 / 50-series Blackwell GPUs (sm_120) require CUDA >= 12.8.
 #   PyTorch >= 2.7.0 + cu128/cu130 wheels include sm_120 kernels.
 #   This project is confirmed working with torch 2.12.1+cu130 (CUDA 13.0).
@@ -68,13 +56,16 @@ transformers==4.38.0
 #   To switch from CPU to CUDA on RTX 5080:
 #
 #     1. Uninstall CPU torch:
-#        pip uninstall torch torchaudio -y
+#        pip uninstall torch torchaudio accelerate -y
 #
 #     2. Install CUDA-enabled matched pair from the OFFICIAL PyTorch index:
 #        pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
 #        → This installs torch 2.12.1+cu130 + torchaudio 2.11.0+cu130
 #
-#     3. Verify (expect: True, RTX 5080, sm_120 in arch list):
+#     3. Re-install accelerate (CPU-only, safe to mix):
+#        pip install accelerate==1.14.0
+#
+#     4. Verify (expect: True, RTX 5080, sm_120 in arch list):
 #        python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_arch_list())"
 #
 #   For OLDER GPUs (RTX 20/30/40 series) use CUDA 12.1 wheels:
@@ -86,9 +77,10 @@ transformers==4.38.0
 #   The mert.py module auto-detects GPU availability and moves the model
 #   to CUDA when available. No config changes needed.
 
-# LLM backends (pick at least one)
-ollama==0.6.2        # local LLM  (free, offline)
-openai==2.44.0       # for DeepSeek / Mistral APIs
+# ── LLM backends (pick at least one) ───────────────────────────────────────
+ollama==0.6.2          # local LLM  (free, offline)
+openai==2.44.0         # for DeepSeek / Mistral APIs
 
-# HTTP requests (for Spotify API direct calls)
-requests==2.34.2
+# ── Utilities ──────────────────────────────────────────────────────────────
+rich==15.0.0           # terminal output formatting
+python-dotenv==1.2.2   # .env file loading

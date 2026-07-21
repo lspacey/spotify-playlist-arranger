@@ -142,7 +142,8 @@ _live_ctx.on_analysis_complete_cb = _on_analysis_complete
 # ── Description generated callback (worker thread → UI refresh) ─────────────
 def _on_desc_generated(track_id: str):
     """Called from desc_generator worker after a description is written to DB.
-    Triggers table refresh for both playlist and queue tables."""
+    Triggers table refresh for both playlist and queue tables, and live-updates
+    the description dialog if it's still open for this track."""
     if not track_id:
         return
     logger.debug("Description generated for track_id=%s", track_id[:8] if track_id else "?")
@@ -176,9 +177,71 @@ def _on_desc_generated(track_id: str):
                             table_ref.rows = rows_cache
                     except Exception:
                         logger.debug("Failed to refresh playlist table %s after desc generation", pid[:8] if pid else "?")
+
+                # ── Live-update: push new description into open dialog ────
+                _push_desc_to_open_dialog(track_id)
+
                 ui.notify("Description generated and saved", type="positive")
         except Exception:
             logger.exception("_on_desc_generated callback failed for %s", track_id[:8] if track_id else "?")
+
+
+def _push_desc_to_open_dialog(track_id: str):
+    """If the desc dialog for *track_id* is currently open, push its new
+    description text from the DB into the live textarea element.
+
+    Guards against stale/closed dialogs: only acts when
+    ``desc_dialog._current_open_track_id == track_id`` and the stored
+    textarea reference is still valid (non-None, has a ``.value`` attribute).
+    """
+    try:
+        from playlist_arranger.ui import desc_dialog as _dd
+    except ImportError:
+        return
+
+    if _dd._current_open_track_id != track_id:
+        return  # dialog is closed or showing a DIFFERENT track — don't overwrite
+
+    textarea = getattr(_dd, "_current_textarea", None)
+    if textarea is None:
+        return  # dialog was closed between check and access
+
+    # Read fresh description from DB
+    entry = _db.get_track(track_id)
+    desc_text = entry.get("desc_text") if isinstance(entry, dict) else None
+    if not desc_text:
+        return  # nothing to push
+
+    # Update the textarea value (NiceGUI reactive binding)
+    try:
+        textarea.value = desc_text
+        logger.debug("Pushed new description into open dialog for track_id=%s",
+                     track_id[:8] if track_id else "?")
+    except Exception:
+        logger.exception("Failed to push description into open dialog for %s",
+                         track_id[:8] if track_id else "?")
+
+    # ── Also update the "Generated: ..." timestamp label ────────────────
+    generated_label = getattr(_dd, "_current_generated_label", None)
+    if generated_label is not None:
+        desc_generated_at = entry.get("desc_generated_at") if isinstance(entry, dict) else None
+        if desc_generated_at and isinstance(desc_generated_at, str) and desc_generated_at.strip():
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(desc_generated_at)
+                if dt.tzinfo is None:
+                    generated_str = dt.strftime("%Y-%m-%d %H:%M")
+                else:
+                    generated_str = dt.astimezone().strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                generated_str = desc_generated_at
+        else:
+            generated_str = "Never generated"
+        try:
+            generated_label.set_text(f"Generated: {generated_str}")
+        except Exception:
+            logger.exception("Failed to update generated-at label for %s",
+                             track_id[:8] if track_id else "?")
 
 _desc_gen.set_on_desc_generated(_on_desc_generated)
 # Batch advance is NOT coupled to buffer submission/discard callbacks.
@@ -800,9 +863,6 @@ def _render_desc_status():
     else:
         processing_label = "Idle — no tracks in queue" if qsize == 0 else "Idle — waiting for worker"
 
-    ui.label(processing_label).classes("text-sm text-gray-600 dark:text-gray-400")
-    ui.label(qsize_label).classes("text-xs text-gray-500")
-
     def on_clear():
         _desc_gen.desc_queue_clear()
         ui.notify("Description queue cleared", type="positive")
@@ -821,6 +881,10 @@ def _render_desc_status():
         on_click=on_update_all,
         color="blue",
     ).classes("text-xs").props("size=sm")
+
+    with ui.column().classes("gap-0"):
+        ui.label(processing_label).classes("text-sm text-gray-600 dark:text-gray-400")
+        ui.label(qsize_label).classes("text-xs text-gray-500")
 
 
 # ─── Play track from playlist table ───────────────────────────────────────────

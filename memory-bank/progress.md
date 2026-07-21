@@ -6,7 +6,7 @@
 - ✅ Audio feature extraction (BPM, key, loudness, spectral features, MFCC, chroma, frequency balance)
 - ✅ MERT neural embedding generation (768-dim) with GPU acceleration
 - ✅ SQLite database for persistent track storage
-- ✅ LLM-based track description generation (Ollama, DeepSeek, Mistral)
+- ✅ LLM-based track description generation (Ollama, DeepSeek, Mistral) — now DB-backed via background worker queue
 - ✅ AI anchor selection with 10 playlist structure types
 - ✅ Manual anchor editor (add, delete, reorder, placeholders)
 - ✅ Simulated annealing ATSP solver with anchor constraints
@@ -31,12 +31,20 @@
 - ✅ Compact audio spectrum visualizer: 120×60 canvas (white bg, gray LED-style bars), 10 log-spaced FFT bands, SR/RMS/Pk stats with fixed-width layout, silence gate preventing -240dB placeholder values, 300ms update cadence
 - ✅ Pause-aware audio collection: `_is_playing` threading.Event gate in `LiveAnalyzeContext`, set by polling thread — prevents silence pollution during pause without reintroducing RMS filter
 - ✅ Two-column layout rebalanced to 30%/70% (left: Spotify connect/device, right: audio device + visualizer + Now Playing) for wider right column
+- ✅ Batch analysis execution with interference detection, watchdog, RLocks, auto-remove, live queue highlighting
+- ✅ Description generation queue infrastructure + desc status UI row (under Now Playing card)
+- ✅ Per-track description dialog with live-update (DB-backed, updates in real-time when worker finishes)
+- ✅ Description generation buttons in playlist tables + queue table (selected tracks + all tracks)
+- ✅ Old monolithic `descriptions.py` removed; `load_descriptions`/`save_descriptions` removed from cache/store
 
 ## What's Left to Build
 - [x] **Queue for Analysis feature** — expandable section above "Your Playlists", populated via per-playlist "Add Selected Tracks to Queue for Analysis" button (replaces "Analyze X missing"). Persists to `cache/analysis_queue.json`. Fully isolated from now-playing highlight system. (2026-07-16)
 - [x] **Batch analysis execution logic** — Real sequential playback via `_batch_advance_to_next()` with snapshot+position sequencer, interference detection (`_batch_expected_track_id`), watchdog timer, live queue rendering, thread-safety (RLock), auto-remove analyzed tracks from queue. (2026-07-17/18)
-- [x] Expand test suite: 6 Analyze-mode regression tests + ~50 batch-specific regression tests in `tests/_test_batch_analysis.py` (batch advance, interference, watchdog, queue lifecycle, thread-safety, race conditions, flush-during-stop patterns)
+- [x] **Description generation queue + background worker** — Thread-safe FIFO queue with daemon worker, dedupe, UI buttons, status row, live dialog updates. Old descriptions.py removed. (2026-07-21/22)
+- [x] Expand test suite: 6 Analyze-mode regression tests + ~50 batch-specific regression tests + 36 desc generator tests (125 total)
 - [x] Production-clean verification: `tests/_verify_production_clean.py` ensures `hasattr` checks return False in production
+- [ ] Wire `desc_generator` worker to actually call LLM (placeholder currently)
+- [ ] Wire `run_descriptions()` to `desc_queue_add_many()` + populate `current_descs` from DB
 - [ ] Cross-platform audio capture (macOS/Linux support)
 - [ ] Batch LLM description generation optimization (concurrent API calls)
 - [ ] Export sorted playlist as M3U with relative paths
@@ -48,26 +56,23 @@
 - [ ] Packaging (single .exe via PyInstaller, or MSIX)
 
 ## Current Status
-The application is feature-complete for its core workflow with **batch analysis now fully implemented** and the monolithic `playlist_source.py` partially decomposed into focused modules. Users can:
+The application is feature-complete for its core workflow with **batch analysis fully implemented**, the **description generation queue infrastructure built**, and the old monolithic `descriptions.py` replaced by a DB-backed background worker pattern. Users can:
 1. Connect to Spotify or browse local files
 2. **Batch analyze** — queue tracks from multiple playlists, then run "Start Batch Analysis" for sequential automatic capture (or analyze one-at-a-time via the Now Playing card)
-3. Generate AI descriptions
+3. **Queue descriptions** — add tracks to the description generation queue (per-track, selected-tracks, or all-tracks), see live status under Now Playing card, get live dialog updates when a description finishes
 4. Create anchors manually or with AI
 5. Run smart sorting
 6. Save results back to Spotify or export M3U
 
 Batch analysis includes: interference detection (warns if Spotify plays wrong track), watchdog timer (alerts if track is stuck), live queue position highlighting, thread-safety via reentrant RLock, auto-removal of analyzed tracks from queue, and production-clean verification.
 
-**Recent refactoring (2026-07-20)**: Three modules extracted from `playlist_source.py`:
-- `analysis/batch_analyzer.py` — batch state and sequencer logic
-- `ui/audio_viz.py` — canvas visualization and FFT updates
-- `ui/playlist_highlight.py` — row highlighting, auto-expand, notify
+**Description generation infrastructure (2026-07-22)**:
+- `analysis/desc_generator.py`: Thread-safe FIFO queue (`queue.Queue` + `set` + `Lock`), daemon worker thread, LLM fallback chain (ollama → primary → mistral → deepseek), VA quadrant computation, `_feat_summary` inlined from old module
+- `ui/desc_dialog.py`: Per-track dialog with live-update state (textarea + generated-at label pushed from worker callback), "Generate new description" button wired to `desc_queue_add()`
+- `ui/pages/playlist_source.py`: Two new desc-gen buttons per playlist/queue table, desc status row under Now Playing card (buttons-first layout, no shifting), `_push_desc_to_open_dialog()` helper
+- Old `llm/descriptions.py` deleted; `cache/store.py` `load_descriptions`/`save_descriptions` removed; `main.py` `run_descriptions()` stubbed with TODO comment
 
-**New tools directory** (`tools/`): `_add_dedup.py` (deduplication), `_diagnose_unplayable.py` (track playability diagnostics), `_move_ph_step1/2/3.py` (multi-step playlist migration helper).
-
-**Cache robustness (2026-07-20)**: Empty cache files and corrupt cache files are auto-detected and deleted, forcing clean re-fetch. Unplayable tracks (local files with no market data) are filtered during playlist loading.
-
-**Test suite**: ~50 batch-specific regression tests in `tests/_test_batch_analysis.py` + 5 buffer lifecycle tests + 6 analyze-mode regression tests + `tests/_verify_production_clean.py` (hasattr guard) + `tests/_capture_hashes.py` (hash snapshot utility) — all passing. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 13 cache files).
+**Test suite**: 36 desc generator tests (queue ops, VA computation, fallback chain, deletion regression, dialog live-update) + 61 batch analysis tests + 5 buffer lifecycle tests + 17 desc status tests + 6 run tests = 125 total, all passing. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 15 cache files).
 
 The application has been tested with RTX 5080 GPU acceleration. All primary features are functional.
 
@@ -81,17 +86,8 @@ The application has been tested with RTX 5080 GPU acceleration. All primary feat
 - `LiveAnalyzeContext._analyze_buf` unprotected property — callers MUST hold `mode_lock` before reading; `get_locked_buf()` assertion catches violations in dev
 - Batch analysis queue operates on live `state.analysis_queue` — tracks added mid-batch are discovered when `_batch_advance_to_next()` re-checks the queue (not a frozen snapshot)
 - Interference detection tolerance is hardcoded; could be made configurable via settings
-
-> **2026-07-13 — Buffer lifecycle fixes (continue implementation)**
-> - **Bug fix 1**: `sync_analyze_buffer(None)` called in "not playing" branch of polling loop — flushes buffer immediately on playback stop (previously waited for track change that never came)
-> - **Bug fix 2**: Removed `SILENCE_RMS_THRESHOLD` filter from `collect_samples()` — all audio chunks appended to buffer for accurate coverage%; replaced with `_is_playing` threading.Event gate to prevent pause-silence pollution
-> - **Button label**: "Analyzing..." → "Analyzing... Click to stop" for clearer UX
-> - Cleaned up unused `SILENCE_RMS_THRESHOLD` import and `_current_playlist_uri` global variable
-
-> **2026-07-13 — Stretch: API counter + audio visualizer (Features 1 & 2)**
-> - **Feature 1 — Spotify API call counter**: `SpotifyCallProxy` class in `spotify_source.py` wraps spotipy client via `__getattr__`, thread-safe counter, displayed as "🔄 X API calls" next to Connect button. Verified zero `isinstance(state.sp, spotipy.Spotify)` type checks in codebase — all calls are flat top-level methods.
-> - **Feature 2 — Audio spectrum visualizer**: 120×60 canvas (white bg, `#9E9E9E` gray LED-style bars, 10 log-spaced FFT bands), placed to the right of Audio Capture Device dropdown. Stats (SR/RMS/Pk) displayed via NiceGUI labels in a vertical column with fixed `w-24` width to prevent layout shift. 300ms `ui.timer` updates, FFT computed in Python from deque copy under brief `audio_lock`. Silence gate: `max(abs(mono)) < 1e-10` → shows "— dB" placeholders instead of computing `20*log10(near_zero)` → -240dB.
-> - **Layout fix**: Two-column split adjusted from `flex-1`/`flex-1` (50/50) to `w-[30%]`/`w-[70%]` to prevent visualizer wrapping. Note: attempts to fix via CSS `min-width:0` overrides on nested Quasar flex containers (`q-field__inner`/`q-field__control`/`q-field__control-container`) proved ineffective in practice (reverted) — working fix was reallocating column widths.
+- **`anchor_editor.py`**: `save_plan` referenced before assignment (pre-existing bug, not from descriptions.py removal) — `ui.button(on_click=save_plan)` appears before `def save_plan():` in `build_anchor_editor()`. Test `test_anchor_editor_safe_with_empty_descs` treats `UnboundLocalError` as acceptable. TODO: fix separately.
+- **`desc_generator` worker**: Currently does not ACTUALLY call LLM — placeholder loop. Infrastructure is ready (queue, dedupe, VA computation, fallback chain, DB write), just needs `_try_generate_description()` call un-commented/re-enabled as next step.
 
 ## Evolution of Project Decisions
 1. **JSON → SQLite migration**: Originally used `tracks_db.json`, migrated to SQLite for better query performance and concurrent access (`database/migrate.py` exists for migration)
@@ -112,3 +108,6 @@ The application has been tested with RTX 5080 GPU acceleration. All primary feat
 16. **Snapshot+position sequencer pattern**: Batch advance uses `_batch_current_track_id` as a position tracker rather than queue index. Worker completion is decoupled from advance — the advance function is called with the completed track_id; it checks `_batch_current_track_id == caller_track_id` to reject stale calls. Queue snapshot taken at advance time, not at batch start — allows live queue growth during batch run.
 17. **Read-before-write for API calls**: `_safe_pause_active_playback()` checks current Spotify playback state before sending a pause command — avoids unnecessary API calls when already paused (reduces rate limit pressure).
 18. **`ui_pending_queue` drain pattern**: Background threads push UI update actions into a thread-safe deque; a main-thread `ui.timer` drains and executes them. Prevents "UI updates must be called from main thread" errors. Includes `_ui_context_lock` (separate from `_batch_lock`) for serializing main-thread access from bg-thread callback sites.
+19. **JSON-cache descriptions → DB-backed descriptions (2026-07-21/22)**: Old pipeline read/wrote `cache/descriptions_<pl_id>.json` files via `load_descriptions`/`save_descriptions`. New pipeline: background worker queue writes `desc_text` + `desc_generated_at` directly to SQLite via `db.save_track()`. Per-track dialog reads from `db.get_track()` at open time and live-updates when worker finishes. Old module `llm/descriptions.py` deleted. `main.py` `run_descriptions()` stubbed.
+20. **Live dialog update via module globals (2026-07-22)**: `desc_dialog.py` exports `_current_open_track_id`, `_current_textarea`, `_current_generated_label` globals. `_push_desc_to_open_dialog()` in `playlist_source.py` (called from `_on_desc_generated` callback inside `_ui_context_lock` + `_ph._page_client`) reads fresh DB data and pushes to open textarea/label. Guards against stale/closed dialogs, different-track-open, and re-open same track.
+21. **Layout stability: buttons-first in rows (2026-07-22)**: In `ui.row()`, children lay out left-to-right in creation order. Place fixed-width elements (buttons) BEFORE variable-width elements (labels) so labels changing length don't shift button positions. Applied in desc status row (`_render_desc_status`).
