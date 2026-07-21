@@ -66,6 +66,8 @@ def save_track_worker(
         "end_seg": end_feats,
         "embedding_file": emb_file,
         "embedding_dim": 768 if emb else None,
+        "desc_text": None,
+        "desc_generated_at": None,
     }
     _db.save_track(tid, entry)
 

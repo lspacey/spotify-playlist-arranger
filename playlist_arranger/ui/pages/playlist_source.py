@@ -19,10 +19,25 @@ from playlist_arranger.database import db as _db
 from playlist_arranger.config import load_settings, CACHE_DIR_DEFAULT
 
 from playlist_arranger.analysis import batch_analyzer as _ba
+from playlist_arranger.analysis.desc_status import get_desc_age_info
+from playlist_arranger.analysis import desc_generator as _desc_gen
+from playlist_arranger.ui.desc_dialog import show_desc_dialog
 from playlist_arranger.ui import audio_viz as _viz
 from playlist_arranger.ui import playlist_highlight as _ph
 # ---- Wire playlist_highlight's dependency injection (circular-import avoidance) ----
 logger = logging.getLogger(__name__)
+
+# ─── Description icon click handler (wired per-table via $parent.$emit) ───────
+
+def _on_desc_icon_click(e):
+    """Handler for desc icon clicks — receives the full row dict via $parent.$emit."""
+    row = e.args if e.args else {}
+    tid = row.get("track_id", "") if isinstance(row, dict) else ""
+    tname = row.get("track_name_original", "") if isinstance(row, dict) else ""
+    artist = row.get("artist", "") if isinstance(row, dict) else ""
+    logger.debug("desc icon clicked: track_id=%s", tid[:8] if tid else "?")
+    if tid:
+        show_desc_dialog(tid, tname, artist=artist)
 
 
 # ─── "Now Playing" card mode state ────────────────────────────────────────────
@@ -123,6 +138,49 @@ def _on_buffer_discarded(track_info: dict):
 _live_ctx.on_buffer_submitted_cb = _on_buffer_submitted
 _live_ctx.on_buffer_discarded_cb = _on_buffer_discarded
 _live_ctx.on_analysis_complete_cb = _on_analysis_complete
+
+# ── Description generated callback (worker thread → UI refresh) ─────────────
+def _on_desc_generated(track_id: str):
+    """Called from desc_generator worker after a description is written to DB.
+    Triggers table refresh for both playlist and queue tables."""
+    if not track_id:
+        return
+    logger.debug("Description generated for track_id=%s", track_id[:8] if track_id else "?")
+    if _ph._page_client is not None:
+        try:
+            with _ui_context_lock, _ph._page_client:
+                # Refresh queue table if visible
+                _rebuild_queue_ui()
+                # Refresh currently-displayed playlist table (desc icon + data)
+                for pid, rows_cache in _ph._playlist_rows_cache.items():
+                    try:
+                        table_ref = _ph._playlist_tables.get(pid)
+                        if table_ref is None:
+                            continue
+                        # Update desc_age info for matching row
+                        updated = False
+                        for row in rows_cache:
+                            if row.get("track_id") == track_id:
+                                entry = _db.get_track(track_id)
+                                desc_info = get_desc_age_info(
+                                    entry.get("desc_text") if entry else None,
+                                    entry.get("desc_generated_at") if entry else None,
+                                )
+                                row["desc_icon"] = "auto_stories" if desc_info.has_desc else "menu_book"
+                                row["desc_color"] = desc_info.color
+                                row["desc_caption"] = desc_info.caption
+                                row["desc"] = "✓" if desc_info.has_desc else "—"
+                                updated = True
+                                break
+                        if updated:
+                            table_ref.rows = rows_cache
+                    except Exception:
+                        logger.debug("Failed to refresh playlist table %s after desc generation", pid[:8] if pid else "?")
+                ui.notify("Description generated and saved", type="positive")
+        except Exception:
+            logger.exception("_on_desc_generated callback failed for %s", track_id[:8] if track_id else "?")
+
+_desc_gen.set_on_desc_generated(_on_desc_generated)
 # Batch advance is NOT coupled to buffer submission/discard callbacks.
 # Instead, batch advance is triggered by the polling thread (_card_listen_thread)
 # when it detects that the current batch track has stopped playing (natural end).
@@ -557,6 +615,16 @@ def _update_np_ui():
     except Exception:
         logger.exception("_update_np_ui() failed — timer callback crashed")
 
+    # ── Refresh desc generator status row ─────────────────────────────────
+    try:
+        global _desc_status_container
+        if _desc_status_container is not None:
+            _desc_status_container.clear()
+            with _desc_status_container:
+                _render_desc_status()
+    except Exception:
+        logger.exception("_desc_status_container refresh failed")
+
     try:
         if _api_counter_label is not None and _state.sp is not None:
             count = getattr(_state.sp, 'call_count', 0)
@@ -617,11 +685,16 @@ def _update_np_ui():
 def _build_now_playing_card():
     global _np_card_container, _btn_listen, _btn_analyze
     global _track_name_label, _track_progress_label, _track_status_label
+    global _desc_status_container
 
     with ui.card().classes("w-full") as card:
         with ui.column().classes("w-full gap-2") as _np_card_container:
             _render_np_inner()
         ui.timer(0.5, _update_np_ui)
+
+    # ── Description generator status row (visually grouped with Now Playing) ──
+    with ui.row().classes("w-full gap-2 items-center mt-2") as _desc_status_container:
+        _render_desc_status()
 
     _viz.init_canvas_js(_viz._viz_canvas_id)
 
@@ -705,6 +778,49 @@ def _render_np_inner():
     rem, res = divmod(rm, 60)
     _track_progress_label = ui.label(f"▶ {em}:{es:02d}  [{pct:.0f}%]  -{rem}:{res:02d}").classes("text-xs text-gray-400")
     ui.linear_progress(value=pct / 100).classes("w-full")
+
+
+# ─── Description generator status row renderer ───────────────────────────────
+
+def _render_desc_status():
+    """Render the description generator status info (called once during build
+    and re-rendered on each timer tick)."""
+    # Start the desc generator worker (idempotent)
+    _desc_gen.start_desc_generator()
+
+    qsize = _desc_gen.desc_queue_size()
+    qsize_label = f"{qsize} track{'s' if qsize != 1 else ''} in description queue"
+
+    current_id = _desc_gen.desc_generator_current_track_id
+    current_name = _desc_gen.desc_generator_current_track_name
+    if current_id and current_name:
+        processing_label = f"Currently processing: {current_name[:60]}"
+    elif current_id:
+        processing_label = f"Currently processing: {current_id[:12]}..."
+    else:
+        processing_label = "Idle — no tracks in queue" if qsize == 0 else "Idle — waiting for worker"
+
+    ui.label(processing_label).classes("text-sm text-gray-600 dark:text-gray-400")
+    ui.label(qsize_label).classes("text-xs text-gray-500")
+
+    def on_clear():
+        _desc_gen.desc_queue_clear()
+        ui.notify("Description queue cleared", type="positive")
+
+    ui.button(
+        "Stop and clean the queue",
+        on_click=on_clear,
+        color="orange",
+    ).classes("text-xs").props("size=sm")
+
+    def on_update_all():
+        logger.debug("'Update all in background' clicked — not yet implemented")
+
+    ui.button(
+        "Update all in background",
+        on_click=on_update_all,
+        color="blue",
+    ).classes("text-xs").props("size=sm")
 
 
 # ─── Play track from playlist table ───────────────────────────────────────────
@@ -803,9 +919,56 @@ def _load_cached_playlist_tracks(playlist_id: str) -> list:
     return filtered
 
 
+def _inject_desc_tooltip_css():
+    """Inject CSS for description icon tooltips once (idempotent).
+    
+    Uses pure CSS :hover tooltip instead of Quasar <q-tooltip> to avoid
+    flicker when table cells re-render (rows= reassignment, queue rebuild).
+    CSS tooltips are immune to DOM re-render because they have no popup
+    lifecycle — the style simply applies to the new element instantly."""
+    ui.add_head_html('''
+    <style>
+    /* Allow the tooltip to overflow the table cell — QTable cells
+       may inherit overflow:hidden from scrollable table wrappers. */
+    .q-table td:has(.desc-icon-container),
+    .q-table th:has(.desc-icon-container) {
+      overflow: visible !important;
+    }
+    .desc-icon-container {
+      position: relative;
+      display: inline-block;
+      cursor: default;
+    }
+    .desc-icon-tip {
+      visibility: hidden;
+      opacity: 0;
+      position: absolute;
+      bottom: calc(100% + 4px);
+      left: 50%;
+      transform: translateX(-50%);
+      white-space: nowrap;
+      background: rgba(0, 0, 0, 0.82);
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      line-height: 1.4;
+      z-index: 10000;
+      pointer-events: none;
+      transition: opacity 0.12s ease;
+    }
+    .desc-icon-container:hover .desc-icon-tip {
+      visibility: visible;
+      opacity: 1;
+    }
+    </style>
+    ''')
+
+
 def build_spotify_section(set_page_cb):
     # _page_client now accessed via _ph._page_client
     _ph._page_client = ui.context.client
+    _inject_desc_tooltip_css()
     ui.label("Spotify Source").classes("text-2xl font-bold mb-2")
 
     with ui.row().classes("w-full gap-4 items-start"):
@@ -835,6 +998,13 @@ def build_spotify_section(set_page_cb):
                 if not _state.sp:
                     ui.notify("Connect Spotify first", type="warning")
                     return
+                _do_refresh()
+
+            def _do_refresh(retry_delay: float = 0.0):
+                """Core device refresh logic with optional retry on 401."""
+                import time as _time
+                if retry_delay > 0:
+                    _time.sleep(retry_delay)
                 try:
                     logger.info("Refreshing Spotify devices...")
                     devs = _state.sp.devices().get("devices", [])
@@ -849,8 +1019,22 @@ def build_spotify_section(set_page_cb):
                             _state.spotify_device_id = None
                     ui.notify(f"Devices refreshed — found {len(devs)}", type="positive")
                 except Exception as e:
-                    logger.exception("Failed to list Spotify devices")
-                    ui.notify(f"Failed to refresh devices: {e}", type="negative")
+                    err_msg = str(e)
+                    if "401" in err_msg or "unauthorized" in err_msg.lower():
+                        if retry_delay == 0:
+                            # Token not yet ready at app startup — retry once after 2s
+                            logger.warning(
+                                "Spotify token not ready for devices() call (401) — retrying in 2s"
+                            )
+                            _do_refresh(retry_delay=2.0)
+                        else:
+                            logger.warning(
+                                "Spotify devices() still failing after retry (401) — skipping"
+                            )
+                            ui.notify("Device list unavailable — try refreshing manually", type="warning")
+                    else:
+                        logger.exception("Failed to list Spotify devices")
+                        ui.notify(f"Failed to refresh devices: {e}", type="negative")
 
             with ui.row().classes("w-full gap-1 items-center"):
                 device_select = ui.select(label="Spotify Device", options={}, with_input=True).classes("flex-grow")
@@ -927,6 +1111,9 @@ def build_spotify_section(set_page_cb):
 
 
 _render_playlists_set_page_cb = None
+
+# ─── Description generator status row ─────────────────────────────────────────
+_desc_status_container = None
 
 # ─── Queue for Analysis section ──────────────────────────────────────────────
 _queue_table_ref = None
@@ -1013,6 +1200,7 @@ def _render_queue_table():
         {"name": "name", "label": "Track", "field": "name"},
         {"name": "artist", "label": "Artist", "field": "artist"},
         {"name": "duration", "label": "Dur", "field": "duration"},
+        {"name": "desc", "label": "Desc", "field": "desc", "sortable": False},
         {"name": "status", "label": "Status", "field": "status"},
     ]
     rows = []
@@ -1023,14 +1211,41 @@ def _render_queue_table():
             status = "⏳ Processing"
         else:
             status = _get_track_status(t)
+        # Look up desc status from DB
+        tid = t.get("id", "")
+        entry = _db.get_track(tid) if tid else None
+        desc_info = get_desc_age_info(
+            entry.get("desc_text") if entry else None,
+            entry.get("desc_generated_at") if entry else None,
+        )
+        icon_name = "auto_stories" if desc_info.has_desc else "menu_book"
+        icon_color = desc_info.color
+        icon_caption = desc_info.caption
         rows.append({"idx": i, "name": t.get("name", "")[:42], "artist": t.get("artist", "")[:40],
-                     "duration": dur_str, "status": status})
+                     "duration": dur_str, "status": status,
+                     "desc": "✓" if desc_info.has_desc else "—",
+                     "desc_icon": icon_name,
+                     "desc_color": icon_color,
+                     "desc_caption": icon_caption,
+                     "track_id": tid,
+                     "track_name_original": t.get("name", "")})
 
     _queue_table_ref = ui.table(
         columns=columns, rows=rows, row_key="idx",
         selection="multiple",
         pagination={"rowsPerPage": 0},
     ).classes("w-full").props("dense")
+    _queue_table_ref.add_slot("body-cell-desc", r"""
+    <q-td :props="props">
+      <span class="desc-icon-container">
+        <q-icon :name="props.row.desc_icon" :color="props.row.desc_color" size="18px"
+                style="cursor: pointer;"
+                @click.stop="() => $parent.$emit('desc_click', props.row)" />
+        <span class="desc-icon-tip">{{ props.row.desc_caption }}</span>
+      </span>
+    </q-td>
+    """)
+    _queue_table_ref.on("desc_click", _on_desc_icon_click)
     _queue_rows_cache = rows
 
     def on_row_dblclick(e):
@@ -1206,6 +1421,54 @@ def _render_queue_controls():
 
         ui.button("Remove All Tracks from Queue", on_click=_on_remove_all, color="red").classes("text-sm").set_enabled(len(_state.analysis_queue) > 0)
 
+    # ── Description generation buttons (queue table) ─────────────────────────
+    with ui.row().classes("w-full gap-2 mt-1"):
+        def _desc_gen_queue_selected():
+            if _queue_table_ref is None:
+                return
+            selected = list(_queue_table_ref.selected) if hasattr(_queue_table_ref, 'selected') else []
+            if not selected:
+                ui.notify("No tracks selected", type="warning")
+                return
+            track_ids = [r["track_id"] for r in selected if r.get("track_id")]
+            n = _desc_gen.desc_queue_add_many(track_ids)
+            if n > 0:
+                ui.notify(f"Added {n} tracks to description queue", type="positive")
+            else:
+                ui.notify("All selected tracks are already in the description queue", type="info")
+
+        desc_q_sel_btn = ui.button(
+            "Generate new descriptions for selected tracks",
+            on_click=_desc_gen_queue_selected,
+            color="blue",
+        ).classes("text-sm")
+        desc_q_sel_btn.set_enabled(False)
+
+        def _refresh_desc_q_sel_btn():
+            if _queue_table_ref is not None:
+                selected = list(_queue_table_ref.selected) if hasattr(_queue_table_ref, 'selected') else []
+                desc_q_sel_btn.set_enabled(len(selected) > 0)
+        ui.timer(0.5, _refresh_desc_q_sel_btn)
+
+        def _desc_gen_queue_all():
+            track_ids = [
+                t.get("id", "")
+                for t in _state.analysis_queue
+                if isinstance(t, dict) and t.get("id")
+            ]
+            n = _desc_gen.desc_queue_add_many(track_ids)
+            if n > 0:
+                ui.notify(f"Added {n} tracks to description queue", type="positive")
+            else:
+                ui.notify("All tracks are already in the description queue", type="info")
+
+        desc_q_all_btn = ui.button(
+            "Generate new descriptions for all tracks",
+            on_click=_desc_gen_queue_all,
+            color="blue",
+        ).classes("text-sm")
+        desc_q_all_btn.set_enabled(len(_state.analysis_queue) > 0)
+
 
 def _render_analysis_queue():
     global _queue_expansion_ref, _queue_label_ref, _queue_container
@@ -1291,6 +1554,7 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
         {"name": "name", "label": "Track", "field": "name"},
         {"name": "artist", "label": "Artist", "field": "artist"},
         {"name": "duration", "label": "Dur", "field": "duration"},
+        {"name": "desc", "label": "Desc", "field": "desc", "sortable": False},
         {"name": "status", "label": "Status", "field": "status"},
     ]
     rows = []
@@ -1298,13 +1562,41 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
         dur_ms = t.get("duration_ms", 0)
         dur_str = f"{dur_ms // 60000}:{(dur_ms // 1000) % 60:02d}" if dur_ms else "?"
         status = _get_track_status(t)
-        rows.append({"idx": i, "name": t["name"][:42], "artist": t["artist"][:40], "duration": dur_str, "status": status})
+        # Look up desc status from DB
+        tid = t.get("id", "")
+        entry = _db.get_track(tid) if tid else None
+        desc_info = get_desc_age_info(
+            entry.get("desc_text") if entry else None,
+            entry.get("desc_generated_at") if entry else None,
+        )
+        icon_name = "auto_stories" if desc_info.has_desc else "menu_book"
+        icon_color = desc_info.color
+        icon_caption = desc_info.caption
+        rows.append({"idx": i, "name": t["name"][:42], "artist": t["artist"][:40],
+                     "duration": dur_str, "status": status,
+                     "desc": "✓" if desc_info.has_desc else "—",
+                     "desc_icon": icon_name,
+                     "desc_color": icon_color,
+                     "desc_caption": icon_caption,
+                     "track_id": tid,
+                     "track_name_original": t.get("name", "")})
 
     track_table = ui.table(
         columns=columns, rows=rows, row_key="idx",
         selection="multiple",
         pagination={"rowsPerPage": 0},
     ).classes("w-full").props("dense")
+    track_table.add_slot("body-cell-desc", r"""
+    <q-td :props="props">
+      <span class="desc-icon-container">
+        <q-icon :name="props.row.desc_icon" :color="props.row.desc_color" size="18px"
+                style="cursor: pointer;"
+                @click.stop="() => $parent.$emit('desc_click', props.row)" />
+        <span class="desc-icon-tip">{{ props.row.desc_caption }}</span>
+      </span>
+    </q-td>
+    """)
+    track_table.on("desc_click", _on_desc_icon_click)
 
     _ph._playlist_tables[pl_id] = track_table
     _ph._playlist_rows_cache[pl_id] = rows
@@ -1370,6 +1662,44 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
             on_click=_add_not_ok_to_queue,
             color="yellow",
         ).classes("text-sm")
+
+        # ── Description generation buttons (playlist table) ──────────────────
+        def _desc_gen_selected():
+            selected_rows = _get_selected_rows(pl_id)
+            if not selected_rows:
+                ui.notify("No tracks selected", type="warning")
+                return
+            track_ids = [r["track_id"] for r in selected_rows if r.get("track_id")]
+            n = _desc_gen.desc_queue_add_many(track_ids)
+            if n > 0:
+                ui.notify(f"Added {n} tracks to description queue", type="positive")
+            else:
+                ui.notify("All selected tracks are already in the description queue", type="info")
+
+        desc_selected_btn = ui.button(
+            "Generate new descriptions for selected tracks",
+            on_click=_desc_gen_selected,
+            color="blue",
+        ).classes("text-sm")
+        desc_selected_btn.set_enabled(len(_get_selected_rows(pl_id)) > 0)
+        def _refresh_desc_sel_btn():
+            desc_selected_btn.set_enabled(len(_get_selected_rows(pl_id)) > 0)
+        ui.timer(0.5, _refresh_desc_sel_btn)
+
+        def _desc_gen_all():
+            track_ids = [t.get("id", "") for t in tracks if t.get("id")]
+            n = _desc_gen.desc_queue_add_many(track_ids)
+            if n > 0:
+                ui.notify(f"Added {n} tracks to description queue", type="positive")
+            else:
+                ui.notify("All tracks are already in the description queue", type="info")
+
+        desc_all_btn = ui.button(
+            "Generate new descriptions for all tracks",
+            on_click=_desc_gen_all,
+            color="blue",
+        ).classes("text-sm")
+        desc_all_btn.set_enabled(len(tracks) > 0)
 
         if _backup_exists(pl_id):
             ui.button("Recover from backup", on_click=lambda: _recover_from_backup(pl_id, set_page_cb), color="purple").classes("text-sm")

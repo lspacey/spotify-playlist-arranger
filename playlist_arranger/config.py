@@ -162,12 +162,14 @@ ALBUM_PENALTY = 0.30
 
 # ─── LLM configuration ────────────────────────────────────────────────────────
 LLM_BACKEND = os.getenv("LLM", "ollama").strip().lower()
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:26b").strip()
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "ollama").strip()
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest").strip()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
+MISTRAL_BASE_URL = os.getenv("MISTRAL_BASE_URL", "https://api.mistral.ai/v1").strip()
 
 # ─── Selected audio device index (default: first WASAPI loopback) ─────────────
 SELECTED_AUDIO_DEVICE_INDEX = None
@@ -245,7 +247,8 @@ class Settings:
     # Local music
     local_music_dir: str = LOCAL_MUSIC_DIR
 
-    # LLM
+    # LLM — settings.json values win if non-empty; .env provides fallback.
+    # Use resolve_llm_settings() to merge the two sources.
     llm_backend: str = LLM_BACKEND
     ollama_model: str = OLLAMA_MODEL
     deepseek_model: str = DEEPSEEK_MODEL
@@ -255,8 +258,43 @@ class Settings:
     selected_audio_device_index: int | None = SELECTED_AUDIO_DEVICE_INDEX
 
 
+# ─── Fields whose settings.json values must fall back to .env when empty ────
+_LLM_FIELDS = {"llm_backend", "ollama_model", "deepseek_model", "mistral_model"}
+
+# .env-backed defaults per field — read once at startup, never change
+_ENV_DEFAULTS = {
+    "llm_backend": LLM_BACKEND,
+    "ollama_model": OLLAMA_MODEL,
+    "deepseek_model": DEEPSEEK_MODEL,
+    "mistral_model": MISTRAL_MODEL,
+}
+
+
+def resolve_llm_settings(settings: Settings) -> Settings:
+    """Apply .env→settings.json merge for LLM model fields.
+
+    For each of the four LLM fields:
+    - If settings.json has a non-empty value → use it (UI overrides .env)
+    - If settings.json has an empty/None value → fall back to the .env constant
+
+    Returns *settings* (mutated in-place) for convenience chaining.
+    """
+    for key in _LLM_FIELDS:
+        val = getattr(settings, key, None)
+        default = _ENV_DEFAULTS.get(key, "")
+        if not val and default:
+            setattr(settings, key, default)
+    return settings
+
+
 def load_settings() -> Settings:
-    """Load settings from cache/settings.json or return defaults."""
+    """Load settings from cache/settings.json, merging .env fallbacks for LLM fields.
+
+    Path and LLM model fields use specific resolution rules:
+    - LLM fields: settings.json wins if non-empty, otherwise .env acts as fallback.
+    - Path fields: converted via _resolve_path.
+    - All other fields: settings.json value as-is (may be empty/missing).
+    """
     settings_path = CACHE_DIR_DEFAULT / "settings.json"
     if settings_path.exists():
         try:
@@ -265,12 +303,21 @@ def load_settings() -> Settings:
             data = json.loads(settings_path.read_text(encoding="utf-8"))
             s = Settings()
             for key, val in data.items():
-                if key in ("db_path", "embeds_dir", "cache_dir", "anchors_dir"):
+                if key in _LLM_FIELDS:
+                    # Do NOT overwrite with empty string — resolve_llm_settings
+                    # below will fill in the .env fallback for empty values.
+                    if val and hasattr(s, key):
+                        setattr(s, key, val)
+                elif key in ("db_path", "embeds_dir", "cache_dir", "anchors_dir"):
                     val = _resolve_path(val)
+                    if hasattr(s, key):
+                        setattr(s, key, val)
                 elif key == "local_music_dir":
-                    val = str(_resolve_path(val))
-                if hasattr(s, key):
+                    if hasattr(s, key):
+                        setattr(s, key, str(_resolve_path(val)))
+                elif hasattr(s, key):
                     setattr(s, key, val)
+            resolve_llm_settings(s)
             return s
         except Exception:
             pass

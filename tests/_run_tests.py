@@ -252,6 +252,10 @@ def test_flush_uses_old_track_duration_not_new():
         buf.samples_count += len(chunk)
         fed += len(chunk)
 
+    # Save reference to old buffer BEFORE on_track_changed (the context
+    # replaces self._analyze_buf with a new buffer during the call).
+    old_buf = buf
+
     # Simulate _card_listen_thread overwriting _current_track BEFORE callback
     _ps._current_track = new_track
 
@@ -266,18 +270,20 @@ def test_flush_uses_old_track_duration_not_new():
     assert new_buf.track_info.get("duration_ms") == 190000, \
         f"Expected 190000ms, got {new_buf.track_info.get('duration_ms')!r}"
 
-    # The old buffer (95% of 285600ms) should have submitted
-    with _ctx._analyze_worker_lock:
-        submitted = _ctx._analyze_worker_busy or len(_ctx._analyze_worker_queue) > 0
-        # Cleanup
-        _ctx._analyze_worker_queue.clear()
-        _ctx._analyze_worker_busy = False
-
-    assert submitted, (
+    # The old buffer (95% of 285600ms) should have submitted.
+    # buf.submitted is set synchronously in _flush_analyze_buffer BEFORE the
+    # async worker thread starts — no daemon-thread race condition to worry
+    # about here.
+    assert old_buf.submitted, (
         "95% of OLD track should submit — "
         "BUG 3 would use NEW track's shorter duration (190000ms) and produce "
         "nonsensical >100% coverage, then discard"
     )
+
+    # Cleanup worker state (may or may not still be processing)
+    with _ctx._analyze_worker_lock:
+        _ctx._analyze_worker_queue.clear()
+        _ctx._analyze_worker_busy = False
 
 
 # ── Run all tests ─────────────────────────────────────────────────────────────

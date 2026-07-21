@@ -19,6 +19,6 @@
   "llm_backend": "mistral",
   "ollama_model": "gemma4:26b",
   "deepseek_model": "deepseek-v4-flash",
-  "mistral_model": "mistal-large-latest",
+  "mistral_model": "mistral-large-latest",
   "selected_audio_device_index": 14
 }
