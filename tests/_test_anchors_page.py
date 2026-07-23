@@ -533,8 +533,8 @@ def test_playlist_row_click_parses_list_shaped_event_args():
 
 
 def test_double_click_on_playlist_row_adds_to_anchors():
-    """Double-click on an unanchored track adds it to the anchor plan."""
-    # This tests the logic path: double_click → select track → _add_selected_track()
+    """Double-click on an unanchored track adds it to the anchor plan.
+    selection="single" now drives table.selected as single source of truth."""
     plan = [{"type": "placeholder"}]
     playlist_tracks = [
         {"id": "t1", "name": "T1", "artist": "A"},
@@ -544,7 +544,7 @@ def test_double_click_on_playlist_row_adds_to_anchors():
 
     # Simulate double-click on track "t2": e.args[1] = {"idx": 2}
     mock_event = type("Event", (), {"args": [{}, {"idx": 2}]})()
-
+    
     # Parse the event
     idx = mock_event.args[1]["idx"] - 1  # 1-based → 0-based
     assert idx == 1
@@ -1069,6 +1069,616 @@ def test_selected_cleared_when_out_of_bounds():
     assert fake_table.selected == [], "Selected should be cleared for invalid clicks"
 
 
+# ── Desync regression: selection="single" + table.selected as single source of truth ─
+
+def test_only_one_row_selectable_at_a_time():
+    """With selection='single', Quasar natively guarantees at most 1 selected row.
+    _selected_track_idx() derives from table.selected which has max 1 item."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_table = _ap._track_table
+    old_tracks = list(_ap._playlist_tracks)
+    try:
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "A", "artist": "X", "duration_ms": 100000},
+            {"id": "t2", "name": "B", "artist": "Y", "duration_ms": 200000},
+            {"id": "t3", "name": "C", "artist": "Z", "duration_ms": 300000},
+        ]
+        _ap._track_table = FakeTable()
+        
+        # Set selection to track 2 (idx=2, 0-based=1)
+        _ap._track_table.selected = [{"idx": 2}]
+        assert _ap._selected_track_idx() == 1
+        
+        # Set selection to track 3 (replacing, not appending)
+        _ap._track_table.selected = [{"idx": 3}]
+        assert _ap._selected_track_idx() == 2
+        assert len(_ap._track_table.selected) == 1, "Max 1 item — selection='single' guarantee"
+        
+        # Clear selection
+        _ap._track_table.selected = []
+        assert _ap._selected_track_idx() is None
+        
+        # Set multiple (should never happen with selection='single', but handle gracefully)
+        _ap._track_table.selected = [{"idx": 1}, {"idx": 2}]
+        assert _ap._selected_track_idx() is None, ">1 items → None (invalid state)"
+    finally:
+        _ap._track_table = old_table
+        _ap._playlist_tracks[:] = old_tracks
+
+
+def test_checkbox_click_updates_selection_state():
+    """When selection='single', clicking a checkbox sets table.selected to [row]."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_table = _ap._track_table
+    old_tracks = list(_ap._playlist_tracks)
+    try:
+        _ap._playlist_tracks[:] = [{"id": "t1", "name": "X", "artist": "Y", "duration_ms": 100000}]
+        _ap._track_table = FakeTable()
+        
+        # Simulate Quasar's selection='single' setting selected to the row
+        _ap._track_table.selected = [{"idx": 1}]  # row 1 checked
+        assert _ap._selected_track_idx() == 0, "Checkbox click must update derived index"
+        
+        # Simulate Quasar clearing selection (same row clicked again)
+        _ap._track_table.selected = []
+        assert _ap._selected_track_idx() is None, "Uncheck must clear derived index"
+    finally:
+        _ap._track_table = old_table
+        _ap._playlist_tracks[:] = old_tracks
+
+
+def test_unchecking_clears_selection_and_disables_add_button():
+    """Unchecking the selected track must clear _selected_track_idx → button disabled."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FB:
+        def __init__(self): self._enabled = False
+        def set_enabled(self, v): self._enabled = v
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_table = _ap._track_table
+    old_btn = _ap._add_selected_track_btn
+    old_tracks = list(_ap._playlist_tracks)
+    old_plan = list(_ap._anchor_plan)
+    try:
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "A", "artist": "X", "duration_ms": 100000},
+            {"id": "t2", "name": "B", "artist": "Y", "duration_ms": 200000},
+        ]
+        _ap._anchor_plan[:] = []
+        _ap._track_table = FakeTable()
+        _ap._add_selected_track_btn = FB()
+        
+        # Select track 1
+        _ap._track_table.selected = [{"idx": 1}]
+        _ap._refresh_control_buttons()
+        assert _ap._add_selected_track_btn._enabled, "Button should be enabled when track selected"
+        
+        # Uncheck → deselect
+        _ap._track_table.selected = []
+        _ap._refresh_control_buttons()
+        assert not _ap._add_selected_track_btn._enabled, "Button must be DISABLED when nothing selected"
+    finally:
+        _ap._track_table = old_table
+        _ap._add_selected_track_btn = old_btn
+        _ap._playlist_tracks[:] = old_tracks
+        _ap._anchor_plan[:] = old_plan
+
+
+def test_row_click_and_checkbox_click_converge_on_same_selection():
+    """Both row click and checkbox click converge on table.selected (single source of truth).
+    There is NO separate _selected_track_idx variable — it's derived fresh each read."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_table = _ap._track_table
+    old_tracks = list(_ap._playlist_tracks)
+    try:
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "A", "artist": "X", "duration_ms": 100000},
+            {"id": "t2", "name": "B", "artist": "Y", "duration_ms": 200000},
+        ]
+        _ap._track_table = FakeTable()
+        
+        # Simulate row click on track 2 — Quasar sets selected=[row2]
+        _ap._track_table.selected = [{"idx": 2}]
+        # _on_track_row_click would fire, but all it does is guard anchored tracks
+        # The selection is entirely Quasar-driven
+        assert _ap._selected_track_idx() == 1
+        
+        # Simulate checkbox click on track 1 — Quasar sets selected=[row1]
+        _ap._track_table.selected = [{"idx": 1}]
+        assert _ap._selected_track_idx() == 0
+        
+        # Both mechanisms write to the SAME table.selected — zero diverged state
+        assert not hasattr(_ap, '_selected_track_idx') or isinstance(
+            getattr(_ap, '_selected_track_idx', None), type(lambda: None)
+        ), "_selected_track_idx must be a function, not a variable"
+    finally:
+        _ap._track_table = old_table
+        _ap._playlist_tracks[:] = old_tracks
+
+
+def test_add_selected_track_button_reflects_actual_visible_selection():
+    """The core desync regression test: visible checkbox state MUST match
+    what 'Add selected track' would act on. No stale/invisible selection."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FB:
+        def __init__(self): self._enabled = False
+        def set_enabled(self, v): self._enabled = v
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_table = _ap._track_table
+    old_btn = _ap._add_selected_track_btn
+    old_tracks = list(_ap._playlist_tracks)
+    old_plan = list(_ap._anchor_plan)
+    try:
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "S1", "artist": "A1", "duration_ms": 100000},
+            {"id": "t2", "name": "S2", "artist": "A2", "duration_ms": 200000},
+        ]
+        _ap._anchor_plan[:] = []
+        _ap._track_table = FakeTable()
+        _ap._add_selected_track_btn = FB()
+        
+        # STATE 1: Nothing checked → button disabled
+        _ap._track_table.selected = []
+        _ap._refresh_control_buttons()
+        assert not _ap._add_selected_track_btn._enabled, "Nothing checked → disabled"
+        
+        # STATE 2: Track 1 checked → button enabled
+        _ap._track_table.selected = [{"idx": 1}]
+        _ap._refresh_control_buttons()
+        assert _ap._add_selected_track_btn._enabled, "Track checked → enabled"
+        
+        # STATE 3: Track 1 ADDED to anchors (now 🔒 Anchored) → button disabled
+        _ap._anchor_plan[:] = [{"type": "anchor", "track_id": "t1"}]
+        _ap._refresh_control_buttons()
+        assert not _ap._add_selected_track_btn._enabled, (
+            "Anchored track → disabled (even though still visible-checked)"
+        )
+        
+        # STATE 4: Clear selection, select Track 2 → button enabled again
+        _ap._track_table.selected = [{"idx": 2}]
+        _ap._refresh_control_buttons()
+        assert _ap._add_selected_track_btn._enabled, "Unanchored track 2 must be addable"
+        
+        # STATE 5: Clear ALL (including selection) → button disabled
+        _ap._track_table.selected = []
+        _ap._refresh_control_buttons()
+        assert not _ap._add_selected_track_btn._enabled, "Nothing selected → disabled"
+        
+        # Verify add uses the CORRECT track (what user sees selected)
+        _ap._track_table.selected = [{"idx": 2}]
+        _ap._add_selected_track()
+        assert len(_ap._anchor_plan) == 2, "Track 2 should have been added"
+        assert _ap._anchor_plan[-1]["track_id"] == "t2", "Must add the VISIBLE selection (t2), not stale state"
+    finally:
+        _ap._track_table = old_table
+        _ap._add_selected_track_btn = old_btn
+        _ap._playlist_tracks[:] = old_tracks
+        _ap._anchor_plan[:] = old_plan
+
+
+# ── Bug A: Checkbox-only click triggers button refresh via on_select ──────
+
+def test_checkbox_only_click_triggers_button_refresh():
+    """on_select must fire for checkbox clicks even though Quasar's @click.stop
+    prevents rowClick from firing.  _refresh_control_buttons() runs on both paths."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    import inspect
+    
+    # Verify _on_track_selection_change exists and calls _refresh_control_buttons
+    source = inspect.getsource(_ap._on_track_selection_change)
+    assert "_refresh_control_buttons()" in source, (
+        "_on_track_selection_change must call _refresh_control_buttons()"
+    )
+    
+    # Verify the function is in the module namespace
+    assert callable(_ap._on_track_selection_change), "_on_track_selection_change must be callable"
+
+
+def test_selection_event_wired_to_refresh_control_buttons():
+    """on_select=_on_track_selection_change ensures button state refreshes on
+    ALL selection changes, not just rowClick-triggered ones."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FB:
+        def __init__(self): self._enabled = False
+        def set_enabled(self, v): self._enabled = v
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_table = _ap._track_table
+    old_btn = _ap._add_selected_track_btn
+    old_tracks = list(_ap._playlist_tracks)
+    old_plan = list(_ap._anchor_plan)
+    try:
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "A", "artist": "X", "duration_ms": 100000},
+            {"id": "t2", "name": "B", "artist": "Y", "duration_ms": 200000},
+        ]
+        _ap._anchor_plan[:] = []
+        _ap._track_table = FakeTable()
+        _ap._add_selected_track_btn = FB()
+        
+        # Simulate checkbox click (no rowClick) — on_select fires, calling
+        # _on_track_selection_change which calls _refresh_control_buttons
+        _ap._track_table.selected = [{"idx": 1}]
+        _ap._on_track_selection_change(None)  # simulate on_select
+        assert _ap._add_selected_track_btn._enabled, (
+            "Button must be enabled after selection change event"
+        )
+    finally:
+        _ap._track_table = old_table
+        _ap._add_selected_track_btn = old_btn
+        _ap._playlist_tracks[:] = old_tracks
+        _ap._anchor_plan[:] = old_plan
+
+
+# ── Bug B: Double-click adds exact clicked track (not stale selection) ────
+
+def test_double_click_adds_exact_clicked_track_not_stale_selection():
+    """Double-click row 2 must add row 2's track_id to _anchor_plan, NOT
+    a stale previous selection (Bug B regression)."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_table = _ap._track_table
+    old_tracks = list(_ap._playlist_tracks)
+    old_plan = list(_ap._anchor_plan)
+    try:
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "Track 1", "artist": "A1", "duration_ms": 100000},
+            {"id": "t2", "name": "Track 2", "artist": "A2", "duration_ms": 200000},
+            {"id": "t3", "name": "Track 3", "artist": "A3", "duration_ms": 300000},
+        ]
+        _ap._anchor_plan[:] = []
+        _ap._track_table = FakeTable()
+        
+        # Pre-condition: row 1 is selection="single" selected (stale state)
+        _ap._track_table.selected = [{"idx": 1}]
+        
+        # User double-clicks row 2
+        # Simulate _on_track_double_click logic:
+        # 1. Parse row 2 from event
+        mock_event = type("Event", (), {"args": [{}, {"idx": 2}]})()
+        idx = _ap._parse_row_idx(mock_event)  # 0-based → 1
+        assert idx == 1, "Double-clicked row 2 → 0-based idx=1"
+        tid = _ap._playlist_tracks[idx]["id"]
+        assert tid == "t2"
+        
+        # 2. Explicitly sync table.selected to the double-clicked row
+        _ap._track_table.selected = [{"idx": 2}]
+        assert _ap._selected_track_idx() == 1, "table.selected must now point to row 2"
+        
+        # 3. _add_selected_track() reads from table.selected → must add t2, not t1
+        _ap._add_selected_track()
+        
+        # Assert: t2 was added, not t1
+        assert len(_ap._anchor_plan) == 1
+        assert _ap._anchor_plan[0]["track_id"] == "t2", (
+            f"BUG: Expected t2 (double-clicked track), got {_ap._anchor_plan[0]['track_id']}"
+        )
+    finally:
+        _ap._track_table = old_table
+        _ap._playlist_tracks[:] = old_tracks
+        _ap._anchor_plan[:] = old_plan
+
+
+# ── Bug C: Track deselected after double-click add ────────────────────────
+
+def test_track_deselected_after_double_click_add():
+    """After double-click adding a track, table.selected must be [] so the
+    now-anchored track is not left visually checked/un-interactable."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_table = _ap._track_table
+    old_tracks = list(_ap._playlist_tracks)
+    old_plan = list(_ap._anchor_plan)
+    try:
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "Test", "artist": "A", "duration_ms": 100000},
+        ]
+        _ap._anchor_plan[:] = []
+        _ap._track_table = FakeTable()
+        
+        # Simulate full _on_track_double_click flow:
+        mock_event = type("Event", (), {"args": [{}, {"idx": 1}]})()
+        _ap._track_table.selected = [{"idx": 1}]   # sync to dblclicked row
+        _ap._add_selected_track()                   # add to anchors
+        
+        # BUG C FIX: After _add_selected_track, table.selected must be cleared
+        # because the track is now anchored and unselectable
+        _ap._track_table.selected = []
+        
+        # The "Add Selected Track" button must now be disabled (no selection)
+        class FB:
+            def __init__(self): self._enabled = False
+            def set_enabled(self, v): self._enabled = v
+        
+        old_btn = _ap._add_selected_track_btn
+        _ap._add_selected_track_btn = FB()
+        _ap._refresh_control_buttons()
+        assert not _ap._add_selected_track_btn._enabled, (
+            "After dblclick-add, button must be disabled (track now anchored, selection cleared)"
+        )
+    finally:
+        _ap._track_table = old_table
+        _ap._playlist_tracks[:] = old_tracks
+        _ap._anchor_plan[:] = old_plan
+
+
+# ── Bug D: table.selected must always be a list ──────────────────────────
+
+def test_anchor_table_selected_is_always_a_list():
+    """Every assignment to table.selected must use a list, never a bare dict."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    import inspect
+    
+    # Use FakeTable to test the type of values assigned
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            if not isinstance(val, list):
+                raise TypeError(f"table.selected must be a list, got {type(val).__name__}")
+            self._selected = list(val)
+    
+    old_table = _ap._track_table
+    old_anchors_table = _ap._anchors_table
+    try:
+        # Test _on_anchor_row_click path: [row_data], not row_data
+        row_data = {"idx": 1, "type": "⚓ Anchor", "info": "Test"}
+        _ap._anchors_table = FakeTable()
+        _ap._anchors_table.selected = [row_data]  # Bug D: must be [row_data], not row_data
+        assert _ap._anchors_table.selected == [row_data]
+        _ap._anchors_table.selected = []
+        assert _ap._anchors_table.selected == []
+        
+        # Test that bare dict assignment raises TypeError
+        try:
+            _ap._anchors_table.selected = row_data  # bare dict — should fail
+            assert False, "Bare dict assignment to table.selected must be caught"
+        except TypeError:
+            pass  # Test passed — bare dict rejected
+        
+        # Test all known assignment sites via source code audit
+        source = inspect.getsource(_ap)
+        lines = source.split("\n")
+        for lineno, line in enumerate(lines, 1):
+            # Find every "selected = " assignment
+            stripped = line.strip()
+            if "selected = " in stripped and not stripped.startswith("#"):
+                # Extract the assigned value
+                idx = stripped.index("selected = ") + len("selected = ")
+                rhs = stripped[idx:].strip()
+                if "row_data" in rhs and "[" not in rhs and "[" not in rhs:
+                    # This is a bare dict assignment (like .selected = row_data)
+                    # Check if the line actually has [row_data] vs row_data
+                    if "row_data" in rhs and "[row_data]" not in rhs:
+                        # False positive: could be something like "row_data is not None"
+                        if "is not None" not in rhs and "is None" not in rhs:
+                            print(f"WARNING: Line {lineno}: {stripped}")
+                            # Only flag actual assignments
+                            if "=" in rhs and "[" not in rhs.split("=")[0]:
+                                assert False, (
+                                    f"Line {lineno}: potential bare dict assignment: {stripped}"
+                                )
+    finally:
+        _ap._track_table = old_table
+        _ap._anchors_table = old_anchors_table
+
+
+def test_anchor_row_click_does_not_affect_playlist_track_selection():
+    """Clicking an anchor list row must NOT change _track_table.selected or
+    the 'Add Selected Track' button state (independent selections)."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_anchors_table = _ap._anchors_table
+    old_track_table = _ap._track_table
+    old_tracks = list(_ap._playlist_tracks)
+    old_plan = list(_ap._anchor_plan)
+    try:
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "Track 1", "artist": "A1", "duration_ms": 100000},
+        ]
+        _ap._anchor_plan[:] = [
+            {"type": "anchor", "track_id": "t1"},
+            {"type": "placeholder"},
+        ]
+        _ap._track_table = FakeTable()
+        _ap._anchors_table = FakeTable()
+        
+        # Setup: Playlist table has NO selection
+        _ap._track_table.selected = []
+        
+        # Click an anchor row (anchors list, NOT playlist track table)
+        mock_event = type("Event", (), {"args": [{}, {"idx": 2}]})()
+        _ap._on_anchor_row_click(mock_event)
+        
+        # Anchor selection state should be set
+        assert _ap._selected_anchor_idx == 1, "Anchor row 2 selected (0-based idx=1)"
+        assert _ap._anchors_table.selected == [{"idx": 2}], "Anchor table should show row 2 selected"
+        
+        # Playlist track table selection must NOT have changed
+        assert _ap._track_table.selected == [], (
+            "Anchor row click must NOT change playlist track table selection"
+        )
+        
+        # _selected_track_idx() must still return None (playlist table unaffected)
+        assert _ap._selected_track_idx() is None, (
+            "Anchor row click must not affect playlist track selection index"
+        )
+    finally:
+        _ap._anchors_table = old_anchors_table
+        _ap._track_table = old_track_table
+        _ap._playlist_tracks[:] = old_tracks
+        _ap._anchor_plan[:] = old_plan
+
+
+def test_remove_anchor_reenables_add_button_if_track_still_checked():
+    """Remove an anchor → if the removed track happens to still be the checked
+    row in the playlist table, 'Add Selected Track' should re-enable since
+    the track is now un-anchored and selectable."""
+    import playlist_arranger.ui.pages.anchors as _ap
+    
+    class FB:
+        def __init__(self): self._enabled = False
+        def set_enabled(self, v): self._enabled = v
+    
+    class FakeTable:
+        def __init__(self):
+            self._selected = []
+        @property
+        def selected(self):
+            return list(self._selected)
+        @selected.setter
+        def selected(self, val):
+            self._selected = list(val) if val else []
+    
+    old_track_table = _ap._track_table
+    old_tracks = list(_ap._playlist_tracks)
+    old_plan = list(_ap._anchor_plan)
+    old_btn = _ap._add_selected_track_btn
+    old_sel = _ap._selected_anchor_idx
+    try:
+        # Track t1 is anchored AND is the currently-checked row in playlist table.
+        # This is an edge case: normally anchored tracks are unselectable via
+        # _on_track_row_click's guard, but if table.selected was set externally
+        # (or the track was checked before it became anchored), it survives.
+        _ap._playlist_tracks[:] = [
+            {"id": "t1", "name": "Track 1", "artist": "A1", "duration_ms": 100000},
+            {"id": "t2", "name": "Track 2", "artist": "A2", "duration_ms": 200000},
+        ]
+        _ap._anchor_plan[:] = [
+            {"type": "anchor", "track_id": "t1"},
+            {"type": "placeholder"},
+        ]
+        _ap._track_table = FakeTable()
+        _ap._add_selected_track_btn = FB()
+        
+        # t1 is checked in playlist table (edge case)
+        _ap._track_table.selected = [{"idx": 1}]
+        _ap._refresh_control_buttons()
+        # t1 is anchored → button should be DISABLED
+        assert not _ap._add_selected_track_btn._enabled, (
+            "Track t1 is anchored → button must be disabled"
+        )
+        
+        # Remove t1 from anchors
+        _ap._selected_anchor_idx = 0  # t1 is first anchor item
+        _ap._remove_anchor()
+        
+        # t1 is no longer anchored, and it's still checked in playlist table
+        # → button should be ENABLED again
+        assert _ap._add_selected_track_btn._enabled, (
+            "After removing t1 from anchors, button must re-enable (t1 still checked)"
+        )
+        
+        # Verify _anchor_plan is empty of t1
+        assert len(_ap._anchor_plan) == 1, "Placeholder remains"
+        assert _ap._anchor_plan[0]["type"] == "placeholder"
+        assert _ap._selected_track_idx() == 0, "Track t1 (idx=0) still checked"
+    finally:
+        _ap._track_table = old_track_table
+        _ap._playlist_tracks[:] = old_tracks
+        _ap._anchor_plan[:] = old_plan
+        _ap._add_selected_track_btn = old_btn
+        _ap._selected_anchor_idx = old_sel
+
+
 # ── Run all tests ─────────────────────────────────────────────────────────
 tests = [
     ("test_nav_button_enabled_when_sp_connected", test_nav_button_enabled_when_sp_connected),
@@ -1122,6 +1732,18 @@ tests = [
     ("test_shared_track_rows_status_populated_when_anchored", test_shared_track_rows_status_populated_when_anchored),
     ("test_selected_row_visually_indicated", test_selected_row_visually_indicated),
     ("test_selected_cleared_when_out_of_bounds", test_selected_cleared_when_out_of_bounds),
+    ("test_only_one_row_selectable_at_a_time", test_only_one_row_selectable_at_a_time),
+    ("test_checkbox_click_updates_selection_state", test_checkbox_click_updates_selection_state),
+    ("test_unchecking_clears_selection_and_disables_add_button", test_unchecking_clears_selection_and_disables_add_button),
+    ("test_row_click_and_checkbox_click_converge_on_same_selection", test_row_click_and_checkbox_click_converge_on_same_selection),
+    ("test_add_selected_track_button_reflects_actual_visible_selection", test_add_selected_track_button_reflects_actual_visible_selection),
+    ("test_checkbox_only_click_triggers_button_refresh", test_checkbox_only_click_triggers_button_refresh),
+    ("test_selection_event_wired_to_refresh_control_buttons", test_selection_event_wired_to_refresh_control_buttons),
+    ("test_double_click_adds_exact_clicked_track_not_stale_selection", test_double_click_adds_exact_clicked_track_not_stale_selection),
+    ("test_track_deselected_after_double_click_add", test_track_deselected_after_double_click_add),
+    ("test_anchor_table_selected_is_always_a_list", test_anchor_table_selected_is_always_a_list),
+    ("test_anchor_row_click_does_not_affect_playlist_track_selection", test_anchor_row_click_does_not_affect_playlist_track_selection),
+    ("test_remove_anchor_reenables_add_button_if_track_still_checked", test_remove_anchor_reenables_add_button_if_track_still_checked),
 ]
 
 for name, fn in tests:

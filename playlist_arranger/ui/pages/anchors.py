@@ -25,12 +25,14 @@ _anchors_select = None
 _anchors_list_container = None
 _track_list_container = None
 
-# ── SINGLE SOURCE OF TRUTH for current anchor plan ─────────────────────────
-_anchor_plan: list = []
+# ── SINGLE SOURCE OF TRUTH ────────────────
+_anchor_plan: list = []               # anchor plan items (mutated in-place)
+_selected_anchor_idx: int | None = None  # selected anchor row (for move/remove)
 
-# Selected rows (tracked in Python + native Quasar highlight via .selected)
-_selected_anchor_idx: int | None = None
-_selected_track_idx: int | None = None
+# Track selection: Quasar's table.selected is the SINGLE source of truth.
+# selection="single" guarantees at most 1 row is checked.  We derive the
+# selected 0-based track index from table.selected[0]["idx"] - 1 on every
+# read — no stale/invisible cached Python variable can exist.
 
 # Table refs (for programmatic .selected row highlighting)
 _anchors_table = None
@@ -44,6 +46,25 @@ _playlist_name: str = ""
 def _anchored_track_ids() -> set:
     """Return the set of track IDs currently in the anchor plan."""
     return {e["track_id"] for e in _anchor_plan if e["type"] == "anchor"}
+
+
+def _selected_track_idx() -> int | None:
+    """Derive the 0-based selected track index from table.selected (single source of truth).
+
+    selection="single" guarantees table.selected has 0 or 1 items.
+    Returns None if nothing is selected, or the 0-based index if exactly
+    one row is checked and its idx falls within the playlist tracks range.
+    """
+    if _track_table is None:
+        return None
+    sel = list(_track_table.selected) if hasattr(_track_table, 'selected') else []
+    if len(sel) != 1:
+        return None
+    idx = sel[0].get("idx", 0) if isinstance(sel[0], dict) else 0
+    i = int(idx) - 1  # 1-based → 0-based
+    if 0 <= i < len(_playlist_tracks):
+        return i
+    return None
 
 
 def _parse_row_idx(e) -> int | None:
@@ -81,11 +102,12 @@ def _refresh_control_buttons():
     if _remove_btn is not None:
         _remove_btn.set_enabled(single_selected)
 
-    # Add selected track: enabled iff one track selected AND it's not already anchored
+    # Add selected track: read from table.selected (single source of truth)
     if _add_selected_track_btn is not None:
         track_enabled = False
-        if _selected_track_idx is not None and 0 <= _selected_track_idx < len(_playlist_tracks):
-            tid = _playlist_tracks[_selected_track_idx].get("id", "")
+        sti = _selected_track_idx()
+        if sti is not None:
+            tid = _playlist_tracks[sti].get("id", "")
             track_enabled = tid not in _anchored_track_ids()
         _add_selected_track_btn.set_enabled(track_enabled)
 
@@ -116,10 +138,14 @@ def _rebuild_track_list():
         _render_track_list()
 
 
-# ── Event handlers (NO Quasar selection mode — all selection tracked in Python) ─
+# ── Event handlers ──────────────────────────────────────────────────────────
 
 def _on_anchor_row_click(e):
-    """Handle single-selection on anchors table + native Quasar highlight."""
+    """Handle single-selection on anchors table + native Quasar highlight.
+
+    _anchors_table.selected is ALWAYS a list: [row_data] for selection,
+    [] for deselection.  Never a bare dict.
+    """
     global _selected_anchor_idx, _anchors_table
     idx = _parse_row_idx(e)
     row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else None
@@ -136,41 +162,67 @@ def _on_anchor_row_click(e):
 
 
 def _on_track_row_click(e):
-    """Handle single-selection on playlist tracks table + native Quasar highlight."""
-    global _selected_track_idx, _track_table
-    idx = _parse_row_idx(e)
-    row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else None
+    """Handle single-click on playlist track table.
 
+    With selection="single", Quasar natively sets table.selected to [row_data]
+    (or [] if the same row is clicked again to deselect).  We guard against
+    anchored tracks: if the newly-selected row belongs to an already-anchored
+    track, clear the selection.  Button refresh is handled by the on_select
+    event (fires on ALL selection changes, including checkbox clicks).
+    """
+    idx = _parse_row_idx(e)
     if idx is not None and 0 <= idx < len(_playlist_tracks):
         tid = _playlist_tracks[idx].get("id", "")
-        if tid and tid not in _anchored_track_ids():
-            _selected_track_idx = idx
-            if _track_table is not None and row_data is not None:
-                _track_table.selected = [row_data]
-        else:
-            _selected_track_idx = None
+        if tid in _anchored_track_ids():
             if _track_table is not None:
                 _track_table.selected = []
-    else:
-        _selected_track_idx = None
-        if _track_table is not None:
-            _track_table.selected = []
+    _refresh_control_buttons()
+
+
+def _on_track_selection_change(e):
+    """BUG A FIX: Called via on_select whenever table.selected changes.
+
+    Quasar fires @selection for ANY selection change: checkbox click, row
+    click, rowDblclick — even though checkbox clicks have @click.stop and
+    don't fire rowClick.  This ensures _refresh_control_buttons() runs for
+    EVERY selection change, keeping the "Add Selected Track" button in sync
+    with the visible checkbox state.
+
+    Source: NiceGUI 3.13.0 `Table.__init__` accepts `on_select:
+    Handler[TableSelectionEventArguments]` — the official way to listen for
+    Quasar's native `@selection` event.
+    """
     _refresh_control_buttons()
 
 
 def _on_track_double_click(e):
-    """Double-click on playlist track → select + add to anchors + native Quasar highlight."""
-    global _selected_track_idx, _track_table
-    idx = _parse_row_idx(e)
-    row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else None
+    """Handle double-click on playlist track table.
 
+    BUG B FIX: Quasar's rowDblclick does NOT update table.selected.
+    We must explicitly set table.selected to [row_data] BEFORE calling
+    _add_selected_track() so the single source of truth reflects the
+    double-clicked row, not a stale previous selection.
+
+    BUG C FIX: After adding the track to anchors, clear table.selected
+    so the track (now anchored) doesn't remain visually selected and
+    un-interactable.
+    """
+    idx = _parse_row_idx(e)
     if idx is not None and 0 <= idx < len(_playlist_tracks):
+        row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else None
         tid = _playlist_tracks[idx].get("id", "")
-        if tid and tid not in _anchored_track_ids():
-            _selected_track_idx = idx
+        if tid in _anchored_track_ids():
+            if _track_table is not None:
+                _track_table.selected = []
+        else:
+            # Explicitly sync table.selected to the double-clicked row
+            # before reading it via _selected_track_idx() → _add_selected_track().
             if _track_table is not None and row_data is not None:
                 _track_table.selected = [row_data]
             _add_selected_track()
+            # After adding, the track is anchored → clear selection
+            if _track_table is not None:
+                _track_table.selected = []
     _refresh_control_buttons()
 
 
@@ -204,10 +256,14 @@ def _remove_anchor():
     global _anchor_plan, _selected_anchor_idx
     if _selected_anchor_idx is None or _selected_anchor_idx < 0 or _selected_anchor_idx >= len(_anchor_plan):
         return
+    removed = _anchor_plan[_selected_anchor_idx]
     del _anchor_plan[_selected_anchor_idx]
     _selected_anchor_idx = None
     _rebuild_anchors_list()
     _rebuild_track_list()
+    # If the removed anchor's track was checked in the playlist table,
+    # it should now become addable again.  _refresh_control_buttons()
+    # re-reads _anchored_track_ids() from the updated _anchor_plan.
     _refresh_control_buttons()
 
 
@@ -220,10 +276,17 @@ def _add_placeholder():
 
 
 def _add_selected_track():
-    global _anchor_plan, _selected_track_idx
-    if _selected_track_idx is None or _selected_track_idx < 0 or _selected_track_idx >= len(_playlist_tracks):
+    """Add the currently selected track to the anchor plan.
+
+    Reads the selected track from table.selected (single source of truth).
+    There is no separate _selected_track_idx variable — the visible checkbox
+    state IS the authoritative selection.
+    """
+    global _anchor_plan
+    sti = _selected_track_idx()
+    if sti is None:
         return
-    tid = _playlist_tracks[_selected_track_idx].get("id", "")
+    tid = _playlist_tracks[sti].get("id", "")
     if tid and tid not in _anchored_track_ids():
         _anchor_plan.append({"type": "anchor", "track_id": tid})
     _rebuild_anchors_list()
@@ -233,10 +296,12 @@ def _add_selected_track():
 
 def _clear_anchors():
     """Clear ALL items from the anchor plan (no leftover placeholder)."""
-    global _anchor_plan, _selected_anchor_idx, _selected_track_idx
+    global _anchor_plan, _selected_anchor_idx
     _anchor_plan.clear()
     _selected_anchor_idx = None
-    _selected_track_idx = None
+    # Clear track selection too (so no stale selection survives)
+    if _track_table is not None:
+        _track_table.selected = []
     _rebuild_anchors_list()
     _rebuild_track_list()
     _refresh_control_buttons()
@@ -244,7 +309,7 @@ def _clear_anchors():
 
 def _save_anchors():
     """Save the current _anchor_plan to disk. Does NOT mutate the plan.
-    
+
     Saving an empty anchor plan saves an EMPTY list ([]), full stop.
     There is no product requirement to inject a placeholder on save.
     """
@@ -283,8 +348,7 @@ def _render_controls():
 
 
 def _render_anchors_list():
-    """Render the anchors list table — compact, no pagination.
-    NO Quasar selection mode — all selection tracked in Python via rowClick."""
+    """Render the anchors list table — compact, no pagination."""
     title_text = f"Anchors for {_playlist_name}" if _playlist_name else "Anchors"
 
     columns = [
@@ -328,8 +392,15 @@ def _render_anchors_list():
 
 
 def _render_track_list():
-    """Render the playlist track list — reuses shared build_track_rows().
-    NO Quasar selection mode — all selection tracked in Python."""
+    """Render the playlist track list — follows show_track_compact_table() pattern.
+
+    selection="single": Quasar's native single-select behavior (max 1 checkbox).
+    table.selected IS the single source of truth for which track is selected.
+
+    on_select: fires on EVERY selection change (checkbox click, row click,
+    rowDblclick) — keeps button state in sync even when checkbox @click.stop
+    prevents rowClick from firing (Bug A fix per NiceGUI 3.13.0 docs).
+    """
     if not _playlist_tracks:
         ui.label("No tracks loaded.").classes("text-sm text-gray-400 italic")
         return
@@ -347,79 +418,44 @@ def _render_track_list():
     ]
 
     ui.label(f"Playlist: {_playlist_name} ({len(_playlist_tracks)} tracks)").classes("text-sm font-semibold mb-1")
+
     global _track_table
     _track_table = ui.table(
-        columns=columns,
-        rows=rows,
-        row_key="idx",
-        selection="multiple",
+        columns=columns, rows=rows, row_key="idx",
+        selection="single",
         pagination={"rowsPerPage": 0},
+        on_select=_on_track_selection_change,
     ).classes("w-full").props("dense")
-    # Custom body slot with native checkbox column (selection="multiple") +
-    # anchored-row graying + desc icon rendering + click/dblclick forwarding.
-    # Quasar's default body renders <q-checkbox v-model="props.selected"> in
-    # the first cell, then each data column.  We replicate this and add
-    # @click/@dblclick on <q-tr> which emit the same events QTable's native
-    # body would: ("rowClick", evt, row, pageIndex) and
-    # ("rowDblclick", evt, row, pageIndex) — confirmed at
-    # nicegui/static/quasar.umd.js:emit("rowDblclick", evt, row, pageIndex).
-    # $parent.$emit is standard Vue 3 component communication, not an internal.
-    # Checkbox @click.stop prevents the row click from toggling selection AND
-    # triggering _selected_track_idx — checkbox clicks stay isolated.
-    from playlist_arranger.ui.pages.playlist_source import _on_desc_icon_click
-    _track_table.add_slot("body", r'''
-    <q-tr :props="props" :class="props.row.locked ? 'anchors-locked-row' : ''"
-          @click="(evt) => $parent.$emit('rowClick', evt, props.row, props.pageIndex)"
-          @dblclick="(evt) => $parent.$emit('rowDblclick', evt, props.row, props.pageIndex)">
-        <q-td auto-width>
-            <q-checkbox v-if="props.selected !== void 0" v-model="props.selected" @click.stop />
-        </q-td>
-        <q-td v-for="col in props.cols" :key="col.name" :props="props">
-            <template v-if="col.name === 'desc'">
-              <span class="desc-icon-container">
-                <q-icon :name="props.row.desc_icon" :color="props.row.desc_color" size="18px"
-                        style="cursor: pointer;"
-                        @click.stop="() => $parent.$emit('desc_click', props.row)" />
-                <span class="desc-icon-tip">{{ props.row.desc_caption }}</span>
-              </span>
-            </template>
-            <template v-else>
-              {{ props.row[col.field] }}
-            </template>
-        </q-td>
-    </q-tr>
-    ''')
-    _track_table.on("desc_click", _on_desc_icon_click)
 
-    # CSS for anchored rows
-    ui.add_head_html("""
-    <style>
-    .anchors-locked-row {
-        opacity: 0.45 !important;
-        pointer-events: none !important;
-        background-color: #f5f5f5 !important;
-    }
-    body.body--dark .anchors-locked-row {
-        background-color: #1a1a1a !important;
-    }
-    </style>
+    _track_table.add_slot("body-cell-desc", r"""
+    <q-td :props="props">
+      <span class="desc-icon-container">
+        <q-icon :name="props.row.desc_icon" :color="props.row.desc_color" size="18px"
+                style="cursor: pointer;"
+                @click.stop="() => $parent.$emit('desc_click', props.row)" />
+        <span class="desc-icon-tip">{{ props.row.desc_caption }}</span>
+      </span>
+    </q-td>
     """)
+
+    from playlist_arranger.ui.pages.playlist_source import _on_desc_icon_click
+    _track_table.on("desc_click", _on_desc_icon_click)
+    _track_table.on("rowDblclick", _on_track_double_click)
+    _track_table.on("rowClick", _on_track_row_click)
 
 
 def _on_playlist_selected(pl_id: str):
     """Handle playlist selection change — load tracks and anchor plan."""
     global _anchor_plan, _playlist_tracks, _playlist_name
-    global _selected_anchor_idx, _selected_track_idx
+    global _selected_anchor_idx
 
     _state.anchors_selected_playlist_id = pl_id
 
     if not pl_id:
         return
 
-    # Load anchor plan
     _anchor_plan = _load_anchors_file(pl_id) or []
 
-    # Load playlist tracks via the existing caching/fetching pipeline
     from playlist_arranger.ui.pages.playlist_source import _load_cached_playlist_tracks
     try:
         _playlist_tracks = _load_cached_playlist_tracks(pl_id)
@@ -428,7 +464,6 @@ def _on_playlist_selected(pl_id: str):
         ui.notify(f"Failed to load tracks: {exc}", type="negative")
         _playlist_tracks = []
 
-    # Extract playlist name
     _playlist_name = ""
     try:
         pl_data = _state.sp.playlist(pl_id, fields="name")
@@ -437,7 +472,6 @@ def _on_playlist_selected(pl_id: str):
         _playlist_name = pl_id[:8]
 
     _selected_anchor_idx = None
-    _selected_track_idx = None
 
     _rebuild_anchors_list()
     _rebuild_track_list()
@@ -447,7 +481,7 @@ def _on_playlist_selected(pl_id: str):
 def build_anchors():
     """Build the full anchors page."""
     global _anchor_plan, _playlist_tracks, _playlist_name
-    global _selected_anchor_idx, _selected_track_idx
+    global _selected_anchor_idx
     global _anchors_select, _anchors_list_container, _track_list_container
 
     ui.label("Anchors").classes("text-2xl font-bold mb-4")
@@ -481,14 +515,12 @@ def build_anchors():
         on_change=on_change,
     ).classes("w-80 mb-4")
 
-    # ── Anchors list + controls ───────────────────────────────────────────
     _anchors_list_container = ui.column().classes("w-full mb-2")
     with _anchors_list_container:
         _render_anchors_list()
 
     _render_controls()
 
-    # ── Playlist track list ───────────────────────────────────────────────
     ui.separator().classes("my-4")
     _track_list_container = ui.column().classes("w-full")
     with _track_list_container:
