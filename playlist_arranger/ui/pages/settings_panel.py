@@ -130,10 +130,17 @@ def build_settings_dialog():
             for d in devices:
                 label = f"[{'LOOP' if d['loopback'] else 'IN'}] {d['name'][:50]} ({d['channels']}ch @ {d['sr']}Hz)"
                 device_options[str(d["index"])] = label
+            saved_idx = str(s.selected_audio_device_index) if s.selected_audio_device_index is not None else None
+            if saved_idx is not None and saved_idx in device_options:
+                value = saved_idx
+            else:
+                value = None
+                if saved_idx is not None:
+                    ui.label("⚠ Audio device changed — please reselect").classes("text-xs text-orange-500 mb-1")
             device_select = ui.select(
                 label="Audio input device",
                 options=device_options,
-                value=str(s.selected_audio_device_index) if s.selected_audio_device_index is not None else None,
+                value=value,
             ).classes("w-full max-w-md")
 
         # ─── LLM settings ───────────────────────────────────────────────────

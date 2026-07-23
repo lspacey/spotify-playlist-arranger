@@ -20,5 +20,5 @@
   "ollama_model": "gemma4:26b",
   "deepseek_model": "deepseek-v4-flash",
   "mistral_model": "mistral-large-latest",
-  "selected_audio_device_index": 14
+  "selected_audio_device_index": 18
 }

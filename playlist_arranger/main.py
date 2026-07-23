@@ -28,7 +28,7 @@ from playlist_arranger.ui.pages.playlist_source import (
 _state.load_analysis_queue()
 logger.info("Analysis queue loaded: %d track(s)", len(_state.analysis_queue))
 
-from playlist_arranger.ui.pages.anchor_editor import build_anchor_editor
+from playlist_arranger.ui.pages.anchors import build_anchors
 from playlist_arranger.ui.pages.smart_sorting import build_smart_sorting
 from playlist_arranger.ui.pages.database_panel import build_database_dialog
 from playlist_arranger.ui.pages.settings_panel import build_settings_dialog
@@ -40,11 +40,25 @@ from playlist_arranger.sources.spotify_source import is_configured as _spotify_c
 _current_page = "welcome"  # welcome | spotify_source | local_source | anchors | sorting
 _right_panel = None
 
+# Nav button references (set at build time, updated reactively via _refresh_nav_buttons)
+_anchor_btn = None
+_sort_btn = None
+
+
+def _refresh_nav_buttons() -> None:
+    """Re-evaluate nav button enabled states based on current application state."""
+    global _anchor_btn, _sort_btn
+    if _anchor_btn is not None:
+        _anchor_btn.set_enabled(_state.sp is not None)
+    if _sort_btn is not None:
+        _sort_btn.set_enabled(_state.has_anchor_plan())
+
 
 def set_page(page_name: str) -> None:
     """Switch the right panel to a different page."""
     global _current_page, _right_panel
     _current_page = page_name
+    _refresh_nav_buttons()
     render_right_panel()
 
 
@@ -70,11 +84,7 @@ def render_right_panel() -> None:
         elif _current_page == "local_source":
             build_local_section(set_page)
         elif _current_page == "anchors":
-            if _state.has_descriptions():
-                build_anchor_editor()
-            else:
-                ui.label("No descriptions available. Generate descriptions first.").classes("text-yellow-500")
-                ui.button("Generate Descriptions", on_click=run_descriptions).classes("mt-2")
+            build_anchors()
         elif _current_page == "sorting":
             if _state.has_anchor_plan():
                 build_smart_sorting()
@@ -198,64 +208,6 @@ async def run_analysis_local() -> None:
         progress.error(str(e))
         logger.exception("Local analysis failed")
 
-
-def recover_backup() -> None:
-    """Recover from backup — load descriptions and go to anchors."""
-    from playlist_arranger.cache.store import load_backup as _load_backup
-    from playlist_arranger.database import db as _db
-
-    bk_data = _load_backup(_state.current_playlist_id)
-    if not bk_data:
-        ui.notify("No backup found", type="warning")
-        return
-
-    bk_tracks = bk_data.get("tracks", [])
-    if not bk_tracks:
-        ui.notify("Backup is empty", type="warning")
-        return
-
-    descs = []
-    for t in bk_tracks:
-        tid = t.get("id") or t.get("track_id", "")
-        descs.append({
-            "track_id": tid,
-            "name": t.get("name", "?"),
-            "artist": t.get("artist", "?"),
-            "album": t.get("album", "?"),
-            "description": "",
-            "playlist": _state.current_playlist_name,
-            "bpm": 0, "key": "", "camelot": "",
-            "loudness_db": 0, "dynamic_range": 0,
-            "harm_ratio": 0, "flatness": 0,
-            "bass_pct": 0, "mid_pct": 0, "high_pct": 0,
-            "onset_str": 0, "duration_ms": 0,
-        })
-
-    # Enrich from DB
-    for d in descs:
-        tid = d.get("track_id")
-        if tid:
-            entry = _db.get_track(tid)
-            if entry:
-                f = entry.get("features") or {}
-                d["bpm"] = round(f.get("bpm", 0), 1)
-                d["key"] = f"{f.get('chroma_key', '')} {f.get('mode', '')}".strip()
-                d["camelot"] = f.get("camelot", "")
-                d["loudness_db"] = round(f.get("rms_db", 0), 1)
-                d["dynamic_range"] = round(f.get("dynamic_range", 0), 1)
-                d["harm_ratio"] = round(f.get("harm_ratio", 0), 2)
-                d["flatness"] = round(f.get("flatness", 0), 3)
-                d["bass_pct"] = round(f.get("bass", 0) * 100, 1)
-                d["mid_pct"] = round(f.get("mid", 0) * 100, 1)
-                d["high_pct"] = round(f.get("high", 0) * 100, 1)
-                d["onset_str"] = round(f.get("onset_str", 0), 2)
-                d["duration_ms"] = entry.get("duration_ms", 0)
-
-    _state.current_descs[:] = descs
-    ui.notify(f"Recovered {len(descs)} tracks from backup", type="positive")
-    set_page("anchors")
-
-
 # ─── Main UI layout ───────────────────────────────────────────────────────────
 @ui.page("/")
 def main_page():
@@ -290,17 +242,19 @@ def main_page():
             ui.button("Local Files", on_click=lambda: set_page("local_source")) \
                 .classes("w-full text-sm")
 
-            # Anchor Selection (disabled until playlist selected)
-            anchor_btn = ui.button("Anchors", on_click=lambda: set_page("anchors"))
-            anchor_btn.classes("w-full text-sm")
-            if not _state.has_playlist():
-                anchor_btn.set_enabled(False)
+            # Anchors (disabled until Spotify is connected)
+            global _anchor_btn
+            _anchor_btn = ui.button("Anchors", on_click=lambda: set_page("anchors"))
+            _anchor_btn.classes("w-full text-sm")
+            if _state.sp is None:
+                _anchor_btn.set_enabled(False)
 
             # Smart Sorting (disabled until anchor plan non-empty)
-            sort_btn = ui.button("Sorting", on_click=lambda: set_page("sorting"))
-            sort_btn.classes("w-full text-sm")
+            global _sort_btn
+            _sort_btn = ui.button("Sorting", on_click=lambda: set_page("sorting"))
+            _sort_btn.classes("w-full text-sm")
             if not _state.has_anchor_plan():
-                sort_btn.set_enabled(False)
+                _sort_btn.set_enabled(False)
 
             ui.separator().classes("my-2")
 

@@ -15,6 +15,9 @@ current_descs: list = []
 current_anchor_plan: list = []
 current_sorted_descs: list = []
 
+# ─── Anchors page state ───────────────────────────────────────────────────────
+anchors_selected_playlist_id: str | None = None
+
 # ─── Spotify state ──────────────────────────────────────────────────────────
 sp = None  # spotipy.Spotify instance
 spotify_device_id: str | None = None

@@ -1130,11 +1130,25 @@ def build_spotify_section(set_page_cb):
                         default_audio_idx = str(d["index"])
                         break
             if default_audio_idx is None:
-                default_audio_idx = str(s.selected_audio_device_index) if s.selected_audio_device_index is not None else None
+                saved_idx = str(s.selected_audio_device_index) if s.selected_audio_device_index is not None else None
+                if saved_idx is not None and saved_idx in audio_device_options:
+                    default_audio_idx = saved_idx
+                else:
+                    default_audio_idx = None
+                    if saved_idx is not None:
+                        logger.warning(
+                            "Saved audio device index %s not found in enumerated devices — "
+                            "device list may have changed (plug/unplug). Please reselect.",
+                            saved_idx,
+                        )
 
             with ui.row().classes("w-full items-start gap-2 mb-2"):
+                # Defensive: only pass value= if it's a valid option key
+                _valid_value = default_audio_idx if default_audio_idx in audio_device_options else None
                 audio_device_select = ui.select(label="Audio Capture Device", options=audio_device_options,
-                                                value=default_audio_idx).classes("flex-grow")
+                                                value=_valid_value).classes("flex-grow")
+                if _valid_value is None and default_audio_idx is not None:
+                    ui.label("⚠ Audio device changed — please reselect").classes("text-xs text-orange-500 ml-2")
 
                 with ui.row().classes("flex-shrink-0 gap-2 items-start"):
                     ui.html(f'''

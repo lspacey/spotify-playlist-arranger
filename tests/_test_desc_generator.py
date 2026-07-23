@@ -272,47 +272,6 @@ def test_run_descriptions_stub_does_not_crash():
             raise
 
 
-def test_anchor_editor_safe_with_empty_descs():
-    """anchor_editor.build_anchor_editor() doesn't crash with empty current_descs.
-
-    Known pre-existing issue: 'save_plan' is referenced before assignment inside
-    build_anchor_editor() — the ui.button(on_click=save_plan) appears before
-    ``def save_plan():``.  This is NOT introduced by descriptions.py removal
-    and will be fixed separately.  The test treats UnboundLocalError as an
-    acceptable outcome (code path reaches rendering, doesn't hit ImportError
-    or DB/cache errors).
-    """
-    from playlist_arranger.ui.state import current_descs, current_anchor_plan, current_playlist_id, current_playlist_name
-    # Save original state
-    orig_descs = list(current_descs)
-    orig_plan = list(current_anchor_plan)
-    orig_pid = current_playlist_id
-    orig_pname = current_playlist_name
-    try:
-        current_descs[:] = []
-        current_anchor_plan[:] = []
-        current_playlist_id = "test_empty_descs"
-        current_playlist_name = "Test Empty"
-        # Import and call — should not raise
-        from playlist_arranger.ui.pages.anchor_editor import build_anchor_editor
-        build_anchor_editor()
-    except (RuntimeError, AttributeError) as exc:
-        err = str(exc).lower()
-        if "nicegui" in err or "context" in err or "client" in err:
-            pass  # Expected in headless test env
-        else:
-            raise
-    except UnboundLocalError:
-        # Known pre-existing bug: save_plan referenced before assignment inside
-        # build_anchor_editor() — NOT caused by descriptions.py removal.
-        pass
-    finally:
-        current_descs[:] = orig_descs
-        current_anchor_plan[:] = orig_plan
-        current_playlist_id = orig_pid
-        current_playlist_name = orig_pname
-
-
 def test_smart_sorting_safe_with_empty_descs():
     """smart_sorting.build_smart_sorting() doesn't crash with empty current_descs."""
     from playlist_arranger.ui.state import current_descs, current_anchor_plan, current_playlist_id, current_playlist_name, current_sorted_descs
@@ -630,7 +589,6 @@ tests = [
     ("test_cache_invalidates_on_model_change_only", test_cache_invalidates_on_model_change_only),
     ("test_descriptions_module_deleted", test_descriptions_module_deleted),
     ("test_run_descriptions_stub_does_not_crash", test_run_descriptions_stub_does_not_crash),
-    ("test_anchor_editor_safe_with_empty_descs", test_anchor_editor_safe_with_empty_descs),
     ("test_smart_sorting_safe_with_empty_descs", test_smart_sorting_safe_with_empty_descs),
     ("test_load_save_descriptions_removed", test_load_save_descriptions_removed),
     ("test_dialog_updates_when_same_track_open", test_dialog_updates_when_same_track_open),
