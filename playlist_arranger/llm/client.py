@@ -31,9 +31,13 @@ try:
 except ImportError:
     HAS_OPENAI = False
 
-_llm_client = None
-_llm_backend_used = None
-_llm_model_used = None  # the model name last initialised (for llm_chat reference)
+_llm_clients: dict = {}  # keyed by backend name (ollama / deepseek / mistral)
+_llm_models_used: dict = {}  # model name per backend
+# Legacy references kept for backward compat with any external code that
+# may read these module-level names directly:
+_llm_client = None  # deprecated — use _llm_clients[backend] instead
+_llm_backend_used = None  # deprecated — use the backend key directly
+_llm_model_used = None  # deprecated — use _llm_models_used[backend] instead
 
 
 def _resolve_model(backend: str, model_override: str | None) -> str:
@@ -53,31 +57,39 @@ def _init_llm_client(backend=None, model_override=None):
     """Initialize the LLM client based on LLM env var: ollama | deepseek | mistral.
 
     All model names flow through _resolve_model() — settings.json wins if
-    non-empty, .env provides the fallback.  The resolved model is stored in
-    _llm_model_used so that llm_chat() picks up the correct name without
-    re-reading settings.
+    non-empty, .env provides the fallback.  Clients are cached per-backend
+    (dict keyed by backend name) so that switching backends via the anchors
+    page dropdown reuses previously-initialised clients rather than
+    creating new ones on every call.
 
     Args:
-        backend: Override backend name (None = use LLM_BACKEND env var).
+        backend: Override backend name (None = use settings.json llm_backend).
         model_override: Override model name (None = resolve from settings/.env).
     """
+    global _llm_clients, _llm_models_used
     global _llm_client, _llm_backend_used, _llm_model_used
 
     if backend is None:
         # backend NOT provided — read from settings.json (with .env fallback).
-        # This is the only place callers like descriptions.py / anchors.py
-        # determine which provider to use — they NEVER read the .env constant directly.
         s = _config.load_settings()
         backend = s.llm_backend or LLM_BACKEND
-        # For the default (no-override) case, reuse cached client only if
-        # BOTH backend AND the resolved model name are unchanged.  Model-only
-        # changes (same backend, different Mistral model e.g.) must rebuild.
-        if _llm_client is not None and _llm_backend_used == backend:
-            resolved = _resolve_model(backend, None)
-            if _llm_model_used == resolved:
-                return _llm_client
+
+    if backend is None:  # still None after settings lookup — bail
+        raise RuntimeError("No LLM backend configured.")
 
     model = _resolve_model(backend, model_override)
+
+    # Per-backend cache: reuse client if this exact backend+model was
+    # previously initialised.  Model-only changes (same backend, different
+    # model e.g. mistral-large → mistral-medium) must rebuild.
+    cached_client = _llm_clients.get(backend)
+    cached_model = _llm_models_used.get(backend)
+    if cached_client is not None and cached_model == model:
+        # Update legacy refs for backward compat (llm_chat reads these)
+        _llm_client = cached_client
+        _llm_backend_used = backend
+        _llm_model_used = model
+        return cached_client
 
     if backend == "ollama":
         if not HAS_OLLAMA:
@@ -116,6 +128,8 @@ def _init_llm_client(backend=None, model_override=None):
         _llm_backend_used = "ollama"
         _llm_model_used = model
         _llm_client = _ollama_client
+        _llm_clients["ollama"] = _ollama_client
+        _llm_models_used["ollama"] = model
 
     elif backend == "deepseek":
         if not HAS_OPENAI:
@@ -131,6 +145,8 @@ def _init_llm_client(backend=None, model_override=None):
             api_key=DEEPSEEK_API_KEY,
             base_url=DEEPSEEK_BASE_URL,
         )
+        _llm_clients["deepseek"] = _llm_client
+        _llm_models_used["deepseek"] = model
 
     elif backend == "mistral":
         if not HAS_OPENAI:
@@ -146,6 +162,8 @@ def _init_llm_client(backend=None, model_override=None):
             api_key=MISTRAL_API_KEY,
             base_url=MISTRAL_BASE_URL,
         )
+        _llm_clients["mistral"] = _llm_client
+        _llm_models_used["mistral"] = model
 
     else:
         raise RuntimeError(

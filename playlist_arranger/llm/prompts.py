@@ -19,18 +19,23 @@ ANCHOR_SYSTEM_PROMPT = (
     "You will receive a list of tracks from a single playlist, each with:\n"
     "- A short audio-based description\n"
     "- Key audio features (BPM, key, loudness, harmonic ratio, dynamics)\n"
-    "- Artist and track name\n\n"
+    "- Artist and track name\n"
+    "- A POSITION NUMBER at the start of each line (e.g. '  3. track name — artist')\n\n"
     "Your task: select exactly N anchor tracks that best realise the requested "
     "playlist structure type, and arrange them in the correct order.\n"
     "Choose tracks whose descriptions and features match the energy arc, mood "
     "progression, and dynamic contour described by the structure. "
     "Prioritise diversity of textures and keys.\n\n"
-    "OUTPUT FORMAT — strictly follow this structure, no extra text:\n"
+    "OUTPUT FORMAT — strictly follow this structure, return POSITION NUMBERS only, no extra text:\n"
     "ANCHORS:\n"
-    "1. Track Name — Artist\n"
-    "2. Track Name — Artist\n"
+    "7\n"
+    "23\n"
+    "41\n"
     "...\n"
-    "N. Track Name — Artist"
+    "(exactly N lines of position numbers, one per line, ordered by intended sequence)\n\n"
+    "Each number refers to the POSITION NUMBER shown at the start of each track line "
+    "in the track list below. Return ONLY the numbers in the ANCHORS: block — "
+    "no track names, no artists, no commentary."
 )
 
 PLAYLIST_STRUCTURES = [
@@ -93,5 +98,11 @@ PLAYLIST_STRUCTURES = [
         "name": "Story Arc",
         "desc": "Introduction → development → climax → resolution — like a narrative.",
         "anchor_pct": 25,
+    },
+    {
+        "id": "custom",
+        "name": "Custom",
+        "desc": "",
+        "anchor_pct": 20,
     },
 ]

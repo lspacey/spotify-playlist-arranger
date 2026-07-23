@@ -257,6 +257,9 @@ class Settings:
     # Audio
     selected_audio_device_index: int | None = SELECTED_AUDIO_DEVICE_INDEX
 
+    # Anchor generation
+    custom_anchor_prompt: str = ""
+
 
 # ─── Fields whose settings.json values must fall back to .env when empty ────
 _LLM_FIELDS = {"llm_backend", "ollama_model", "deepseek_model", "mistral_model"}

@@ -154,10 +154,43 @@ Race condition handling:
 - User swaps dialog from X to Y while X generates → `_current_open_track_id` is Y, not X → skipped
 - Same track re-opened → `show_desc_dialog()` refreshes refs to new dialog's elements
 
-### 23. Layout Stability: Buttons-First in Rows (2026-07-22)
+### 23. Per-Backend Client Cache with Dict (`llm/client.py`) (2026-07-24)
+Previous single-slot `_llm_client` global was replaced with per-backend dict cache:
+```python
+_llm_clients: dict = {}       # keyed by backend name (ollama/deepseek/mistral)
+_llm_models_used: dict = {}   # model name per backend
+```
+Cache hit checks both client object AND model name match for the specific requested backend. Legacy `_llm_client`/`_llm_backend_used`/`_llm_model_used` module-level names are updated on cache hit for backward compat with `llm_chat()` which reads them directly.
+
+**Why**: Switching backends via the dropdown creates new clients per backend. A single-slot cache would silently return the wrong backend's client on subsequent calls. The dict pattern also handles model-only switches (same backend, different model) by checking `cached_model == model` on cache hit.
+
+### 24. Session-Level In-Memory State Persistence Pattern (2026-07-24)
+For remembering UI panel state across collapse/expand cycles within one process lifetime (NOT persisted to disk):
+```python
+# Module-level globals with sentinel "never touched" values
+_gen_last_structure_id: str = DEFAULT
+_gen_last_desc_text: str = DEFAULT
+_gen_last_desc_touched: bool = False  # True once user has interacted
+_gen_last_n: int | None = None      # None = compute from formula
+_gen_last_backend: str | None = None  # None = use default
+```
+Lightweight `on_change` handlers update these globals on every keystroke/change (pure Python variable assignment, zero disk I/O). Render function reads from globals, falling back to defaults only when still at initial/unset state.
+
+**Custom-structure precedence rule**: If structure is "custom" AND the user has never touched the textarea this session (`_gen_last_desc_touched == False`), load from `settings.json` (persisted disk value). Once user types, in-session memory wins. `_gen_last_desc_touched` resets to False when switching TO custom (that's a load, not user typing).
+
+### 25. `ui.notify()` Before Panel.clear() in Async Handlers (2026-07-24)
+After an async handler resumes from `asyncio.to_thread`, the UI slot context from the original panel may be stale. Call `ui.notify()` **BEFORE** `_gen_panel.clear()` to avoid RuntimeError. Wrap both in try/except with `logger.exception` as defense-in-depth.
+```python
+# CORRECT order:
+ui.notify("Success", type="positive")
+_gen_panel_visible = False
+_gen_panel.clear()
+```
+
+### 26. Layout Stability: Buttons-First in Rows (2026-07-22)
 In NiceGUI `ui.row()`, children are laid out left-to-right in creation order. Place **fixed-width** elements (buttons) BEFORE **variable-width** elements (labels) so label content changes don't shift button positions. Applied in `_render_desc_status()`: buttons ("Stop and clean the queue", "Update all in background") created first, then labels wrapped in a `ui.column()`.
 
-### 24. NiceGUI Dialog Lifecycle Pattern
+### 27. NiceGUI Dialog Lifecycle Pattern
 `ui.dialog()` does NOT accept `on_close` keyword argument. To detect dialog close:
 ```python
 with ui.dialog(value=True) as dialog:

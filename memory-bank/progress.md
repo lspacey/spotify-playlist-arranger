@@ -43,6 +43,9 @@
 - [x] **Description generation queue + background worker** — Thread-safe FIFO queue with daemon worker, dedupe, UI buttons, status row, live dialog updates. Old descriptions.py removed. (2026-07-21/22)
 - [x] Expand test suite: 6 Analyze-mode regression tests + ~50 batch-specific regression tests + 36 desc generator tests (125 total)
 - [x] Production-clean verification: `tests/_verify_production_clean.py` ensures `hasattr` checks return False in production
+- [x] **Multi-backend LLM dropdown in Generate Anchors panel** — user can switch between Ollama, DeepSeek, Mistral from dropdown; backend override passed through to `_init_llm_client()` (2026-07-24)
+- [x] **Per-backend client cache** — dict by backend name prevents stale cache when switching backends (2026-07-24)
+- [x] **Session-level panel persistence** — 5 `_gen_last_*` globals remember Generate Anchors panel selections across collapse/expand (in-memory, not disk) (2026-07-24)
 - [ ] Wire `desc_generator` worker to actually call LLM (placeholder currently)
 - [ ] Wire `run_descriptions()` to `desc_queue_add_many()` + populate `current_descs` from DB
 - [ ] Cross-platform audio capture (macOS/Linux support)
@@ -56,11 +59,11 @@
 - [ ] Packaging (single .exe via PyInstaller, or MSIX)
 
 ## Current Status
-The application is feature-complete for its core workflow with **batch analysis fully implemented**, the **description generation queue infrastructure built**, and the old monolithic `descriptions.py` replaced by a DB-backed background worker pattern. Users can:
+The application is feature-complete for its core workflow with **batch analysis fully implemented**, the **description generation queue infrastructure built**, the old monolithic `descriptions.py` replaced by a DB-backed background worker pattern, and the **Anchors page stabilized** (multi-backend LLM, session-level panel persistence). Users can:
 1. Connect to Spotify or browse local files
 2. **Batch analyze** — queue tracks from multiple playlists, then run "Start Batch Analysis" for sequential automatic capture (or analyze one-at-a-time via the Now Playing card)
 3. **Queue descriptions** — add tracks to the description generation queue (per-track, selected-tracks, or all-tracks), see live status under Now Playing card, get live dialog updates when a description finishes
-4. Create anchors manually or with AI
+4. Create anchors manually or with AI (with **switchable LLM backend** and **session-persistent Generate Anchors panel**)
 5. Run smart sorting
 6. Save results back to Spotify or export M3U
 
@@ -72,7 +75,12 @@ Batch analysis includes: interference detection (warns if Spotify plays wrong tr
 - `ui/pages/playlist_source.py`: Two new desc-gen buttons per playlist/queue table, desc status row under Now Playing card (buttons-first layout, no shifting), `_push_desc_to_open_dialog()` helper
 - Old `llm/descriptions.py` deleted; `cache/store.py` `load_descriptions`/`save_descriptions` removed; `main.py` `run_descriptions()` stubbed with TODO comment
 
-**Test suite**: 36 desc generator tests (queue ops, VA computation, fallback chain, deletion regression, dialog live-update) + 61 batch analysis tests + 5 buffer lifecycle tests + 17 desc status tests + 6 run tests = 125 total, all passing. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 15 cache files).
+**Anchors page stabilization (2026-07-24)**:
+- `ui/pages/anchors.py`: Multi-backend model dropdown in Generate Anchors panel (calls `_init_llm_client(backend=selected_backend, model_override=selected_model)`). 5 `_gen_last_*` session globals for panel persistence. `ui.notify()` before `_gen_panel.clear()` (RuntimeError fix). `_gen_last_n` reset to None on playlist switch.
+- `llm/client.py`: Per-backend dict cache (`_llm_clients` keyed by backend name, `_llm_models_used` keyed by backend name). Legacy `_llm_client`/`_llm_backend_used`/`_llm_model_used` maintained for backward compat with `llm_chat()`.
+- `llm/prompts.py`: Added `"custom"` structure type + `anchor_pct` to `PLAYLIST_STRUCTURES` (2026-07-22).
+
+**Test suite**: 85 anchors page tests + 36 desc generator tests + 61 batch analysis tests + 5 buffer lifecycle tests + 17 desc status tests + 6 run tests = **209 total, all passing**. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 15 cache files).
 
 The application has been tested with RTX 5080 GPU acceleration. All primary features are functional.
 
