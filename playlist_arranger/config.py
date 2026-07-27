@@ -170,6 +170,8 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").s
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest").strip()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 MISTRAL_BASE_URL = os.getenv("MISTRAL_BASE_URL", "https://api.mistral.ai/v1").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+TAVILY_MAX_CALLS_PER_RUN = int(os.getenv("TAVILY_MAX_CALLS_PER_RUN", "50"))
 
 # ─── Selected audio device index (default: first WASAPI loopback) ─────────────
 SELECTED_AUDIO_DEVICE_INDEX = None

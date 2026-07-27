@@ -10,7 +10,14 @@ DESCRIPTION_SYSTEM_PROMPT = (
     "Be specific — mention tempo feel, harmonic colour, texture, and dynamics. "
     "Do NOT invent biographical facts about the artist. "
     "Do NOT start with the track name or artist name as the first word. "
-    "Reply with the description only, no preamble."
+    "Reply with the description only, no preamble.\n\n"
+    "You may also receive web-search context (reviews, listener reactions, "
+    "the song's known meaning or reception) in addition to the audio features. "
+    "When present, blend relevant emotional/thematic insights from this context "
+    "into your description alongside the sonic characteristics — but always "
+    "verify plausibility against the audio features rather than blindly trusting "
+    "external text. Never state unverified biographical claims as fact. If the "
+    "web context is absent, rely solely on the audio features as before."
 )
 
 ANCHOR_SYSTEM_PROMPT = (

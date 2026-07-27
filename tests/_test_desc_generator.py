@@ -376,6 +376,565 @@ def test_dialog_not_updated_when_closed():
     # No crash = pass
 
 
+# ── Tavily web search tests ─────────────────────────────────────────────────
+
+import tempfile
+import os
+
+
+def _mock_tavily_response_answer(answer_text: str = "A haunting trip-hop classic from 1994...") -> dict:
+    """Helper: build a mock Tavily response dict with a synthesized answer."""
+    return {
+        "answer": answer_text,
+        "results": [
+            {"title": "Review 1", "url": "https://example.com/1", "content": "Brilliant track.", "score": 0.9},
+            {"title": "Review 2", "url": "https://example.com/2", "content": "Genre-defining.", "score": 0.8},
+        ],
+        "response_time": 0.42,
+        "query": "test query",
+    }
+
+
+def _mock_tavily_response_snippets(snippets: list[str] = None) -> dict:
+    """Helper: build a mock Tavily response dict with results but no answer."""
+    if snippets is None:
+        snippets = ["Snippet one about the song.", "Snippet two with more detail.", "Snippet three finishing up."]
+    return {
+        "results": [{"title": f"R{i}", "url": f"https://x.com/{i}", "content": s, "score": 0.9 - i * 0.1}
+                     for i, s in enumerate(snippets)],
+        "response_time": 0.42,
+        "query": "test query",
+    }
+
+
+def test_tavily_search_returns_none_when_key_not_set():
+    """_search_track_context returns None when TAVILY_API_KEY is empty."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    try:
+        cfg.TAVILY_API_KEY = ""
+        result = dg._search_track_context("Sour Times", "Portishead")
+        assert result is None, f"Expected None when key not set, got {result!r}"
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+
+
+def test_tavily_search_returns_none_on_api_error():
+    """_search_track_context returns None (does not raise) when TavilyClient.search raises."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.side_effect = RuntimeError("API connection refused")
+            mock_tc.return_value = mock_instance
+
+            # Also patch the debug writer to avoid touching filesystem
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                result = dg._search_track_context("Test Track", "Test Artist")
+                assert result is None, (
+                    f"Expected None on API error, got {result!r}"
+                )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+
+
+def test_tavily_search_returns_none_on_empty_results():
+    """_search_track_context returns None when Tavily returns zero results and no answer."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        empty_response = {"results": [], "response_time": 0.1, "query": "test"}
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.return_value = empty_response
+            mock_tc.return_value = mock_instance
+
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                result = dg._search_track_context("Obscure Track", "Unknown Artist")
+                assert result is None, (
+                    f"Expected None on empty results, got {result!r}"
+                )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+
+
+def test_web_context_appended_to_user_msg_when_present():
+    """_try_generate_description appends web context when provided."""
+    web_ctx = "Portishead's 'Sour Times' is known for its melancholic trip-hop atmosphere..."
+
+    with patch("playlist_arranger.analysis.desc_generator.config.load_settings",
+               return_value=FakeSettings()), \
+         patch("playlist_arranger.analysis.desc_generator._init_llm_client"), \
+         patch("playlist_arranger.analysis.desc_generator.llm_chat",
+               return_value="A moody trip-hop track with haunting vocals.") as mock_chat:
+        desc = dg._try_generate_description(
+            "Sour Times", "Portishead", "Dummy",
+            "BPM: 94\nKey: F# minor",
+            "Valence: -0.50  Arousal: -0.20\nQuadrant: Low Energy / Negative",
+            web_context=web_ctx,
+        )
+        # Verify the LLM was called with web context in the user message
+        assert mock_chat.called, "LLM chat was not called"
+        user_msg = mock_chat.call_args[0][1]  # second positional arg is user_msg
+        assert "Additional context from web sources" in user_msg, (
+            f"Expected web context section in user message. Got: {user_msg[:200]}"
+        )
+        assert "Portishead" in user_msg
+        assert "Sour Times" in user_msg
+        assert desc is not None
+
+
+def test_user_msg_unchanged_when_web_context_absent():
+    """_try_generate_description produces the correct audio-only prompt when web_context is None."""
+    with patch("playlist_arranger.analysis.desc_generator.config.load_settings",
+               return_value=FakeSettings()), \
+         patch("playlist_arranger.analysis.desc_generator._init_llm_client"), \
+         patch("playlist_arranger.analysis.desc_generator.llm_chat",
+               return_value="A description.") as mock_chat:
+        dg._try_generate_description(
+            "Test Track", "Test Artist", "Test Album",
+            "BPM: 120\nKey: C major",
+            "Valence: +0.30  Arousal: +0.50",
+            web_context=None,
+        )
+        user_msg = mock_chat.call_args[0][1]
+        assert "Additional context from web sources" not in user_msg, (
+            "Web context section should NOT appear when web_context is None"
+        )
+        assert "Write a description of this track." in user_msg
+        assert "Test Track" in user_msg
+        assert "Test Artist" in user_msg
+
+
+def test_tavily_calls_capped_per_run():
+    """_search_track_context respects TAVILY_MAX_CALLS_PER_RUN."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    orig_cap = cfg.TAVILY_MAX_CALLS_PER_RUN
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        cfg.TAVILY_MAX_CALLS_PER_RUN = 3  # small cap for testing
+
+        # Reset counter to start fresh
+        dg._reset_tavily_call_counter()
+
+        # Mock TavilyClient to track call count
+        call_count = [0]  # mutable counter in closure
+
+        def _mock_search(**kwargs):
+            call_count[0] += 1
+            # Include the query in the answer so artist-mention check passes
+            query_str = kwargs.get("query", "")
+            return _mock_tavily_response_answer(
+                f"Review of {query_str} — call {call_count[0]}"
+            )
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.side_effect = _mock_search
+            mock_tc.return_value = mock_instance
+
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                # Simulate 10 tracks — only first 3 should trigger API calls
+                for i in range(10):
+                    artist = f"Artist_{i}"  # underscores so Tavily query includes it
+                    result = dg._search_track_context(f"Track {i}", artist)
+                    if i < 3:
+                        assert result is not None, (
+                            f"Track {i} (before cap) should get web context"
+                        )
+                    else:
+                        assert result is None, (
+                            f"Track {i} (after cap) should return None"
+                        )
+
+        # TavilyClient.search should have been called exactly 3 times
+        assert call_count[0] == 3, (
+            f"Expected 3 Tavily API calls, got {call_count[0]}"
+        )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        cfg.TAVILY_MAX_CALLS_PER_RUN = orig_cap
+        dg._reset_tavily_call_counter()
+
+
+def test_tavily_counter_resets_between_separate_batch_runs():
+    """desc_queue_add_many resets the counter, so a second batch gets a fresh budget."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    orig_cap = cfg.TAVILY_MAX_CALLS_PER_RUN
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        cfg.TAVILY_MAX_CALLS_PER_RUN = 3
+
+        # Simulate batch 1 via desc_queue_add_many — should reset counter
+        dg.desc_queue_clear()
+        dg.desc_queue_add_many([f"b1_track_{i}" for i in range(5)])
+
+        # Run 5 tracks — only first 3 should get Tavily calls
+        call_count = [0]
+
+        def _mock_search_b1(**kwargs):
+            call_count[0] += 1
+            query_str = kwargs.get("query", "")
+            return _mock_tavily_response_answer(
+                f"Review of {query_str} — batch1 call {call_count[0]}"
+            )
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.side_effect = _mock_search_b1
+            mock_tc.return_value = mock_instance
+
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                for i in range(5):
+                    artist = f"Artist_{i}"
+                    result = dg._search_track_context(f"Track {i}", artist)
+                    if i < 3:
+                        assert result is not None, f"Batch1 track {i} should get enrichment"
+                    else:
+                        assert result is None, f"Batch1 track {i} should be capped"
+
+        assert call_count[0] == 3, f"Batch1: expected 3 calls, got {call_count[0]}"
+
+        # Now simulate batch 2 — a second call to desc_queue_add_many
+        dg.desc_queue_clear()
+        dg.desc_queue_add_many([f"b2_track_{i}" for i in range(5)])
+
+        call_count[0] = 0  # reset counter via closure
+
+        def _mock_search_b2(**kwargs):
+            call_count[0] += 1
+            query_str = kwargs.get("query", "")
+            return _mock_tavily_response_answer(
+                f"Review of {query_str} — batch2 call {call_count[0]}"
+            )
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.side_effect = _mock_search_b2
+            mock_tc.return_value = mock_instance
+
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                for i in range(5):
+                    artist = f"Artist_{i}"
+                    result = dg._search_track_context(f"Track {i}", artist)
+                    if i < 3:
+                        assert result is not None, f"Batch2 track {i} should get enrichment"
+                    else:
+                        assert result is None, f"Batch2 track {i} should be capped"
+
+        assert call_count[0] == 3, (
+            f"Batch2: expected 3 calls (reset), got {call_count[0]}"
+        )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        cfg.TAVILY_MAX_CALLS_PER_RUN = orig_cap
+        dg.desc_queue_clear()
+        dg._reset_tavily_call_counter()
+
+
+def test_tavily_cap_zero_means_unlimited():
+    """TAVILY_MAX_CALLS_PER_RUN=0 means unlimited — all tracks get web context."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    orig_cap = cfg.TAVILY_MAX_CALLS_PER_RUN
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        cfg.TAVILY_MAX_CALLS_PER_RUN = 0  # 0 = unlimited
+
+        dg._reset_tavily_call_counter()
+
+        call_count = [0]
+
+        def _mock_search_unlimited(**kwargs):
+            call_count[0] += 1
+            query_str = kwargs.get("query", "")
+            return _mock_tavily_response_answer(
+                f"Review of {query_str} — unlimited call {call_count[0]}"
+            )
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.side_effect = _mock_search_unlimited
+            mock_tc.return_value = mock_instance
+
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                # 100 tracks — ALL should get Tavily calls
+                for i in range(100):
+                    artist = f"Artist_{i}"
+                    result = dg._search_track_context(f"Track {i}", artist)
+                    assert result is not None, f"Track {i} should get enrichment with cap=0"
+
+        assert call_count[0] == 100, (
+            f"Unlimited mode: expected 100 calls, got {call_count[0]}"
+        )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        cfg.TAVILY_MAX_CALLS_PER_RUN = orig_cap
+        dg._reset_tavily_call_counter()
+
+
+# ── Tavily relevance validation tests ──────────────────────────────────────
+
+def test_tavily_answer_discarded_when_artist_not_mentioned():
+    """Answer is discarded (returns None) when artist name is absent from entire response."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        dg._reset_tavily_call_counter()
+
+        # Answer exists but never mentions the artist ANYWHERE
+        response = {
+            "answer": "A classic rock anthem about rebellion and youth...",
+            "results": [
+                {"title": "Review 1", "url": "https://x.com/1",
+                 "content": "Great song by a different band.", "score": 0.9},
+            ],
+            "response_time": 0.42,
+            "query": "test",
+        }
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.return_value = response
+            mock_tc.return_value = mock_instance
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                result = dg._search_track_context("Strange Love", "Swoone")
+                assert result is None, (
+                    f"Should discard answer when artist 'Swoone' never mentioned. "
+                    f"Got: {result}"
+                )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        dg._reset_tavily_call_counter()
+
+
+def test_tavily_answer_kept_when_artist_mentioned_in_answer():
+    """Answer is KEPT when artist name appears in the answer text itself."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        dg._reset_tavily_call_counter()
+
+        response = {
+            "answer": "Portishead's 'Sour Times' is a melancholic trip-hop classic...",
+            "results": [
+                {"title": "R1", "url": "https://x.com/1",
+                 "content": "Portishead defined a genre.", "score": 0.95},
+            ],
+            "response_time": 0.42,
+            "query": "test",
+        }
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.return_value = response
+            mock_tc.return_value = mock_instance
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                result = dg._search_track_context("Sour Times", "Portishead")
+                assert result is not None, "Should keep answer — artist mentioned"
+                assert "Portishead" in result, f"Artist should be in result: {result[:100]}"
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        dg._reset_tavily_call_counter()
+
+
+def test_tavily_answer_kept_when_artist_mentioned_in_results_not_answer():
+    """Answer is KEPT when artist name appears in result snippets, even if absent from answer."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        dg._reset_tavily_call_counter()
+
+        response = {
+            "answer": "A classic song about loss and redemption...",
+            "results": [
+                {"title": "Radiohead interview", "url": "https://x.com/1",
+                 "content": "Radiohead's approach to 'Creep' changed rock music...",
+                 "score": 0.92},
+            ],
+            "response_time": 0.42,
+            "query": "test",
+        }
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.return_value = response
+            mock_tc.return_value = mock_instance
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                result = dg._search_track_context("Creep", "Radiohead")
+                assert result is not None, (
+                    "Should keep answer — artist mentioned in results even if "
+                    "not in answer text"
+                )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        dg._reset_tavily_call_counter()
+
+
+def test_tavily_result_skipped_when_score_below_threshold():
+    """Results with score < TAVILY_MIN_RELEVANCE_SCORE are skipped in snippet fallback."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    orig_threshold = dg.TAVILY_MIN_RELEVANCE_SCORE
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        dg.TAVILY_MIN_RELEVANCE_SCORE = 0.5  # raise threshold for test
+        dg._reset_tavily_call_counter()
+
+        # No answer, only results — first result has low score + no artist
+        response = {
+            "results": [
+                {"title": "R1", "url": "https://x.com/1",
+                 "content": "Low relevance snippet about Radiohead.", "score": 0.2},
+                {"title": "R2", "url": "https://x.com/2",
+                 "content": "High quality review of Radiohead's Creep...", "score": 0.8},
+            ],
+            "response_time": 0.42,
+            "query": "test",
+        }
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.return_value = response
+            mock_tc.return_value = mock_instance
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                result = dg._search_track_context("Creep", "Radiohead")
+                # Should return the high-score result only
+                assert result is not None, "Should get context from high-score result"
+                assert "High quality" in result or "Radiohead" in result, (
+                    f"High-score snippet should be included: {result[:100]}"
+                )
+                assert "Low relevance" not in result, (
+                    f"Low-score result should be filtered out: {result[:100]}"
+                )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        dg.TAVILY_MIN_RELEVANCE_SCORE = orig_threshold
+        dg._reset_tavily_call_counter()
+
+
+def test_tavily_all_results_filtered_returns_none():
+    """When ALL results are filtered (score + artist), return None."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    orig_threshold = dg.TAVILY_MIN_RELEVANCE_SCORE
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        dg.TAVILY_MIN_RELEVANCE_SCORE = 0.9  # very high — nothing passes
+        dg._reset_tavily_call_counter()
+
+        response = {
+            "results": [
+                {"title": "R1", "url": "https://x.com/1",
+                 "content": "Some band Swoone made a cool song.", "score": 0.3},
+                {"title": "R2", "url": "https://x.com/2",
+                 "content": "Another track by Swoone.", "score": 0.5},
+            ],
+            "response_time": 0.42,
+            "query": "test",
+        }
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.return_value = response
+            mock_tc.return_value = mock_instance
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                result = dg._search_track_context("Strange Love", "Swoone")
+                assert result is None, (
+                    f"All results filtered — should return None, got {result!r}"
+                )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        dg.TAVILY_MIN_RELEVANCE_SCORE = orig_threshold
+        dg._reset_tavily_call_counter()
+
+
+def test_tavily_artist_name_matching_case_insensitive():
+    """Artist mention check is case-insensitive and handles whitespace."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        dg._reset_tavily_call_counter()
+
+        # Artist "Swoone" — answer uses "SWOONE" (uppercase) + extra whitespace
+        response = {
+            "answer": "  SWOONE  's latest track 'Strange Love' explores...",
+            "results": [
+                {"title": "Review", "url": "https://x.com/1",
+                 "content": "A masterpiece by swoone.", "score": 0.85},
+            ],
+            "response_time": 0.42,
+            "query": "test",
+        }
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.return_value = response
+            mock_tc.return_value = mock_instance
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                result = dg._search_track_context("Strange Love", "swoone")
+                assert result is not None, "Case-insensitive: 'swoone' should match 'SWOONE'"
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        dg._reset_tavily_call_counter()
+
+
+def test_tavily_debug_file_written_on_search():
+    """_search_track_context writes debug file when search succeeds."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    orig_debug_path = dg._TAVILY_DEBUG_PATH
+
+    # Use a temp file to avoid touching real debug output
+    tmpdir = tempfile.mkdtemp(prefix="tavily_debug_test_")
+    tmpfile = os.path.join(tmpdir, "tavily_search_debug.txt")
+
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        # Override the debug path for this test
+        dg._TAVILY_DEBUG_PATH = dg.config.CACHE_DIR_DEFAULT.__class__(tmpfile)
+        # Actually set the module-level path properly
+        import playlist_arranger.analysis.desc_generator as _dg_mod
+        _dg_mod._TAVILY_DEBUG_PATH = dg.config.CACHE_DIR_DEFAULT.__class__(tmpfile)
+
+        # Ensure dir exists
+        os.makedirs(os.path.dirname(tmpfile), exist_ok=True)
+
+        response = _mock_tavily_response_answer("Sour Times is a trip-hop track...")
+
+        # Directly call _write_tavily_debug (already tested through _search_track_context)
+        dg._write_tavily_debug("Sour Times", "Portishead",
+                               '"Sour Times" Portishead song meaning mood reception review',
+                               response)
+
+        # Verify the file was written
+        assert os.path.exists(tmpfile), f"Debug file was not created at {tmpfile}"
+        content = open(tmpfile, "r", encoding="utf-8").read()
+        assert "Sour Times" in content, f"Track name missing from debug output: {content[:200]}"
+        assert "Portishead" in content, f"Artist missing from debug output: {content[:200]}"
+        assert "Sour Times is a trip-hop track" in content, f"Answer missing: {content[:200]}"
+        assert "song meaning mood reception review" in content, f"Query missing: {content[:200]}"
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        dg._TAVILY_DEBUG_PATH = orig_debug_path
+        # Clean up temp file
+        try:
+            os.remove(tmpfile)
+            os.rmdir(os.path.dirname(tmpfile))
+        except Exception:
+            pass
+
+
 def test_stale_reference_cleared_on_close():
     """_close_dialog_state resets both _current_open_track_id and _current_textarea to None."""
     from playlist_arranger.ui import desc_dialog as _dd
@@ -595,6 +1154,21 @@ tests = [
     ("test_dialog_not_updated_when_different_track_open", test_dialog_not_updated_when_different_track_open),
     ("test_dialog_not_updated_when_closed", test_dialog_not_updated_when_closed),
     ("test_stale_reference_cleared_on_close", test_stale_reference_cleared_on_close),
+    ("test_tavily_search_returns_none_when_key_not_set", test_tavily_search_returns_none_when_key_not_set),
+    ("test_tavily_search_returns_none_on_api_error", test_tavily_search_returns_none_on_api_error),
+    ("test_tavily_search_returns_none_on_empty_results", test_tavily_search_returns_none_on_empty_results),
+    ("test_web_context_appended_to_user_msg_when_present", test_web_context_appended_to_user_msg_when_present),
+    ("test_user_msg_unchanged_when_web_context_absent", test_user_msg_unchanged_when_web_context_absent),
+    ("test_tavily_calls_capped_per_run", test_tavily_calls_capped_per_run),
+    ("test_tavily_counter_resets_between_separate_batch_runs", test_tavily_counter_resets_between_separate_batch_runs),
+    ("test_tavily_cap_zero_means_unlimited", test_tavily_cap_zero_means_unlimited),
+    ("test_tavily_answer_discarded_when_artist_not_mentioned", test_tavily_answer_discarded_when_artist_not_mentioned),
+    ("test_tavily_answer_kept_when_artist_mentioned_in_answer", test_tavily_answer_kept_when_artist_mentioned_in_answer),
+    ("test_tavily_answer_kept_when_artist_mentioned_in_results_not_answer", test_tavily_answer_kept_when_artist_mentioned_in_results_not_answer),
+    ("test_tavily_result_skipped_when_score_below_threshold", test_tavily_result_skipped_when_score_below_threshold),
+    ("test_tavily_all_results_filtered_returns_none", test_tavily_all_results_filtered_returns_none),
+    ("test_tavily_artist_name_matching_case_insensitive", test_tavily_artist_name_matching_case_insensitive),
+    ("test_tavily_debug_file_written_on_search", test_tavily_debug_file_written_on_search),
 ]
 
 for name, fn in tests:

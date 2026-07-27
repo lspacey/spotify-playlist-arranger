@@ -2212,6 +2212,210 @@ def test_notify_before_panel_clear_in_on_run_generate():
     )
 
 
+# ── FIX 1: Placeholder collapse tests ─────────────────────────────────────
+
+def test_save_collapses_adjacent_placeholders():
+    """_collapse_adjacent_placeholders merges consecutive placeholder entries."""
+    from playlist_arranger.ui.pages.anchors import _collapse_adjacent_placeholders
+    plan = [
+        {"type": "anchor", "track_id": "a1"},
+        {"type": "placeholder"},
+        {"type": "placeholder"},
+        {"type": "placeholder"},
+        {"type": "anchor", "track_id": "a2"},
+    ]
+    result = _collapse_adjacent_placeholders(plan)
+    assert len(result) == 3, f"Expected 3 items, got {len(result)}: {result}"
+    assert result[0] == {"type": "anchor", "track_id": "a1"}
+    assert result[1] == {"type": "placeholder"}
+    assert result[2] == {"type": "anchor", "track_id": "a2"}
+
+
+def test_save_collapses_leading_and_trailing_placeholder_runs():
+    """Leading and trailing placeholder runs collapse to single placeholders."""
+    from playlist_arranger.ui.pages.anchors import _collapse_adjacent_placeholders
+    plan = [
+        {"type": "placeholder"},
+        {"type": "placeholder"},
+        {"type": "anchor", "track_id": "a1"},
+        {"type": "placeholder"},
+        {"type": "placeholder"},
+    ]
+    result = _collapse_adjacent_placeholders(plan)
+    assert len(result) == 3, f"Expected 3 items, got {len(result)}: {result}"
+    assert result[0] == {"type": "placeholder"}
+    assert result[1] == {"type": "anchor", "track_id": "a1"}
+    assert result[2] == {"type": "placeholder"}
+
+
+def test_save_does_not_affect_single_isolated_placeholders():
+    """A plan with well-separated single placeholders is unchanged."""
+    from playlist_arranger.ui.pages.anchors import _collapse_adjacent_placeholders
+    plan = [
+        {"type": "anchor", "track_id": "a1"},
+        {"type": "placeholder"},
+        {"type": "anchor", "track_id": "a2"},
+        {"type": "placeholder"},
+        {"type": "anchor", "track_id": "a3"},
+    ]
+    result = _collapse_adjacent_placeholders(plan)
+    assert result == plan, f"Plan should be unchanged, got {result}"
+
+
+def test_collapse_stale_index_reset():
+    """When collapse shrinks the plan past _selected_anchor_idx, selection resets.
+
+    Before: 7 items (anchor, ph, ph, ph, ph, ph, anchor) — selected at index 3.
+    After collapse: 3 items (anchor, ph, anchor) — index 3 is out of range.
+    """
+    import playlist_arranger.ui.pages.anchors as _anchors_mod
+    orig_plan = list(_anchors_mod._anchor_plan)
+    orig_idx = _anchors_mod._selected_anchor_idx
+    try:
+        # Set up: 7 items, 5 consecutive placeholders between two anchors
+        _anchors_mod._anchor_plan[:] = [
+            {"type": "anchor", "track_id": "a1"},
+            {"type": "placeholder"},
+            {"type": "placeholder"},
+            {"type": "placeholder"},
+            {"type": "placeholder"},
+            {"type": "placeholder"},
+            {"type": "anchor", "track_id": "a2"},
+        ]
+        _anchors_mod._selected_anchor_idx = 3  # 4th placeholder in the middle
+
+        from playlist_arranger.ui.pages.anchors import _collapse_adjacent_placeholders
+        collapsed = _collapse_adjacent_placeholders(_anchors_mod._anchor_plan)
+        # Simulate what _save_anchors does:
+        _anchors_mod._anchor_plan[:] = collapsed
+        if _anchors_mod._selected_anchor_idx is not None and _anchors_mod._selected_anchor_idx >= len(_anchors_mod._anchor_plan):
+            _anchors_mod._selected_anchor_idx = None
+
+        # Collapsed: [anchor(a1), placeholder, anchor(a2)] = 3 items
+        # Selected idx 3 >= 3 → out of range → must be None
+        assert _anchors_mod._selected_anchor_idx is None, (
+            f"Selected index should be reset after collapse (3 >= 3), got {_anchors_mod._selected_anchor_idx}"
+        )
+        assert len(_anchors_mod._anchor_plan) == 3, f"Expected 3 items, got {len(_anchors_mod._anchor_plan)}"
+    finally:
+        _anchors_mod._anchor_plan[:] = orig_plan
+        _anchors_mod._selected_anchor_idx = orig_idx
+
+
+# ── FIX 2: LLM client key-error message tests ─────────────────────────────
+
+def test_init_llm_client_raises_clear_error_when_deepseek_key_missing():
+    """_init_llm_client with deepseek backend raises clear key-missing error."""
+    import playlist_arranger.llm.client as lc
+    orig_key = lc.DEEPSEEK_API_KEY
+    orig_clients = dict(lc._llm_clients)
+    orig_models = dict(lc._llm_models_used)
+    try:
+        lc.DEEPSEEK_API_KEY = ""
+        lc._llm_clients.clear()  # force cache miss to reach key check
+        lc._llm_models_used.clear()
+        from openai import OpenAI as _OpenAI  # noqa
+        try:
+            lc._init_llm_client(backend="deepseek")
+            assert False, "Should have raised RuntimeError"
+        except RuntimeError as e:
+            msg = str(e).lower()
+            assert "deepseek" in msg, f"Error should mention 'deepseek': {msg}"
+            assert "api_key" in msg or ".env" in msg, f"Error should mention .env or api_key: {msg}"
+    finally:
+        lc.DEEPSEEK_API_KEY = orig_key
+        lc._llm_clients = orig_clients
+        lc._llm_models_used = orig_models
+
+
+def test_init_llm_client_raises_clear_error_when_mistral_key_missing():
+    """_init_llm_client with mistral backend raises clear key-missing error."""
+    import playlist_arranger.llm.client as lc
+    orig_key = lc.MISTRAL_API_KEY
+    orig_clients = dict(lc._llm_clients)
+    orig_models = dict(lc._llm_models_used)
+    try:
+        lc.MISTRAL_API_KEY = ""
+        lc._llm_clients.clear()  # force cache miss to reach key check
+        lc._llm_models_used.clear()
+        from openai import OpenAI as _OpenAI  # noqa
+        try:
+            lc._init_llm_client(backend="mistral")
+            assert False, "Should have raised RuntimeError"
+        except RuntimeError as e:
+            msg = str(e).lower()
+            assert "mistral" in msg, f"Error should mention 'mistral': {msg}"
+            assert "api_key" in msg or ".env" in msg, f"Error should mention .env or api_key: {msg}"
+    finally:
+        lc.MISTRAL_API_KEY = orig_key
+        lc._llm_clients = orig_clients
+        lc._llm_models_used = orig_models
+
+
+def test_init_llm_client_ollama_never_requires_api_key():
+    """_init_llm_client with ollama backend does NOT check for API keys."""
+    import playlist_arranger.llm.client as lc
+    orig_deepseek_key = lc.DEEPSEEK_API_KEY
+    orig_mistral_key = lc.MISTRAL_API_KEY
+    try:
+        lc.DEEPSEEK_API_KEY = ""
+        lc.MISTRAL_API_KEY = ""
+        # Ollama should NOT raise about missing keys — it only needs
+        # the ollama package (HAS_OLLAMA).  If ollama is installed, it
+        # will try to connect and may raise a connection error, but it
+        # should NEVER be a "missing API key" RuntimeError.
+        try:
+            lc._init_llm_client(backend="ollama")
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "api_key" in msg or "not set" in msg or ".env" in msg:
+                assert False, (
+                    f"Ollama should NOT raise API-key errors, got: {e}"
+                )
+            # Connection errors (e.g. Ollama server not running) are
+            # acceptable in the test environment.
+        except ImportError:
+            pass  # ollama package not installed — also fine
+    finally:
+        lc.DEEPSEEK_API_KEY = orig_deepseek_key
+        lc.MISTRAL_API_KEY = orig_mistral_key
+
+
+def test_available_backend_models_excludes_backends_without_keys():
+    """_available_backend_models never includes cloud backends with no key."""
+    from playlist_arranger.ui.pages.anchors import _available_backend_models
+    import playlist_arranger.llm.client as lc
+    orig_deepseek_key = lc.DEEPSEEK_API_KEY
+    orig_mistral_key = lc.MISTRAL_API_KEY
+    try:
+        # Both keys empty — only Ollama should appear
+        lc.DEEPSEEK_API_KEY = ""
+        lc.MISTRAL_API_KEY = ""
+        options = _available_backend_models()
+        values = {opt["value"] for opt in options}
+        assert "ollama" in values, f"Ollama should always be present: {values}"
+        assert "deepseek" not in values, f"DeepSeek should NOT appear without key: {values}"
+        assert "mistral" not in values, f"Mistral should NOT appear without key: {values}"
+
+        # Mistral key set — should appear
+        lc.MISTRAL_API_KEY = "some-key"
+        options = _available_backend_models()
+        values = {opt["value"] for opt in options}
+        assert "mistral" in values, f"Mistral should appear with key: {values}"
+        assert "deepseek" not in values, "DeepSeek should still be absent"
+
+        # Both keys set
+        lc.DEEPSEEK_API_KEY = "some-key"
+        options = _available_backend_models()
+        values = {opt["value"] for opt in options}
+        assert "ollama" in values
+        assert "deepseek" in values
+        assert "mistral" in values
+    finally:
+        lc.DEEPSEEK_API_KEY = orig_deepseek_key
+        lc.MISTRAL_API_KEY = orig_mistral_key
+
+
 def test_llm_error_leaves_plan_unchanged_and_panel_open():
     """When _parse_anchor_positions returns None (validation failure),
     _anchor_plan must NOT be modified and panel stays open."""
@@ -2333,6 +2537,14 @@ tests = [
     ("test_switching_playlist_resets_generate_n", test_switching_playlist_resets_generate_n),
     ("test_notify_before_panel_clear_in_on_run_generate", test_notify_before_panel_clear_in_on_run_generate),
     ("test_llm_error_leaves_plan_unchanged_and_panel_open", test_llm_error_leaves_plan_unchanged_and_panel_open),
+    ("test_save_collapses_adjacent_placeholders", test_save_collapses_adjacent_placeholders),
+    ("test_save_collapses_leading_and_trailing_placeholder_runs", test_save_collapses_leading_and_trailing_placeholder_runs),
+    ("test_save_does_not_affect_single_isolated_placeholders", test_save_does_not_affect_single_isolated_placeholders),
+    ("test_collapse_stale_index_reset", test_collapse_stale_index_reset),
+    ("test_init_llm_client_raises_clear_error_when_deepseek_key_missing", test_init_llm_client_raises_clear_error_when_deepseek_key_missing),
+    ("test_init_llm_client_raises_clear_error_when_mistral_key_missing", test_init_llm_client_raises_clear_error_when_mistral_key_missing),
+    ("test_init_llm_client_ollama_never_requires_api_key", test_init_llm_client_ollama_never_requires_api_key),
+    ("test_available_backend_models_excludes_backends_without_keys", test_available_backend_models_excludes_backends_without_keys),
 ]
 
 for name, fn in tests:

@@ -256,17 +256,55 @@ def _clear_anchors():
     _refresh_control_buttons()
 
 
+def _collapse_adjacent_placeholders(plan: list) -> list:
+    """Return a new plan list with adjacent placeholder entries merged into one.
+
+    Example: [anchor, ph, ph, anchor] → [anchor, ph, anchor]
+    Leading/trailing placeholder runs also collapse: [ph, ph, anchor] → [ph, anchor]
+    """
+    if not plan:
+        return []
+    result = []
+    for item in plan:
+        if item.get("type") == "placeholder":
+            # Only append a placeholder if the previous item ISN'T already
+            # a placeholder (skip duplicates adjacent to another placeholder).
+            if not result or result[-1].get("type") != "placeholder":
+                result.append({"type": "placeholder"})
+        else:
+            result.append(item)
+    return result
+
+
 def _save_anchors():
-    global _anchor_plan
+    global _anchor_plan, _selected_anchor_idx
     pl_id = getattr(_state, "anchors_selected_playlist_id", None)
     if not pl_id:
         ui.notify("No playlist selected", type="warning")
         return
-    plan_to_save = list(_anchor_plan)
-    _save_anchors_file(pl_id, _playlist_name, plan_to_save)
-    actual_count = len(plan_to_save)
+
+    # Collapse adjacent placeholders in the plan being saved.
+    original_len = len(_anchor_plan)
+    collapsed = _collapse_adjacent_placeholders(_anchor_plan)
+
+    _save_anchors_file(pl_id, _playlist_name, collapsed)
+    actual_count = len(collapsed)
+
+    # Update in-memory plan to match what was written to disk, so the UI
+    # never shows a stale state with redundant placeholders that aren't
+    # actually in the file.  If the selected anchor index pointed to an
+    # item that was collapsed away, reset selection to avoid a stale index.
+    if len(collapsed) < original_len:
+        _anchor_plan[:] = collapsed
+        if _selected_anchor_idx is not None and _selected_anchor_idx >= len(_anchor_plan):
+            _selected_anchor_idx = None
+        _rebuild_anchors_list()
+        _rebuild_track_list()
+        _refresh_control_buttons()
+
     ui.notify(f"Anchors saved ({actual_count} items)", type="positive")
-    logger.info("Saved %d anchor items for playlist %s", actual_count, pl_id[:8])
+    logger.info("Saved %d anchor items for playlist %s (collapsed from %d)",
+                actual_count, pl_id[:8], original_len)
 
 
 # ── Generate Anchors LLM flow ──────────────────────────────────────────────

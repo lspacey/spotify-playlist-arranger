@@ -81,6 +81,9 @@ accelerate==1.14.0      # required by transformers pipeline (auto-detected)
 ollama==0.6.2          # local LLM  (free, offline)
 openai==2.44.0         # for DeepSeek / Mistral APIs
 
+# ── Web search (optional, for enriched track descriptions) ──────────────────
+tavily-python==0.7.17  # Tavily search API client (https://tavily.com)
+
 # ── Utilities ──────────────────────────────────────────────────────────────
 rich==15.0.0           # terminal output formatting
 python-dotenv==1.2.2   # .env file loading

@@ -15,6 +15,7 @@ import threading
 import time
 import logging
 import pathlib
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -250,10 +251,16 @@ DESC_SYSTEM_PROMPT = (
     "the sonic palette that fits the genre implied by the audio features "
     "(e.g. acoustic instruments, synths, beats, vocals, atmosphere) — do not "
     "assume it's electronic music unless the features/metadata suggest it. "
-    "Base your description ONLY on the audio features and metadata provided. "
     "Do NOT invent biographical facts about the artist. Do NOT start with "
     "the track name or artist name as the first word. Reply with the "
-    "description only, no preamble, no markdown formatting."
+    "description only, no preamble, no markdown formatting.\n\n"
+    "You may also receive web-search context (reviews, listener reactions, "
+    "the song's known meaning or reception) in addition to the audio features. "
+    "When present, blend relevant emotional/thematic insights from this context "
+    "into your description alongside the sonic characteristics — but always "
+    "verify plausibility against the audio features rather than blindly trusting "
+    "external text. Never state unverified biographical claims as fact. If the "
+    "web context is absent, rely solely on the audio features as before."
 )
 
 
@@ -305,8 +312,214 @@ _THINK_RE = re.compile(r"", re.DOTALL)
 _THINK_INNER_RE = re.compile(r"", re.DOTALL)
 
 
+# ── Tavily web search helpers ─────────────────────────────────────────────────
+
+_TAVILY_DEBUG_PATH = config.CACHE_DIR_DEFAULT / "tavily_search_debug.txt"
+_tavily_call_count_this_run: int = 0
+_tavily_cap_logged: bool = False
+TAVILY_MIN_RELEVANCE_SCORE = 0.3  # skip results below this score threshold
+
+
+def _artist_mentioned_in(artist: str, *texts: str) -> bool:
+    """Check whether *artist* appears as a substring (case-insensitive) in any of *texts*.
+
+    Normalises both sides by lowercasing and stripping to guard against
+    whitespace / capitalisation differences.  Handles multi-word artist
+    names (e.g. "Porcelain Toy") via straightforward substring match —
+    fuzzy/stemmed matching is deliberately NOT used to avoid false
+    positives.
+    """
+    needle = artist.strip().lower()
+    if not needle:
+        return False
+    return any(needle in (t or "").strip().lower() for t in texts)
+
+
+def _tavily_cap_reached() -> bool:
+    """Check whether the per-run Tavily call cap has been hit.
+
+    Returns False if TAVILY_MAX_CALLS_PER_RUN <= 0 (unlimited mode).
+    Otherwise returns True once the counter reaches the configured cap.
+    """
+    cap = config.TAVILY_MAX_CALLS_PER_RUN
+    if cap <= 0:
+        return False  # 0 or negative = unlimited
+    return _tavily_call_count_this_run >= cap
+
+
+def _reset_tavily_call_counter() -> None:
+    """Reset the per-run Tavily call counter.  Called once per description
+    batch (i.e. each time the user clicks a bulk-generate button)."""
+    global _tavily_call_count_this_run, _tavily_cap_logged
+    _tavily_call_count_this_run = 0
+    _tavily_cap_logged = False
+
+
+def _search_track_context(track_name: str, artist: str) -> str | None:
+    """Search Tavily for web context about a track (reviews, meaning, reception).
+
+    Returns a concatenated string of relevant text snippets (up to ~800 chars),
+    or None if no key is configured, search fails, or no results found.
+    This is a nice-to-have enrichment — failures must never block description
+    generation.
+    """
+    api_key = config.TAVILY_API_KEY
+    if not api_key:
+        return None
+
+    # ── Per-run cap check (soft degradation, not a hard stop) ───────────
+    global _tavily_call_count_this_run, _tavily_cap_logged
+    if _tavily_cap_reached():
+        if not _tavily_cap_logged:
+            logger.info(
+                "Tavily call cap (%d) reached — remaining tracks will use "
+                "audio-only descriptions", config.TAVILY_MAX_CALLS_PER_RUN,
+            )
+            _tavily_cap_logged = True
+        return None
+
+    _tavily_call_count_this_run += 1
+
+    query = f'"{track_name}" "{artist}" song meaning mood reception review'
+
+    try:
+        from tavily import TavilyClient  # noqa: F811 — optional dependency
+
+        client = TavilyClient(api_key=api_key)
+        response = client.search(
+            query=query,
+            search_depth="basic",
+            max_results=5,
+            include_answer="basic",
+        )
+
+        # Debug dump (best-effort, don't block on failure)
+        _write_tavily_debug(track_name, artist, query, response)
+
+        results = response.get("results") or []
+
+        # ── Gather all result texts for artist-mention validation ────────
+        result_texts: list[str] = []
+        for r in results:
+            for field in ("title", "content"):
+                val = (r.get(field) or "").strip()
+                if val:
+                    result_texts.append(val)
+
+        # ── Prefer the synthesized answer if available and non-empty ─────
+        answer = (response.get("answer") or "").strip()
+        if answer:
+            # Layer 2: validate that the artist is mentioned SOMEWHERE in
+            # the response (answer + all result texts).  If the artist is
+            # absent, the answer is likely about a DIFFERENT song with the
+            # same title — discard it.
+            if not _artist_mentioned_in(artist, answer, *result_texts):
+                logger.info(
+                    "Tavily result for '%s' by %s does not mention the "
+                    "artist — likely a title collision with an unrelated "
+                    "song, discarding web context",
+                    track_name, artist,
+                )
+                return None
+
+            # Truncate synthesized answer to ~500 chars to keep prompt lean
+            if len(answer) > 500:
+                answer = answer[:497] + "..."
+            logger.info(
+                "Enriched description for %s with Tavily web context (%d chars)",
+                track_name, len(answer),
+            )
+            return answer
+
+        # ── Fall back to concatenating raw snippets ──────────────────────
+        if not results:
+            logger.debug("Tavily search for '%s' returned empty results", track_name)
+            return None
+
+        parts: list[str] = []
+        total = 0
+        MAX_TOTAL = 800
+        filtered_out = 0
+        for r in results:
+            # Layer 3: skip low-relevance results
+            score = float(r.get("score", 0))
+            if score < TAVILY_MIN_RELEVANCE_SCORE:
+                logger.debug(
+                    "Skipping Tavily result (score %.2f < %.2f) for '%s'",
+                    score, TAVILY_MIN_RELEVANCE_SCORE, track_name,
+                )
+                filtered_out += 1
+                continue
+
+            # Layer 2: also skip results that never mention the artist
+            title = (r.get("title") or "").strip()
+            content = (r.get("content") or "").strip()
+            if not _artist_mentioned_in(artist, title, content):
+                logger.debug(
+                    "Skipping Tavily result (artist not mentioned) for '%s'",
+                    track_name,
+                )
+                filtered_out += 1
+                continue
+
+            snippet = content
+            if not snippet:
+                continue
+            if total + len(snippet) > MAX_TOTAL:
+                remaining = MAX_TOTAL - total
+                if remaining > 40:
+                    snippet = snippet[:remaining] + "..."
+                else:
+                    break
+            parts.append(snippet)
+            total += len(snippet)
+
+        if not parts:
+            if filtered_out > 0:
+                logger.info(
+                    "All %d Tavily results filtered out (score < %.2f or "
+                    "artist not mentioned) for '%s' — no usable web context",
+                    filtered_out, TAVILY_MIN_RELEVANCE_SCORE, track_name,
+                )
+            else:
+                logger.debug("Tavily search for '%s' returned no content text", track_name)
+            return None
+
+        combined = " | ".join(parts)
+        logger.info(
+            "Enriched description for %s with Tavily web context (%d chars)",
+            track_name, len(combined),
+        )
+        return combined
+
+    except Exception:
+        logger.warning(
+            "Tavily search failed for '%s' — continuing without web context",
+            track_name, exc_info=True,
+        )
+        return None
+
+
+def _write_tavily_debug(track_name: str, artist: str, query: str, response: dict) -> None:
+    """Append raw Tavily response to debug file (best-effort, never raises)."""
+    try:
+        import json
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        header = f"{'='*70}\n{ts}  |  {track_name} — {artist}\nQuery: {query}\n"
+        body = json.dumps(response, indent=2, ensure_ascii=False, default=str)
+        entry = f"{header}\n{body}\n\n"
+
+        _TAVILY_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_TAVILY_DEBUG_PATH, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception:
+        pass  # debug file is best-effort only
+
+
 def _try_generate_description(track_name: str, artist: str, album: str,
-                               feat_text: str, va_text: str) -> str | None:
+                               feat_text: str, va_text: str,
+                               web_context: str | None = None) -> str | None:
     """Try all LLM backend candidates in order. Returns description or None if all fail."""
     s = config.load_settings()
     candidates = _get_llm_candidates(s)
@@ -327,9 +540,17 @@ def _try_generate_description(track_name: str, artist: str, album: str,
                 'Artist: ' + artist + '\n'
                 'Album: ' + album + '\n\n'
                 "Audio features:\n" + feat_text + "\n\n"
-                + va_text + "\n\n"
-                "Write a description of this track."
+                + va_text
             )
+
+            if web_context:
+                user_msg += (
+                    "\n\nAdditional context from web sources (reviews, meaning, "
+                    "reception — use only as supporting color, do not treat as "
+                    "verified biographical fact):\n" + web_context
+                )
+
+            user_msg += "\n\nWrite a description of this track."
 
             raw = llm_chat(DESC_SYSTEM_PROMPT, user_msg, temperature=0.7, max_tokens=2000)
 
@@ -455,11 +676,15 @@ def _desc_worker_loop():
         # ── Build feature summary ────────────────────────────────────────
         feat_text = _feat_summary(entry)
 
+        # ── Query Tavily for web context (best-effort, never blocks) ────
+        web_context = _search_track_context(name, artist)
+
         # ── Generate description (fallback chain + retry loop) ───────────
         description = None
         while not _desc_worker_stop.is_set():
             description = _try_generate_description(
                 name, artist, album, feat_text, va_text,
+                web_context=web_context,
             )
             if description is not None:
                 break
@@ -550,7 +775,12 @@ def desc_queue_add(track_id: str) -> bool:
 
 
 def desc_queue_add_many(track_ids: list) -> int:
-    """Add multiple track IDs, skipping duplicates. Returns count actually added."""
+    """Add multiple track IDs, skipping duplicates. Returns count actually added.
+
+    Also resets the per-run Tavily call counter — every UI button click that
+    feeds tracks into this function begins a fresh batch with a full quota.
+    """
+    _reset_tavily_call_counter()
     added = 0
     with _desc_queue_lock:
         for tid in track_ids:
@@ -621,4 +851,8 @@ __all__ = [
     "compute_valence_arousal",
     "va_quadrant",
     "va_intensity_label",
+    "_search_track_context",
+    "_write_tavily_debug",
+    "_try_generate_description",
+    "_reset_tavily_call_counter",
 ]

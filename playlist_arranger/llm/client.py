@@ -137,7 +137,10 @@ def _init_llm_client(backend=None, model_override=None):
                 "openai package not installed: pip install openai"
             )
         if not DEEPSEEK_API_KEY:
-            raise RuntimeError("DEEPSEEK_API_KEY not set in environment")
+            raise RuntimeError(
+                "DEEPSEEK_API_KEY is not set in .env — cannot use the DeepSeek "
+                "backend. Set the key or choose a different backend."
+            )
         logger.info("Using DeepSeek API — model: %s", model)
         _llm_backend_used = "deepseek"
         _llm_model_used = model
@@ -154,7 +157,10 @@ def _init_llm_client(backend=None, model_override=None):
                 "openai package not installed: pip install openai"
             )
         if not MISTRAL_API_KEY:
-            raise RuntimeError("MISTRAL_API_KEY not set in environment")
+            raise RuntimeError(
+                "MISTRAL_API_KEY is not set in .env — cannot use the Mistral "
+                "backend. Set the key or choose a different backend."
+            )
         logger.info("Using Mistral API — model: %s", model)
         _llm_backend_used = "mistral"
         _llm_model_used = model
