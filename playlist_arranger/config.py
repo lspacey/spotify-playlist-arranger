@@ -156,9 +156,45 @@ CAMELOT_TO_IDX = {
 }
 
 # ─── Sorting weights ──────────────────────────────────────────────────────────
-WEIGHTS = {"mood": 0.35, "bpm": 0.15, "transition": 0.25, "key": 0.15, "energy": 0.10}
+# NOTE: Weights are RELATIVE multipliers, NOT required to sum to 1.0.
+# The final distance is an unnormalized weighted sum of individual components.
+# Adding new components (e.g. texture, freq_balance) does NOT require
+# rebalancing existing weights — just add them additively.
+WEIGHTS = {
+    "mood": 0.35,
+    "bpm": 0.15,
+    "transition": 0.25,
+    "key": 0.15,
+    "energy": 0.10,
+    "texture": 0.10,
+    "freq_balance": 0.08,
+}
 ARTIST_PENALTY = 0.18
 ALBUM_PENALTY = 0.30
+
+
+def sync_weights_from_settings(s: "Settings") -> None:
+    """Sync module-level WEIGHTS/ARTIST_PENALTY/ALBUM_PENALTY from a Settings instance.
+
+    Call this at startup (once, with ``load_settings()``) and after every
+    Settings save so that ``sorting/distance.py`` (which reads through the
+    module reference ``_cfg.WEIGHTS``, ``_cfg.ARTIST_PENALTY``, etc.) always
+    sees the current user-configured values rather than the Python defaults.
+
+    Invalidation of ``_SORTING_CACHE`` is the caller's responsibility (see
+    ``settings_panel.py`` for the save-path invalidation logic).
+    """
+    WEIGHTS["mood"] = s.w_mood
+    WEIGHTS["bpm"] = s.w_bpm
+    WEIGHTS["transition"] = s.w_transition
+    WEIGHTS["key"] = s.w_key
+    WEIGHTS["energy"] = s.w_energy
+    WEIGHTS["texture"] = s.w_texture
+    WEIGHTS["freq_balance"] = s.w_freq_balance
+    global ARTIST_PENALTY, ALBUM_PENALTY
+    ARTIST_PENALTY = s.artist_penalty
+    ALBUM_PENALTY = s.album_penalty
+
 
 # ─── LLM configuration ────────────────────────────────────────────────────────
 LLM_BACKEND = os.getenv("LLM", "ollama").strip().lower()
@@ -235,12 +271,14 @@ class Settings:
     sa_T_start: float = 1.0
     sa_T_end: float = 1e-4
 
-    # Weights (slider values 0.0-1.0)
+    # Weights (relative multipliers, NOT required to sum to 1.0)
     w_mood: float = 0.35
     w_bpm: float = 0.15
     w_transition: float = 0.25
     w_key: float = 0.15
     w_energy: float = 0.10
+    w_texture: float = 0.10
+    w_freq_balance: float = 0.08
 
     artist_penalty: float = 0.18
     album_penalty: float = 0.30

@@ -278,7 +278,7 @@ def _collapse_adjacent_placeholders(plan: list) -> list:
 
 def _save_anchors():
     global _anchor_plan, _selected_anchor_idx
-    pl_id = getattr(_state, "anchors_selected_playlist_id", None)
+    pl_id = getattr(_state, "selected_playlist_id", None)
     if not pl_id:
         ui.notify("No playlist selected", type="warning")
         return
@@ -654,7 +654,7 @@ async def _on_run_generate():
     else:
         logger.info("Anchor generation: selected %d anchors for playlist %s",
                     len(anchor_items),
-                    getattr(_state, "anchors_selected_playlist_id", "")[:8])
+                    getattr(_state, "selected_playlist_id", "")[:8])
 
     # Now safe to collapse the panel (done, whether notify succeeded or not)
     _gen_panel_visible = False
@@ -901,12 +901,12 @@ def _on_playlist_selected(pl_id: str):
     global _selected_anchor_idx
     global _gen_last_n
 
-    _state.anchors_selected_playlist_id = pl_id
+    _state.selected_playlist_id = pl_id
 
     if not pl_id:
         return
 
-    _anchor_plan = _load_anchors_file(pl_id) or []
+    _anchor_plan = _load_anchors_file(pl_id) or [{"type": "placeholder"}]
 
     from playlist_arranger.ui.pages.playlist_source import _load_cached_playlist_tracks
     try:
@@ -958,7 +958,7 @@ def build_anchors():
 
     options = {pl["id"]: pl["name"] for pl in playlists}
 
-    saved_id = getattr(_state, "anchors_selected_playlist_id", None)
+    saved_id = getattr(_state, "selected_playlist_id", None)
     default_val = saved_id if saved_id in options else (list(options.keys())[0] if options else None)
 
     def on_change(e):

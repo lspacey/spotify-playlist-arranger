@@ -10,6 +10,7 @@ import threading
 import logging
 
 from playlist_arranger.config import setup_logging
+from playlist_arranger.config import sync_weights_from_settings
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ def _refresh_nav_buttons() -> None:
     if _anchor_btn is not None:
         _anchor_btn.set_enabled(_state.sp is not None)
     if _sort_btn is not None:
-        _sort_btn.set_enabled(_state.has_anchor_plan())
+        _sort_btn.set_enabled(_state.sp is not None)
 
 
 def set_page(page_name: str) -> None:
@@ -86,10 +87,7 @@ def render_right_panel() -> None:
         elif _current_page == "anchors":
             build_anchors()
         elif _current_page == "sorting":
-            if _state.has_anchor_plan():
-                build_smart_sorting()
-            else:
-                ui.label("No anchor plan. Create anchors first.").classes("text-yellow-500")
+            build_smart_sorting()
 
 
 async def run_descriptions() -> None:
@@ -214,6 +212,8 @@ def main_page():
     """Main page layout with sidebar navigation."""
     # Load settings
     s = _state.get_settings()
+    # Sync sorting weights at startup so config.WEIGHTS reflects settings.json
+    sync_weights_from_settings(s)
 
     # Theme toggle in header
     with ui.header(elevated=True).classes("bg-primary text-white"):
@@ -249,11 +249,11 @@ def main_page():
             if _state.sp is None:
                 _anchor_btn.set_enabled(False)
 
-            # Smart Sorting (disabled until anchor plan non-empty)
+            # Smart Sorting (disabled until Spotify is connected, same as Anchors)
             global _sort_btn
             _sort_btn = ui.button("Sorting", on_click=lambda: set_page("sorting"))
             _sort_btn.classes("w-full text-sm")
-            if not _state.has_anchor_plan():
+            if _state.sp is None:
                 _sort_btn.set_enabled(False)
 
             ui.separator().classes("my-2")

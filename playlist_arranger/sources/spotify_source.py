@@ -28,8 +28,52 @@ def is_configured() -> bool:
     )
 
 
+def classify_spotify_error(status_code: int | None, message: str) -> str:
+    """Map HTTP status / exception info to a short error category string.
+
+    Returns one of:
+        "auth_expired"  (401, 403)
+        "not_found"     (404)
+        "rate_limited"  (429) — only when retries already exhausted
+        "server_error"  (5xx, retries exhausted)
+        "network_error" (connection/timeout, unexpected requests exceptions)
+        "unknown"       (fallback — anything unclassified)
+    """
+    if status_code is None:
+        # No HTTP response → network-level issue
+        return "network_error"
+    if 400 <= status_code < 500:
+        if status_code in (401, 403):
+            return "auth_expired"
+        if status_code == 404:
+            return "not_found"
+        if status_code == 429:
+            return "rate_limited"
+    if 500 <= status_code < 600:
+        return "server_error"
+    # Non-HTTP fallback: the message string may contain exception info
+    msg_lower = message.lower()
+    if "timeout" in msg_lower or "connection" in msg_lower or "network" in msg_lower:
+        return "network_error"
+    return "unknown"
+
+
+ERROR_USER_MESSAGES = {
+    "auth_expired": "Your Spotify session expired — please reconnect.",
+    "not_found": "Playlist no longer exists or you lost access to it.",
+    "rate_limited": "Spotify rate-limited the request — try again in a minute.",
+    "server_error": "Spotify API is having issues — try again shortly.",
+    "network_error": "Spotify API is having issues — try again shortly.",
+    "unknown": None,  # use raw error message
+}
+
+
 def _spotify_request_with_retries(sp, method, path, payload=None, max_retries=5):
-    """Spotify API call with retries for 429/5xx errors. Refreshes token on each retry."""
+    """Spotify API call with retries for 429/5xx errors.
+
+    Returns (data, error_dict) where error_dict is ``{"message": str, "type": str}``
+    or None on success.  The ``"type"`` key is a classify_spotify_error category.
+    """
     import requests as _req
 
     url = f"https://api.spotify.com/v1/{path.lstrip('/')}"
@@ -61,12 +105,28 @@ def _spotify_request_with_retries(sp, method, path, payload=None, max_retries=5)
                 backoff = min(backoff * 2, 20)
                 continue
             if not resp.ok:
-                return None, f"{resp.status_code} {resp.text[:200]}"
+                err_type = classify_spotify_error(resp.status_code, resp.text[:200])
+                return None, {
+                    "message": f"{resp.status_code} {resp.text[:200]}",
+                    "type": err_type,
+                    "status_code": resp.status_code,
+                }
             return resp.json() if resp.text else {}, None
-        except Exception:
+        except Exception as exc:
             time.sleep(backoff)
             backoff = min(backoff * 2, 20)
-    return None, "max retries exceeded"
+            if attempt == max_retries - 1:
+                return None, {
+                    "message": str(exc),
+                    "type": classify_spotify_error(None, str(exc)),
+                    "status_code": None,
+                }
+
+    return None, {
+        "message": "max retries exceeded",
+        "type": classify_spotify_error(503, "max retries exceeded"),
+        "status_code": 503,
+    }
 
 
 class SpotifyCallProxy:
@@ -74,45 +134,63 @@ class SpotifyCallProxy:
 
     def __init__(self, sp):
         self._sp = sp
-        self.call_count = 0
-        self._lock = __import__("threading").Lock()
 
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
         attr = getattr(self._sp, name)
         if callable(attr):
+
             def wrapper(*args, **kwargs):
-                with self._lock:
-                    self.call_count += 1
+                # Count the call through a global counter managed by the UI
+                try:
+                    from playlist_arranger.ui import state as _api_state
+
+                    setattr(_api_state, "api_calls", getattr(_api_state, "api_calls", 0) + 1)
+                except Exception:
+                    pass
                 return attr(*args, **kwargs)
+
             return wrapper
         return attr
 
 
 def init_spotify(progress_cb=None):
-    """Initialize Spotify client. progress_cb(msg) for UI feedback."""
+    """Initialize Spotify OAuth, returns spotipy.Spotify or None."""
     if not HAS_SPOTIPY:
-        raise ImportError("spotipy package not installed")
+        logger.warning("spotipy not installed — Spotify features disabled")
+        return None
+
+    client_id = os.getenv("SPOTIPY_CLIENT_ID", "")
+    client_secret = os.getenv("SPOTIPY_CLIENT_SECRET", "")
+
+    if not client_id or not client_secret:
+        logger.warning("Spotify client ID/secret not set — Spotify features disabled")
+        return None
 
     if progress_cb:
-        progress_cb("Connecting to Spotify API...")
-
-    sp = spotipy.Spotify(
-        auth_manager=SpotifyOAuth(
-            scope=SPOTIFY_SCOPE,
+        progress_cb("Authenticating with Spotify...")
+    try:
+        cache_path = str(CACHE_DIR_DEFAULT / ".spotify_cache")
+        auth = SpotifyOAuth(
+            client_id=client_id,
+            client_secret=client_secret,
             redirect_uri=REDIRECT_URI,
+            scope=SPOTIFY_SCOPE,
+            cache_path=cache_path,
             open_browser=True,
         )
-    )
-    user = sp.current_user()
-    if progress_cb:
-        progress_cb(f"Authenticated as: {user['display_name']} ({user['id']})")
-    return SpotifyCallProxy(sp), user["id"]
+        sp = spotipy.Spotify(auth_manager=auth)
+        return sp
+    except Exception as exc:
+        logger.exception("Failed to authenticate with Spotify")
+        if progress_cb:
+            progress_cb(f"Auth failed: {exc}")
+        return None
 
 
 def get_own_playlists(sp, user_id):
-    """Fetch only playlists owned by the current user (paginates fully)."""
+    """Get all playlists owned by user_id. Returns {id: name} dict."""
     playlists = []
     limit = 50
     offset = 0
@@ -120,25 +198,21 @@ def get_own_playlists(sp, user_id):
         result = sp.current_user_playlists(limit=limit, offset=offset)
         items = result.get("items") or []
         for pl in items:
-            if pl and pl.get("owner", {}).get("id") == user_id:
-                playlists.append(pl)
+            if pl.get("owner", {}).get("id") == user_id:
+                playlists.append({"id": pl["id"], "name": pl["name"][:80]})
         if not result.get("next"):
             break
         offset += limit
-        time.sleep(0.2)
+        time.sleep(0.3)
     return playlists
 
 
 def _is_track_playable(item: dict) -> bool:
-    """Return True if a Spotify playlist-item/track is playable.
-
-    Handles both raw Spotify envelope items (with ``item`` sub-object — the
-    Spotify Web API places the track under the ``"item"`` key, not ``"track"``)
-    and already-flattened track dicts loaded from cache (no extra fields).
-    """
-    # Distinguish raw envelope (has "item" key) vs flattened cached track
-    track = item.get("item") if "item" in item else item
-    if track is None:
+    """Check whether a Spotify track item is playable."""
+    track = item.get("track") or item
+    if track.get("is_local"):
+        return False
+    if track.get("type") != "track":
         return False
     if track.get("is_playable") is False:
         return False
@@ -146,9 +220,6 @@ def _is_track_playable(item: dict) -> bool:
     if restrictions:
         return False
     if "is_playable" not in track and "item" in item:
-        # Only apply the available_markets fallback on raw Spotify responses
-        # (the envelope has an "item" key).  Cached/flattened dicts never have
-        # is_playable/available_markets, so we skip this check for them.
         available_markets = track.get("available_markets")
         if available_markets is not None and len(available_markets) == 0:
             return False
@@ -156,12 +227,7 @@ def _is_track_playable(item: dict) -> bool:
 
 
 def get_playlist_tracks(sp, playlist_id):
-    """Fetch all tracks from a playlist.
-
-    Skips local files, episodes, null items, and **unplayable** tracks
-    (deleted, region-restricted, market-unavailable).  Uses ``market="from_token"``
-    so the Spotify API includes the ``is_playable`` field for reliable detection.
-    """
+    """Fetch all tracks from a playlist."""
     tracks = []
     limit = 100
     offset = 0
@@ -205,6 +271,7 @@ def get_playlist_tracks(sp, playlist_id):
                     ),
                     "album": (t.get("album") or {}).get("name", "Unknown"),
                     "duration_ms": t.get("duration_ms", 0),
+                    "uri": t.get("uri", f"spotify:track:{tid}"),
                 }
             )
 
@@ -230,13 +297,34 @@ def play_track_on_device(sp, track_uri, device_id=None):
         raise RuntimeError(f"Playback failed: {exc}") from exc
 
 
-def reorder_playlist(sp, playlist_id, ordered_uris):
+def reorder_playlist(sp, playlist_id, ordered_uris) -> dict:
+    """Replace a playlist's track order with the given URIs.
+
+    PUT first 100 URIs (full replace), then POST remaining chunks of 100
+    with ``time.sleep(0.3)`` between each.
+
+    Returns
+    -------
+    dict
+        {
+            "success": bool,
+            "chunks_total": int,
+            "chunks_completed": int,
+            "tracks_saved": int,
+            "error": dict | None,      # {"message": str, "type": str, "status_code": int|None}
+            "failed_chunk_index": int | None,
+        }
     """
-    Reorder a playlist: PUT first 100 URIs (full replace), then POST remaining
-    chunks of 100 with time.sleep(0.3) between each.
-    """
-    if not ordered_uris:
-        return True, None
+    total = len(ordered_uris)
+    if total == 0:
+        return {
+            "success": True,
+            "chunks_total": 0,
+            "chunks_completed": 0,
+            "tracks_saved": 0,
+            "error": None,
+            "failed_chunk_index": None,
+        }
 
     # PUT first 100 (full replace)
     first_chunk = ordered_uris[:100]
@@ -244,25 +332,60 @@ def reorder_playlist(sp, playlist_id, ordered_uris):
         sp, "PUT", f"playlists/{playlist_id}/items", {"uris": first_chunk}
     )
     if err:
-        return False, err
+        return {
+            "success": False,
+            "chunks_total": 1 + (max(0, total - 100) + 99) // 100,
+            "chunks_completed": 0,
+            "tracks_saved": 0,
+            "error": err,
+            "failed_chunk_index": 0,
+        }
 
     # POST remaining chunks
     rest_chunks = [
-        ordered_uris[i : i + 100] for i in range(100, len(ordered_uris), 100)
+        ordered_uris[i : i + 100] for i in range(100, total, 100)
     ]
-    for chunk in rest_chunks:
+    for idx, chunk in enumerate(rest_chunks):
         _, err2 = _spotify_request_with_retries(
             sp, "POST", f"playlists/{playlist_id}/items", {"uris": chunk}
         )
         if err2:
-            return False, err2
+            return {
+                "success": False,
+                "chunks_total": 1 + len(rest_chunks),
+                "chunks_completed": 1 + idx,  # PUT succeeded + idx prior POSTs
+                "tracks_saved": min(100, total) + idx * 100,
+                "error": err2,
+                "failed_chunk_index": idx + 1,  # 0 = PUT, 1+ = POST chunk
+            }
         time.sleep(0.3)
 
-    return True, None
+    return {
+        "success": True,
+        "chunks_total": 1 + len(rest_chunks),
+        "chunks_completed": 1 + len(rest_chunks),
+        "tracks_saved": total,
+        "error": None,
+        "failed_chunk_index": None,
+    }
 
 
-def create_playlist(sp, name, uris):
-    """Create new playlist and add tracks in chunks."""
+def create_playlist(sp, name, uris) -> dict:
+    """Create a new playlist and add tracks in chunks.
+
+    Returns
+    -------
+    dict
+        {
+            "success": bool,
+            "playlist": dict | None,   # created playlist object (may be present even on failure)
+            "chunks_total": int,
+            "chunks_completed": int,
+            "tracks_saved": int,
+            "error": dict | None,      # {"message": str, "type": str, "status_code": int|None}
+            "failed_chunk_index": int | None,
+        }
+    """
     new_pl, err = _spotify_request_with_retries(
         sp,
         "POST",
@@ -270,9 +393,19 @@ def create_playlist(sp, name, uris):
         payload={"name": name, "public": False},
     )
     if err or not new_pl:
-        return None, err
+        return {
+            "success": False,
+            "playlist": new_pl if isinstance(new_pl, dict) else None,
+            "chunks_total": 0,
+            "chunks_completed": 0,
+            "tracks_saved": 0,
+            "error": err or {"message": "unknown playlist creation error", "type": "unknown"},
+            "failed_chunk_index": None,
+        }
 
-    for i in range(0, len(uris), 100):
+    total_uris = len(uris)
+    chunk_count = (total_uris + 99) // 100  # ceil division
+    for i in range(0, total_uris, 100):
         chunk = uris[i : i + 100]
         _, err2 = _spotify_request_with_retries(
             sp,
@@ -280,8 +413,25 @@ def create_playlist(sp, name, uris):
             f"playlists/{new_pl['id']}/items",
             payload={"uris": chunk},
         )
+        chunk_idx = i // 100
         if err2:
-            return new_pl, err2
+            return {
+                "success": False,
+                "playlist": new_pl,
+                "chunks_total": chunk_count,
+                "chunks_completed": chunk_idx,  # 0-based: 0 chunks if first fails
+                "tracks_saved": i,  # tracks saved BEFORE this failed chunk
+                "error": err2,
+                "failed_chunk_index": chunk_idx,
+            }
         time.sleep(0.3)
 
-    return new_pl, None
+    return {
+        "success": True,
+        "playlist": new_pl,
+        "chunks_total": chunk_count,
+        "chunks_completed": chunk_count,
+        "tracks_saved": total_uris,
+        "error": None,
+        "failed_chunk_index": None,
+    }

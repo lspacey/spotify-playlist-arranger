@@ -15,8 +15,8 @@ current_descs: list = []
 current_anchor_plan: list = []
 current_sorted_descs: list = []
 
-# ─── Anchors page state ───────────────────────────────────────────────────────
-anchors_selected_playlist_id: str | None = None
+# ─── Shared playlist selection (same playlist selected across all pages) ──────
+selected_playlist_id: str | None = None
 
 # ─── Spotify state ──────────────────────────────────────────────────────────
 sp = None  # spotipy.Spotify instance

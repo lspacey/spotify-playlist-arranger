@@ -1210,6 +1210,26 @@ def _rebuild_queue_ui():
     global _queue_table_ref, _queue_rows_cache, _queue_container
     if _queue_container is None:
         return
+
+    # ── Safety: skip rebuild if client disconnected (background-thread callback) ──
+    # _on_desc_generated() is invoked from a background worker thread
+    # (_desc_worker_loop → cb(track_id) → _on_desc_generated → _rebuild_queue_ui).
+    # By the time the callback fires, the user may have navigated away or
+    # disconnected, leaving _queue_container as a stale NiceGUI element whose
+    # client has no active socket connection.  Calling .clear() on a
+    # disconnected element triggers a "deleted but still being used" warning.
+    # We check has_socket_connection before any UI mutation and bail out safely.
+    try:
+        client = _queue_container.client
+        if not client.has_socket_connection:
+            logger.debug("Skipping queue UI rebuild — client disconnected")
+            return
+    except Exception:
+        # Cannot verify connection state (element may be in a bad state) —
+        # bail out safely rather than crash or emit a warning.
+        logger.debug("Could not verify client connection — skipping queue UI rebuild")
+        return
+
     _queue_container.clear()
     with _queue_container:
         _render_queue_table()

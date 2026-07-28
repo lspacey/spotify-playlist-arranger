@@ -1,8 +1,13 @@
-"""Simulated Annealing ATSP solver with anchors."""
+"""Simulated Annealing ATSP solver with anchors.
+
+All UI-agnostic: accepts a plain ``on_progress(str) -> None`` callback for
+logging and reads SA parameters from ``config.load_settings()`` at call time.
+"""
 
 import math
 import random
 import copy
+import logging
 
 from playlist_arranger.sorting.distance import (
     _load_embedding,
@@ -10,6 +15,8 @@ from playlist_arranger.sorting.distance import (
     _SORTING_CACHE,
 )
 from playlist_arranger.sorting.anchors import _load_anchors_file
+
+logger = logging.getLogger(__name__)
 
 
 def _path_cost(order: list, D) -> float:
@@ -156,12 +163,35 @@ def _solve_atsp_with_anchors(
     return build_order()
 
 
-def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str, progress_cb=None):
+def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
+                       progress_cb=None, settings=None):
     """
     Run SA sorting, return (ordered_descs, cost) tuple.
     Pure logic — no UI/no console.
+
+    Parameters
+    ----------
+    db : dict
+        Track database keyed by track_id.
+    descs : list
+        Track descriptor dicts (must have ``track_id``, ``name``, ``artist``).
+    pl_id : str
+        Spotify playlist ID.
+    pl_name : str
+        Playlist name (for logging only).
+    progress_cb : callable(str) -> None, optional
+        Synchronous progress callback.  Called from the worker thread; the
+        caller is responsible for thread-safe delivery to the UI.
+    settings : ``config.Settings``, optional
+        If None, ``config.load_settings()`` is called to read SA parameters
+        (iterations multiplier, n_runs, T_start, T_end).
     """
-    def _log(msg):
+    if settings is None:
+        from playlist_arranger.config import load_settings
+        settings = load_settings()
+
+    def _log(msg: str) -> None:
+        logger.info("%s", msg)
         if progress_cb:
             progress_cb(msg)
 
@@ -253,8 +283,25 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str, progress
     embeddings = [_load_embedding(tid, db) for tid in track_ids]
 
     n_total = len(all_tracks)
-    # Use cached distance matrix if track_ids haven't changed
-    cache_key = tuple(track_ids)
+
+    # ── Calibrate texture normalization scales per playlist ──────────────
+    # Scales are computed from the CURRENT playlist's feature distributions
+    # (not a global constant) so that a 2 dB dynamic_range difference counts
+    # more in a playlist with a narrow spread than in one spanning 30 dB.
+    from playlist_arranger.sorting.distance import _calibrate_texture_scales
+
+    dyn_scale, onset_scale = _calibrate_texture_scales(all_tracks)
+
+    # Cache key must encompass the calibration scales because they change the
+    # distance matrix D.  Round scales to 3 decimal places to avoid cache
+    # misses from floating-point noise while still being playlist-sensitive.
+    # The track_ids tuple already changes per playlist, and scales are
+    # recomputed per playlist selection, so a separate `scale_key` ensures
+    # cache invalidation if the same track set is recalibrated differently.
+    scale_key = (round(dyn_scale, 3), round(onset_scale, 3))
+    texture_scales = (dyn_scale, onset_scale)
+    cache_key = (tuple(track_ids), scale_key)
+
     cached = _SORTING_CACHE.get(pl_id)
     if cached and cached.get("track_ids") == cache_key:
         D = cached["D"]
@@ -264,7 +311,8 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str, progress
             f"Building distance matrix for {n_total} tracks ({n_total*n_total} pairs)..."
         )
         D = _build_distance_matrix(
-            list(range(n_total)), all_tracks, embeddings
+            list(range(n_total)), all_tracks, embeddings,
+            texture_scales=texture_scales,
         )
         _SORTING_CACHE[pl_id] = {
             "D": D,
@@ -272,16 +320,23 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str, progress
             "all_tracks": all_tracks,
             "embeddings": embeddings,
         }
+    _log(
+        f"Calibrated normalization: dynamic_range scale={dyn_scale:.2f} dB, "
+        f"onset_str scale={onset_scale:.2f}"
+    )
 
     all_indices = list(range(len(all_tracks)))
-    iters = max(len(all_tracks) * 500, 5000)
-    N_RUNS = 100
+    iters = max(n_total * settings.sa_iterations_multiplier, 5000)
+    N_RUNS = settings.sa_n_runs
+    T_start = settings.sa_T_start
+    T_end = settings.sa_T_end
 
-    _log(f"SA: {N_RUNS} runs × {iters} iterations...")
+    _log(f"SA: {N_RUNS} runs × {iters} iterations (T={T_start}→{T_end})")
     best_order, best_cost = None, float("inf")
     for run in range(N_RUNS):
         candidate = _solve_atsp_with_anchors(
-            all_indices, anchors_idx, slots, D, iterations=iters
+            all_indices, anchors_idx, slots, D,
+            iterations=iters, T_start=T_start, T_end=T_end,
         )
         cost = _path_cost(candidate, D)
         if cost < best_cost:

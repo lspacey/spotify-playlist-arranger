@@ -104,7 +104,7 @@ def build_settings_dialog():
                     format="%.0e",
                 ).classes("w-40")
 
-            ui.label("Weights (auto-normalized to sum=1 on save)").classes("text-md font-bold mt-4 mb-2")
+            ui.label("Weights (relative — NOT auto-normalized)").classes("text-md font-bold mt-4 mb-2")
             with ui.row().classes("w-full gap-4"):
                 w_mood = ui.number(
                     label="Mood", value=s.w_mood, min=0.0, max=1.0, step=0.05,
@@ -121,6 +121,23 @@ def build_settings_dialog():
                 w_energy = ui.number(
                     label="Energy", value=s.w_energy, min=0.0, max=1.0, step=0.05,
                 ).classes("w-24")
+            with ui.row().classes("w-full gap-4 mt-2"):
+                w_texture = ui.number(
+                    label="Texture", value=s.w_texture, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+                w_freq_balance = ui.number(
+                    label="Freq Bal", value=s.w_freq_balance, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+            with ui.row().classes("w-full gap-4 mt-2"):
+                artist_penalty = ui.number(
+                    label="Artist Penalty", value=s.artist_penalty, min=0.0, max=2.0, step=0.05,
+                ).classes("w-32")
+                album_penalty = ui.number(
+                    label="Album Penalty", value=s.album_penalty, min=0.0, max=2.0, step=0.05,
+                ).classes("w-32")
+                duration_tolerance = ui.number(
+                    label="Duration Tol", value=s.duration_tolerance, min=0.0, max=1.0, step=0.01,
+                ).classes("w-32")
 
         # ─── Audio device ───────────────────────────────────────────────────
         with ui.card().classes("w-full"):
@@ -178,24 +195,17 @@ def build_settings_dialog():
             s_new.sa_T_start = float(sa_T_start.value)
             s_new.sa_T_end = float(sa_T_end.value)
 
-            # Normalize weights so they sum to 1
-            raw = {
-                "mood": float(w_mood.value),
-                "bpm": float(w_bpm.value),
-                "transition": float(w_transition.value),
-                "key": float(w_key.value),
-                "energy": float(w_energy.value),
-            }
-            total = sum(raw.values())
-            if total > 0:
-                for k in raw:
-                    raw[k] = round(raw[k] / total, 4)
-            # Assign after normalization
-            s_new.w_mood = raw["mood"]
-            s_new.w_bpm = raw["bpm"]
-            s_new.w_transition = raw["transition"]
-            s_new.w_key = raw["key"]
-            s_new.w_energy = raw["energy"]
+            # Weights — store raw values, NOT normalized (relative multipliers)
+            s_new.w_mood = float(w_mood.value)
+            s_new.w_bpm = float(w_bpm.value)
+            s_new.w_transition = float(w_transition.value)
+            s_new.w_key = float(w_key.value)
+            s_new.w_energy = float(w_energy.value)
+            s_new.w_texture = float(w_texture.value)
+            s_new.w_freq_balance = float(w_freq_balance.value)
+            s_new.artist_penalty = float(artist_penalty.value)
+            s_new.album_penalty = float(album_penalty.value)
+            s_new.duration_tolerance = float(duration_tolerance.value)
 
             s_new.llm_backend = llm_backend_select.value
             s_new.ollama_model = ollama_model_input.value
@@ -218,15 +228,32 @@ def build_settings_dialog():
             # Reload DB connection with new path
             _reload_db()
 
-            # Update WEIGHTS in config
+            # Check whether sorting weights changed → invalidate cached distance matrices
             import playlist_arranger.config as _cfg
-            _cfg.WEIGHTS["mood"] = s_new.w_mood
-            _cfg.WEIGHTS["bpm"] = s_new.w_bpm
-            _cfg.WEIGHTS["transition"] = s_new.w_transition
-            _cfg.WEIGHTS["key"] = s_new.w_key
-            _cfg.WEIGHTS["energy"] = s_new.w_energy
+            _weight_fields = [
+                "w_mood", "w_bpm", "w_transition", "w_key", "w_energy",
+                "w_texture", "w_freq_balance",
+            ]
+            _weights_changed = any(
+                getattr(s_new, f) != getattr(_cfg, f.upper() if f.startswith("w_") else f, getattr(_cfg, f, None))
+                for f in _weight_fields
+            )
+            _weights_changed = _weights_changed or (
+                s_new.artist_penalty != _cfg.ARTIST_PENALTY
+                or s_new.album_penalty != _cfg.ALBUM_PENALTY
+            )
 
-            ui.notify("Settings saved! (weights normalized)", type="positive")
+            # Sync weights & penalties into config module (single source of truth)
+            _cfg.sync_weights_from_settings(s_new)
+
+            if _weights_changed:
+                # Weights changed — cached distance matrices are now stale
+                # and must be rebuilt on next playlist selection.
+                from playlist_arranger.sorting.distance import _SORTING_CACHE
+                _SORTING_CACHE.clear()
+                ui.notify("Settings saved! (distance cache cleared)", type="positive")
+            else:
+                ui.notify("Settings saved!", type="positive")
 
         ui.button("Save Settings", on_click=do_save, color="green").classes("mt-4")
 

@@ -89,27 +89,52 @@ def test_nav_button_refresh_logic():
 
 
 def test_sort_button_refresh_logic():
-    """Sort button re-evaluates on refresh — mimics _refresh_nav_buttons for sort."""
+    """Sort button re-evaluates on refresh — mimics _refresh_nav_buttons for sort.
+
+    SORTING is now enabled/disabled in lockstep with ANCHORS (both use
+    _state.sp is not None), not the old has_anchor_plan() condition.
+    """
     class FakeButton:
         def __init__(self):
             self._enabled = False
         def set_enabled(self, val):
             self._enabled = val
 
-    btn = FakeButton()
-    original_plan = list(_state.current_anchor_plan)
+    anchor_btn = FakeButton()
+    sort_btn = FakeButton()
+    original_sp = _state.sp
     try:
-        # No anchor plan → disabled
-        _state.current_anchor_plan[:] = []
-        btn.set_enabled(_state.has_anchor_plan())
-        assert not btn._enabled, "Should be disabled without anchor plan"
+        # Disconnected → both buttons disabled
+        _state.sp = None
+        anchor_btn.set_enabled(_state.sp is not None)
+        sort_btn.set_enabled(_state.sp is not None)
+        assert not anchor_btn._enabled, "ANCHORS should be disabled when sp=None"
+        assert not sort_btn._enabled, "SORTING should be disabled when sp=None"
+        assert anchor_btn._enabled == sort_btn._enabled, (
+            "ANCHORS and SORTING must be in lockstep (disabled)"
+        )
 
-        # With anchor plan → enabled
-        _state.current_anchor_plan[:] = [{"type": "anchor", "track_id": "test"}]
-        btn.set_enabled(_state.has_anchor_plan())
-        assert btn._enabled, "Should be enabled with anchor plan"
+        # Connected → both buttons enabled
+        _state.sp = "connected_client"
+        anchor_btn.set_enabled(_state.sp is not None)
+        sort_btn.set_enabled(_state.sp is not None)
+        assert anchor_btn._enabled, "ANCHORS should be enabled when sp is set"
+        assert sort_btn._enabled, "SORTING should be enabled when sp is set"
+        assert anchor_btn._enabled == sort_btn._enabled, (
+            "ANCHORS and SORTING must be in lockstep (enabled)"
+        )
+
+        # Disconnected again → both disabled again
+        _state.sp = None
+        anchor_btn.set_enabled(_state.sp is not None)
+        sort_btn.set_enabled(_state.sp is not None)
+        assert not anchor_btn._enabled, "ANCHORS should disable after disconnect"
+        assert not sort_btn._enabled, "SORTING should disable after disconnect"
+        assert anchor_btn._enabled == sort_btn._enabled, (
+            "ANCHORS and SORTING must remain in lockstep after disconnect"
+        )
     finally:
-        _state.current_anchor_plan[:] = original_plan
+        _state.sp = original_sp
 
 
 # ── Playlist dropdown population logic ─────────────────────────────────────
@@ -190,15 +215,15 @@ def test_spotify_user_id_required_for_playlist_fetch():
 # ── Part 1: Playlist selection persistence ────────────────────────────────
 
 def test_playlist_selection_persists_across_navigation():
-    """anchors_selected_playlist_id survives page navigation (state field test)."""
-    original_val = _state.anchors_selected_playlist_id
+    """selected_playlist_id survives page navigation (state field test)."""
+    original_val = _state.selected_playlist_id
     try:
-        _state.anchors_selected_playlist_id = "pl_test_789"
-        assert _state.anchors_selected_playlist_id == "pl_test_789"
+        _state.selected_playlist_id = "pl_test_789"
+        assert _state.selected_playlist_id == "pl_test_789"
         # Simulate navigating away and back — value persists in state
-        assert _state.anchors_selected_playlist_id == "pl_test_789"
+        assert _state.selected_playlist_id == "pl_test_789"
     finally:
-        _state.anchors_selected_playlist_id = original_val
+        _state.selected_playlist_id = original_val
 
 
 # ── Part 2: Anchor plan loading from cache ────────────────────────────────
