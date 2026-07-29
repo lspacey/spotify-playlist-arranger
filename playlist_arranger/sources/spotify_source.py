@@ -156,37 +156,39 @@ class SpotifyCallProxy:
 
 
 def init_spotify(progress_cb=None):
-    """Initialize Spotify OAuth, returns spotipy.Spotify or None."""
+    """Initialize Spotify OAuth, returns (SpotifyCallProxy, user_id) tuple.
+
+    Always returns a valid 2-tuple on success.  Any failure raises an
+    exception so the caller (``do_connect()``) can handle it uniformly
+    in its ``try/except`` block — no ``return None`` ambiguity.
+    """
     if not HAS_SPOTIPY:
-        logger.warning("spotipy not installed — Spotify features disabled")
-        return None
+        raise RuntimeError("spotipy is not installed — Spotify features unavailable")
 
     client_id = os.getenv("SPOTIPY_CLIENT_ID", "")
     client_secret = os.getenv("SPOTIPY_CLIENT_SECRET", "")
 
     if not client_id or not client_secret:
-        logger.warning("Spotify client ID/secret not set — Spotify features disabled")
-        return None
+        raise RuntimeError(
+            "Spotify client ID/secret not configured — set SPOTIPY_CLIENT_ID "
+            "and SPOTIPY_CLIENT_SECRET in .env"
+        )
 
     if progress_cb:
         progress_cb("Authenticating with Spotify...")
-    try:
-        cache_path = str(CACHE_DIR_DEFAULT / ".spotify_cache")
-        auth = SpotifyOAuth(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=REDIRECT_URI,
-            scope=SPOTIFY_SCOPE,
-            cache_path=cache_path,
-            open_browser=True,
-        )
-        sp = spotipy.Spotify(auth_manager=auth)
-        return sp
-    except Exception as exc:
-        logger.exception("Failed to authenticate with Spotify")
-        if progress_cb:
-            progress_cb(f"Auth failed: {exc}")
-        return None
+
+    cache_path = str(CACHE_DIR_DEFAULT / ".spotify_cache")
+    auth = SpotifyOAuth(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=REDIRECT_URI,
+        scope=SPOTIFY_SCOPE,
+        cache_path=cache_path,
+        open_browser=True,
+    )
+    sp = spotipy.Spotify(auth_manager=auth)
+    user = sp.current_user()
+    return SpotifyCallProxy(sp), user["id"]
 
 
 def get_own_playlists(sp, user_id):
@@ -245,11 +247,11 @@ def get_playlist_tracks(sp, playlist_id):
         for item in items:
             if not item:
                 continue
-            t = item.get("item")
+            t = item.get("track")
             if not t:
                 skipped_unplayable += 1
                 continue
-            if item.get("is_local"):
+            if item.get("is_local"):  # top-level field on the wrapper item, NOT inside "track" — correct as-is
                 skipped_unplayable += 1
                 continue
             if t.get("type") != "track":

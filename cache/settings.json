@@ -16,7 +16,7 @@
   "w_freq_balance": 0.08,
   "artist_penalty": 0.18,
   "album_penalty": 0.3,
-  "duration_tolerance": 0.01,
+  "duration_tolerance": 0.1,
   "local_music_dir": ".\\local_music",
   "llm_backend": "deepseek",
   "ollama_model": "gemma4:26b",

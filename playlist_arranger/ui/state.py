@@ -121,6 +121,17 @@ _EXPECTED_FEATURE_KEYS = frozenset({
 })
 
 
+# ─── Status constants (shared across all pages / test code) ─────────────────
+STATUS_OK = "✓ OK"
+STATUS_NOT_IN_DB = "✗ Not in DB"
+STATUS_CORRUPT = "✗ Corrupt DB entry"
+STATUS_NO_EMBEDDING = "✗ No embedding"
+STATUS_EMBEDDING_MISSING = "✗ Embedding file missing"
+STATUS_INCOMPLETE = "✗ Incomplete features"
+STATUS_DURATION_MISMATCH = "✗ Duration mismatch"
+STATUS_MISSING_ID = "✗ Missing ID"
+
+
 def get_track_status(track: dict) -> str:
     """Unified per-track status check used by playlist tables, queue table, and TrackTable.
 
@@ -140,38 +151,38 @@ def get_track_status(track: dict) -> str:
 
     tid = track.get("id", "")
     if not tid:
-        return "✗ Missing ID"
+        return STATUS_MISSING_ID
 
     entry = _db.get_track(tid)
 
     # 1. Not in DB
     if entry is None:
-        return "✗ Not in DB"
+        return STATUS_NOT_IN_DB
 
     # Edge case: entry is not a dict or is empty
     if not isinstance(entry, dict) or not entry:
-        return "✗ Corrupt DB entry"
+        return STATUS_CORRUPT
 
     # 3. No embedding reference
     emb_file = entry.get("embedding_file")
     if not emb_file:
-        return "✗ No embedding"
+        return STATUS_NO_EMBEDDING
 
     # 4. Embedding file path set but file missing/corrupt
     s = load_settings()
     emb_path = _pl.Path(s.embeds_dir / f"{tid}.npy")
     if not emb_path.exists():
-        return "✗ Embedding file missing"
+        return STATUS_EMBEDDING_MISSING
 
     # 5. No features dict
     features = entry.get("features")
     if not isinstance(features, dict) or not features:
-        return "✗ Incomplete features"
+        return STATUS_INCOMPLETE
 
     # 6. Check for complete feature key set
     existing_keys = set(features.keys())
     if not _EXPECTED_FEATURE_KEYS.issubset(existing_keys):
-        return "✗ Incomplete features"
+        return STATUS_INCOMPLETE
 
     # 7. Duration mismatch
     real_dur = track.get("duration_ms", 0)
@@ -179,9 +190,9 @@ def get_track_status(track: dict) -> str:
     if real_dur > 0 and stored_dur > 0:
         diff = abs(stored_dur - real_dur) / real_dur
         if diff > DURATION_TOLERANCE:
-            return "✗ Duration mismatch"
+            return STATUS_DURATION_MISMATCH
 
-    return "✓ OK"
+    return STATUS_OK
 
 
 # Backward-compatible alias used by components/track_table.py and main.py
@@ -191,7 +202,7 @@ def get_track_needs_analysis(track_id: str, real_duration_ms=None) -> str | None
     if real_duration_ms is not None:
         track["duration_ms"] = real_duration_ms
     status = get_track_status(track)
-    if status == "✓ OK":
+    if status == STATUS_OK:
         return None
     # Map new status strings to legacy reasons
     return status.replace("✗ ", "")

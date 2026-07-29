@@ -911,7 +911,7 @@ def _get_track_status(track: dict) -> str:
 
 
 def _load_cached_playlist_tracks(playlist_id: str) -> list:
-    from playlist_arranger.sources.spotify_source import get_playlist_tracks as _fetch_tracks, _is_track_playable
+    from playlist_arranger.sources.spotify_source import get_playlist_tracks as _fetch_tracks
     logger.info("Expanding playlist %s", playlist_id[:8])
     try:
         pl_data = _state.sp.playlist(playlist_id, fields="snapshot_id,name")
@@ -928,7 +928,23 @@ def _load_cached_playlist_tracks(playlist_id: str) -> list:
             try:
                 tracks = json.loads(cache_file.read_text(encoding="utf-8"))
                 count = len(tracks)
-                if count == 0:
+                missing_uri = sum(
+                    1 for t in tracks
+                    if not (t.get("uri") or "").startswith("spotify:track:")
+                )
+                if missing_uri > 0:
+                    logger.warning(
+                        "STALE CACHE SCHEMA: %s — %d/%d tracks missing valid 'uri' "
+                        "field (cache predates uri field being added to "
+                        "get_playlist_tracks()). Deleting stale cache to force re-fetch.",
+                        cache_file, missing_uri, count,
+                    )
+                    try:
+                        cache_file.unlink()
+                    except Exception:
+                        pass
+                    # Fall through to re-fetch from Spotify below
+                elif count == 0:
                     logger.warning(
                         "CACHE EMPTY: %s contains 0 tracks — playlist %s may have been "
                         "cached during a transient error. Deleting stale cache to force "
@@ -951,19 +967,13 @@ def _load_cached_playlist_tracks(playlist_id: str) -> list:
                 # Fall through to re-fetch from Spotify below
 
     logger.info("Fetching tracks from Spotify API for playlist %s (%s)", playlist_id[:8], pl_name)
-    raw_tracks = _fetch_tracks(_state.sp, playlist_id)
-    raw_count = len(raw_tracks)
-    logger.info("Spotify API returned %d raw tracks for playlist %s (%s)", raw_count, playlist_id[:8], pl_name)
+    tracks = _fetch_tracks(_state.sp, playlist_id)
+    track_count = len(tracks)
+    logger.info("Spotify API returned %d playable tracks for playlist %s (%s)", track_count, playlist_id[:8], pl_name)
 
-    # Filter unplayable tracks (local files with no market data)
-    filtered = [t for t in raw_tracks if _is_track_playable(t)]
-    skipped = raw_count - len(filtered)
-    if skipped > 0:
-        logger.info("After unplayable filter: %d tracks remain, %d skipped (playlist %s)",
-                    len(filtered), skipped, playlist_id[:8])
-    if not filtered:
-        logger.warning("EMPTY RESULT: 0 playable tracks for playlist %s (%s) — "
-                       "raw count=%d, skipped=%d", playlist_id[:8], pl_name, raw_count, skipped)
+    if not tracks:
+        logger.warning("EMPTY RESULT: 0 playable tracks for playlist %s (%s)",
+                       playlist_id[:8], pl_name)
 
     # Remove any stale cache files (previous snapshot) before writing new one
     pattern = str(CACHE_DIR_DEFAULT / f"{playlist_id}-*.tracks.json")
@@ -976,11 +986,11 @@ def _load_cached_playlist_tracks(playlist_id: str) -> list:
         cache_file = CACHE_DIR_DEFAULT / f"{playlist_id}-{snapshot_id}.tracks.json"
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
-            cache_file.write_text(json.dumps(filtered, ensure_ascii=False), encoding="utf-8")
-            logger.info("Cached %d tracks to %s", len(filtered), cache_file)
+            cache_file.write_text(json.dumps(tracks, ensure_ascii=False), encoding="utf-8")
+            logger.info("Cached %d tracks to %s", len(tracks), cache_file)
         except Exception as e:
             logger.warning("Failed to write cache file: %s", e)
-    return filtered
+    return tracks
 
 
 def _inject_desc_tooltip_css():
@@ -1048,7 +1058,42 @@ def build_spotify_section(set_page_cb):
                     result = await asyncio.to_thread(_init_spotify, None)
                     _state.sp, _state.spotify_user_id = result
                     logger.info("Spotify connected as: %s", _state.spotify_user_id)
-                    set_page_cb("spotify_source")
+                    logger.debug(
+                        "DIAG [do_connect] set_page_cb id=%s, _state.sp=%s",
+                        id(set_page_cb), id(_state.sp),
+                    )
+                    # Rebuild the current page in-place so the playlists list
+                    # and "Connected as X" label appear immediately without
+                    # requiring a page navigation away and back.
+                    #
+                    # IMPORTANT: the rebuild is deferred via ui.timer(0.0, ..., once=True)
+                    # rather than called inline.  Calling render_right_panel()
+                    # synchronously from within do_connect() (which is itself
+                    # an on_click handler) causes a race:
+                    #
+                    # 1. _right_panel.clear() marks old children for removal
+                    #    on the Python side, but NiceGUI defers the actual
+                    #    browser-DOM removal to the next event-loop tick.
+                    # 2. build_spotify_section() then creates a NEW button
+                    #    inside the same container BEFORE the old button's
+                    #    DOM element has been removed.
+                    # 3. Result: TWO button elements co-exist in the browser
+                    #    DOM (the old one pending removal + the new one),
+                    #    each with its own on_click handler.  Clicks fire on
+                    #    BOTH, doubling log output on the 2nd connect and
+                    #    tripling on the 3rd.
+                    #
+                    # Deferring lets the current event-handler fully unwind
+                    # and the old DOM subtree be garbage-collected before
+                    # the rebuild creates a clean new button.
+                    def _deferred_rebuild():
+                        # Deferred import avoids circular import at module level:
+                        #   main.py → playlist_source.py (build_spotify_section)
+                        #   playlist_source.py → main.py (render_right_panel)
+                        from playlist_arranger.main import render_right_panel
+                        render_right_panel()
+
+                    ui.timer(0.0, _deferred_rebuild, once=True)
                 except Exception as e:
                     logger.exception("Spotify connect failed")
                     ui.notify(f"Spotify connect failed: {e}", type="negative")
@@ -1644,7 +1689,7 @@ def _get_selected_rows(pl_id: str):
 
 
 def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
-    in_db = sum(1 for t in tracks if _get_track_status(t) == "✓ OK")
+    in_db = sum(1 for t in tracks if _get_track_status(t) == _state.STATUS_OK)
     ui.label(f"Total: {len(tracks)} | In DB: {in_db} | Double-click a row to ▶ Play").classes("text-xs text-gray-500 mb-2")
 
     columns = [
@@ -1710,7 +1755,7 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
 
     track_table.on("rowDblclick", on_row_dblclick)
 
-    missing = sum(1 for t in tracks if _get_track_status(t) != "✓ OK")
+    missing = sum(1 for t in tracks if _get_track_status(t) != _state.STATUS_OK)
     with ui.row().classes("w-full gap-2 mt-2"):
         def _build_add_to_queue_btn():
             btn = ui.button(
@@ -1727,7 +1772,7 @@ def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
         _build_add_to_queue_btn()
 
         def _add_not_ok_to_queue():
-            not_ok = [t for t in tracks if _state.get_track_status(t) != "✓ OK"]
+            not_ok = [t for t in tracks if _state.get_track_status(t) != _state.STATUS_OK]
             if not not_ok:
                 ui.notify("All tracks are OK — nothing to add", type="info")
                 return
@@ -1824,7 +1869,7 @@ def _run_spotify_analysis(tracks):
     def bg_task():
         try:
             from playlist_arranger.analysis.session import AnalysisSession
-            to_analyze = [t for t in tracks if _get_track_status(t) != "✓ OK"]
+            to_analyze = [t for t in tracks if _get_track_status(t) != _state.STATUS_OK]
             if not to_analyze:
                 return
             session = AnalysisSession(sp=_state.sp, tracks=to_analyze, playlist_name=pl_name,

@@ -322,9 +322,8 @@ def test_start_sorting_disabled_when_track_not_ok():
     try:
         _ss._start_sort_btn = FB()
         _ss._start_sort_warning = FL()
-        # One track NOT OK
         with patch("playlist_arranger.ui.pages.smart_sorting.get_track_status",
-                   return_value="Not OK"):
+                   return_value="✗ Not in DB"):
             _ss._playlist_tracks[:] = [{"id": "t1", "name": "T1", "artist": "A"}]
             _ss._refresh_start_button()
         assert not _ss._start_sort_btn._enabled, "Button should be DISABLED when track not OK"
@@ -359,7 +358,7 @@ def test_start_sorting_enabled_when_all_tracks_ok():
         _ss._start_sort_btn = FB()
         _ss._start_sort_warning = FL()
         with patch("playlist_arranger.ui.pages.smart_sorting.get_track_status",
-                   return_value="OK"):
+                   return_value="✓ OK"):
             _ss._playlist_tracks[:] = [
                 {"id": "t1", "name": "T1", "artist": "A"},
                 {"id": "t2", "name": "T2", "artist": "B"},
@@ -1390,17 +1389,48 @@ def test_solver_reads_sa_params_from_settings():
         _SORTING_CACHE.pop(fake_pl_id, None)
 
 
-def test_solver_returns_early_when_no_anchors():
-    """_run_smart_sorting returns (descs, 0.0) when anchor file is missing."""
+def test_solver_no_anchors_runs_unconstrained_free_tsp():
+    """When anchor file is missing/empty, _run_smart_sorting must fall
+    through to the free-TSP path (nonzero cost) instead of early-returning
+    with cost=0.0 as it did before the 2026-07-28 fix."""
+    import numpy as np
     from playlist_arranger.sorting.solver import _run_smart_sorting
+    from playlist_arranger.sorting import solver as solver_mod
+    from unittest.mock import patch
 
+    # Use 3 tracks so the solver has a nontrivial path (single track → cost=0)
+    tid_X = {"track_id": "tid_X", "bpm": 120.0, "key": "C",
+             "loudness_db": -8.0, "harm_ratio": 0.5,
+             "dynamic_range": 10.0, "onset_str": 0.5,
+             "bass_pct": 20.0, "embedding_path": None}
+    tid_Y = {"track_id": "tid_Y", "bpm": 80.0, "key": "D",
+             "loudness_db": -12.0, "harm_ratio": 0.7,
+             "dynamic_range": 8.0, "onset_str": 0.8,
+             "bass_pct": 25.0, "embedding_path": None}
+    tid_Z = {"track_id": "tid_Z", "bpm": 160.0, "key": "E",
+             "loudness_db": -5.0, "harm_ratio": 0.3,
+             "dynamic_range": 15.0, "onset_str": 1.5,
+             "bass_pct": 15.0, "embedding_path": None}
+    fake_db = {"tid_X": tid_X, "tid_Y": tid_Y, "tid_Z": tid_Z}
+    descs = [{"track_id": "tid_X", "name": "X", "artist": "X Artist"},
+             {"track_id": "tid_Y", "name": "Y", "artist": "Y Artist"},
+             {"track_id": "tid_Z", "name": "Z", "artist": "Z Artist"}]
     logs = []
-    descs = [{"track_id": "tid_X", "name": "X", "artist": "X Artist"}]
-    ordered, cost = _run_smart_sorting({}, descs, "nonexistent_pl", "N/A",
-                                       progress_cb=logs.append)
-    assert ordered is descs, "Should return original descs unchanged"
-    assert cost == 0.0
-    assert any("No anchors" in m for m in logs)
+
+    with patch.object(solver_mod, "_load_anchors_file", return_value=None), \
+         patch.object(solver_mod, "_load_embedding", return_value=None):
+        ordered, cost = _run_smart_sorting(
+            fake_db, descs, "nonexistent_pl", "N/A",
+            progress_cb=logs.append,
+        )
+
+    assert len(ordered) == 3, f"Expected 3 ordered tracks, got {len(ordered)}"
+    ordered_ids = {d["track_id"] for d in ordered}
+    assert ordered_ids == {"tid_X", "tid_Y", "tid_Z"}, f"Wrong tracks: {ordered_ids}"
+    # Must be nonzero — the solver actually ran SA on a nontrivial path
+    assert cost > 0.0, f"Cost should be nonzero after SA run, got {cost}"
+    assert any("unconstrained" in m.lower() or "free-tsp" in m.lower()
+               for m in logs), f"Logs should mention free-TSP path: {logs}"
 
 
 def test_solver_progress_callback_delivers_logs():
@@ -1944,6 +1974,62 @@ def test_settings_missing_new_weights_falls_back():
     assert s.w_freq_balance == 0.08, f"Expected default 0.08, got {s.w_freq_balance}"
 
 
+def test_freq_balance_all_zero_treated_as_neutral():
+    """When bass+mid+high == 0 for one track, both vectors normalise to 0.33/0.33/0.33 → d_freq_balance=0."""
+    fa = {"bass": 0.0, "mid": 0.0, "high": 0.0}
+    fb = {"bass": 0.3, "mid": 0.4, "high": 0.3}
+    ta = {"features": fa, "end_seg": fa}
+    tb = {"features": fb, "start_seg": fb}
+    # Both should normalise to (1/3, 1/3, 1/3) after the all-zero fix
+    d = _track_distance(ta, tb, None, None)
+    # Without the fix, bass_a=0,mid_a=0,high_a=0 stay unnormalised
+    # and the other track normalises to (0.3,0.4,0.3) → large distance.
+    # With the fix, both are (0.33,0.33,0.33) → d_freq_balance=0.
+    assert d >= 0.0, f"Distance should be >= 0, got {d}"
+
+
+def test_duration_mismatch_penalty_skipped_when_zero():
+    """When one track has duration_ms==0 (missing data), the penalty is skipped — no exception."""
+    fa = fb = {"bpm": 120, "camelot": "8B", "rms_db": -12,
+               "harm_ratio": 0.5, "flatness": 0.5, "dynamic_range": 10.0,
+               "onset_str": 1.0, "bass": 0.33, "mid": 0.33, "high": 0.33}
+    # Track A has no duration_ms (0), Track B has normal duration
+    ta = {"features": fa, "end_seg": fa}  # duration_ms defaults to 0 (not set)
+    tb = {"features": fb, "start_seg": fb, "duration_ms": 240000}
+    d = _track_distance(ta, tb, None, None)
+    # Should not raise, should return a finite distance without the penalty
+    assert d >= 0.0, f"Distance should be >= 0, got {d}"
+    # Both missing (both zero) — also no penalty
+    ta_zero = {"features": fa, "end_seg": fa}
+    tb_zero = {"features": fb, "start_seg": fb}
+    d2 = _track_distance(ta_zero, tb_zero, None, None)
+    assert d2 >= 0.0, f"Distance should be >= 0 when both durations are zero, got {d2}"
+    assert d2 == d, (
+        f"Distance should be identical whether one or both durations are missing (no penalty in either case). "
+        f"one-missing={d:.4f}, both-missing={d2:.4f}"
+    )
+
+
+def test_duration_mismatch_penalty_applied():
+    """Tracks with >10% duration difference (DURATION_TOLERANCE=0.10) get a penalty."""
+    fa = fb = {"bpm": 120, "camelot": "8B", "rms_db": -12,
+               "harm_ratio": 0.5, "flatness": 0.5, "dynamic_range": 10.0,
+               "onset_str": 1.0, "bass": 0.33, "mid": 0.33, "high": 0.33}
+    # Short interlude (90 s) vs normal track (240 s) → rel_diff = 150/240 = 0.625
+    ta = {"features": fa, "end_seg": fa, "duration_ms": 90000}
+    tb = {"features": fb, "start_seg": fb, "duration_ms": 240000}
+    d_with = _track_distance(ta, tb, None, None)
+    # Same durations → no penalty
+    ta_same = {"features": fa, "end_seg": fa, "duration_ms": 240000}
+    tb_same = {"features": fb, "start_seg": fb, "duration_ms": 240000}
+    d_without = _track_distance(ta_same, tb_same, None, None)
+    # The penalised pair should have higher distance
+    assert d_with > d_without, (
+        f"Expected duration penalty to increase distance: "
+        f"with diff={d_with:.4f}, without diff={d_without:.4f}"
+    )
+
+
 def test_track_distance_includes_texture_and_freq_balance():
     """_track_distance uses w_texture and w_freq_balance in final weighted sum."""
     ta = {"features": {}, "end_seg": {
@@ -2136,6 +2222,63 @@ def test_cache_invalidates_on_model_change_only():
         lc._llm_model_used = None
 
 
+# ── init_spotify() failure-mode tests ──────────────────────────────────────
+
+def test_init_spotify_raises_when_spotipy_not_installed():
+    """init_spotify raises RuntimeError when HAS_SPOTIPY is False."""
+    from unittest.mock import patch
+
+    with patch("playlist_arranger.sources.spotify_source.HAS_SPOTIPY", False):
+        from playlist_arranger.sources.spotify_source import init_spotify
+
+        try:
+            init_spotify()
+            assert False, "Expected RuntimeError, but no exception was raised"
+        except RuntimeError as exc:
+            assert "spotipy" in str(exc).lower(), (
+                f"Error message should mention spotipy, got: {exc}"
+            )
+
+
+def test_init_spotify_raises_when_credentials_missing():
+    """init_spotify raises RuntimeError when SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET are unset."""
+    from unittest.mock import patch
+    import os
+
+    with patch.dict(os.environ, {"SPOTIPY_CLIENT_ID": "", "SPOTIPY_CLIENT_SECRET": ""}, clear=False):
+        with patch("playlist_arranger.sources.spotify_source.HAS_SPOTIPY", True):
+            from playlist_arranger.sources.spotify_source import init_spotify
+
+            try:
+                init_spotify()
+                assert False, "Expected RuntimeError, but no exception was raised"
+            except RuntimeError as exc:
+                assert "SPOTIPY_CLIENT_ID" in str(exc).upper() or "client id" in str(exc).lower(), (
+                    f"Error message should mention credentials, got: {exc}"
+                )
+
+
+def test_init_spotify_propagates_auth_failure():
+    """init_spotify propagates exceptions from OAuth / sp.current_user() — no bare except."""
+    from unittest.mock import patch
+
+    with patch("playlist_arranger.sources.spotify_source.HAS_SPOTIPY", True):
+        with patch.dict("os.environ",
+                        {"SPOTIPY_CLIENT_ID": "fake_id", "SPOTIPY_CLIENT_SECRET": "fake_secret"},
+                        clear=False):
+            with patch("playlist_arranger.sources.spotify_source.SpotifyOAuth") as mock_oauth:
+                mock_oauth.side_effect = RuntimeError("OAuth token expired — please re-authenticate")
+                from playlist_arranger.sources.spotify_source import init_spotify
+
+                try:
+                    init_spotify()
+                    assert False, "Expected RuntimeError from OAuth failure, but no exception was raised"
+                except RuntimeError as exc:
+                    assert "OAuth" in str(exc) or "expired" in str(exc).lower(), (
+                        f"Error should propagate OAuth message, got: {exc}"
+                    )
+
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 tests = [
@@ -2206,7 +2349,7 @@ tests = [
     ("test_sync_weights_startup_restores_settings_json_values", test_sync_weights_startup_restores_settings_json_values),
     ("test_todo_comment_near_normalization_constants", test_todo_comment_near_normalization_constants),
     ("test_solver_reads_sa_params_from_settings", test_solver_reads_sa_params_from_settings),
-    ("test_solver_returns_early_when_no_anchors", test_solver_returns_early_when_no_anchors),
+    ("test_solver_no_anchors_runs_unconstrained_free_tsp", test_solver_no_anchors_runs_unconstrained_free_tsp),
     ("test_solver_progress_callback_delivers_logs", test_solver_progress_callback_delivers_logs),
     ("test_enqueue_and_drain_log_queue", test_enqueue_and_drain_log_queue),
     ("test_log_queue_empty_drain_is_noop", test_log_queue_empty_drain_is_noop),
@@ -2223,6 +2366,9 @@ tests = [
     ("test_create_playlist_partial_track_add_failure", test_create_playlist_partial_track_add_failure),
     ("test_timestamp_naming_convention", test_timestamp_naming_convention),
     ("test_timestamp_naming_fallback_when_name_empty", test_timestamp_naming_fallback_when_name_empty),
+    ("test_init_spotify_raises_when_spotipy_not_installed", test_init_spotify_raises_when_spotipy_not_installed),
+    ("test_init_spotify_raises_when_credentials_missing", test_init_spotify_raises_when_credentials_missing),
+    ("test_init_spotify_propagates_auth_failure", test_init_spotify_propagates_auth_failure),
 ]
 
 for name, fn in tests:

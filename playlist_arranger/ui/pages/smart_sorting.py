@@ -23,7 +23,7 @@ from playlist_arranger.cache.store import atomic_write_json
 from playlist_arranger.config import ANCHORS_DIR_DEFAULT
 from playlist_arranger.sorting.anchors import _load_anchors_file
 from playlist_arranger.ui.components.track_rows import build_track_rows
-from playlist_arranger.ui.state import get_track_status
+from playlist_arranger.ui.state import get_track_status, STATUS_OK
 from playlist_arranger.config import load_settings
 
 logger = logging.getLogger(__name__)
@@ -361,13 +361,13 @@ def _refresh_start_button():
     if _start_sort_btn is None:
         return
     all_ok = len(_playlist_tracks) > 0 and all(
-        get_track_status(t) == "OK" for t in _playlist_tracks
+        get_track_status(t) == STATUS_OK for t in _playlist_tracks
     )
     _start_sort_btn.set_enabled(all_ok)
 
     if _start_sort_warning is not None:
         if not all_ok and _playlist_tracks:
-            missing = sum(1 for t in _playlist_tracks if get_track_status(t) != "OK")
+            missing = sum(1 for t in _playlist_tracks if get_track_status(t) != STATUS_OK)
             _start_sort_warning.set_text(
                 f"{missing} track(s) missing audio features — analyze them first"
             )
@@ -414,7 +414,8 @@ def _update_logs_summary():
         f"transition={s.w_transition:.2f}, key={s.w_key:.2f}, "
         f"energy={s.w_energy:.2f}, texture={s.w_texture:.2f}, "
         f"freq_balance={s.w_freq_balance:.2f}",
-        f"Penalties: artist={s.artist_penalty:.3f}, album={s.album_penalty:.3f}",
+        f"Penalties: artist={s.artist_penalty:.3f}, album={s.album_penalty:.3f}, "
+        f"duration_tolerance={s.duration_tolerance:.3f}",
         f"SA: iterations_multiplier={s.sa_iterations_multiplier}, "
         f"n_runs={s.sa_n_runs}, T_start={s.sa_T_start:.4g}, "
         f"T_end={s.sa_T_end:.4g}",
@@ -433,14 +434,23 @@ async def _on_start_sorting():
         ui.notify("No playlist selected", type="warning")
         return
 
-    # Validate anchor plan exists
+    # Load anchor plan (may be None or contain only placeholders).
+    # If no anchors are present, proceed with an unconstrained free-TSP
+    # sort — the solver's _solve_atsp_with_anchors() already handles
+    # anchors=[] natively via its `if not anchors:` branch.
     plan = _load_anchors_file(pl_id)
-    if plan is None or sum(1 for e in plan if e["type"] == "anchor") == 0:
-        ui.notify(
-            "No anchors found for this playlist — create anchors first on the Anchors page",
-            type="warning",
+    n_anchor_entries = sum(1 for e in (plan or []) if e["type"] == "anchor") if plan else 0
+    if n_anchor_entries == 0:
+        logger.info(
+            "No anchors for playlist %s — running unconstrained free-TSP sort "
+            "over all %d tracks (optimal path, no anchor pinning)",
+            pl_id[:8] if pl_id else "?", len(_playlist_tracks),
         )
-        return
+        ui.notify(
+            "No anchors set — sorting all tracks freely for the optimal order",
+            type="info",
+        )
+        # Deliberately NOT returning — fall through to the solver call below.
 
     # Validate tracks are loaded
     if not _playlist_tracks:
@@ -531,10 +541,22 @@ async def _on_start_sorting():
         tid = d.get("track_id", "")
         full = next((t for t in _playlist_tracks if t.get("id") == tid), d)
         sorted_full_tracks.append(full)
-    _sorted_track_uris = [
-        t.get("uri", "") for t in sorted_full_tracks
-        if (t.get("uri") or "").startswith("spotify:track:")
-    ]
+    _sorted_track_uris = []
+    _dropped_no_id = 0
+    for t in sorted_full_tracks:
+        uri = t.get("uri") or ""
+        if not uri.startswith("spotify:track:"):
+            tid = t.get("id") or t.get("track_id") or ""
+            uri = f"spotify:track:{tid}" if tid else ""
+        if uri.startswith("spotify:track:"):
+            _sorted_track_uris.append(uri)
+        else:
+            _dropped_no_id += 1
+    if _dropped_no_id:
+        logger.warning(
+            "%d track(s) dropped from save list — no track_id/uri available",
+            _dropped_no_id,
+        )
 
     if _results_container is not None:
         _results_container.clear()

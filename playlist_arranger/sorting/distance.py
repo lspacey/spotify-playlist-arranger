@@ -196,17 +196,24 @@ def _track_distance(ta: dict, tb: dict, emb_a, emb_b,
     mid_b = float(start_b.get("mid", fb.get("mid", 0.33)))
     high_b = float(start_b.get("high", fb.get("high", 0.33)))
 
-    # Normalize each vector to unit sum (handle zero vectors)
+    # Normalize each vector to unit sum.  If a vector sums to (near) zero
+    # (silence / missing data), treat it as neutral 0.33/0.33/0.33 so the
+    # distance computation doesn't compare an unnormalized (0,0,0) against a
+    # normalized unit vector, which would produce a misleading result.
     sum_a = bass_a + mid_a + high_a
     sum_b = bass_b + mid_b + high_b
     if sum_a > 1e-9:
         bass_a /= sum_a
         mid_a /= sum_a
         high_a /= sum_a
+    else:
+        bass_a = mid_a = high_a = 1.0 / 3.0
     if sum_b > 1e-9:
         bass_b /= sum_b
         mid_b /= sum_b
         high_b /= sum_b
+    else:
+        bass_b = mid_b = high_b = 1.0 / 3.0
 
     d_freq = np.sqrt((bass_a - bass_b) ** 2 + (mid_a - mid_b) ** 2 + (high_a - high_b) ** 2)
     d_freq_balance = min(d_freq / np.sqrt(2.0), 1.0)  # normalize to [0,1]
@@ -229,6 +236,18 @@ def _track_distance(ta: dict, tb: dict, emb_a, emb_b,
         base += _cfg.ALBUM_PENALTY
     elif artist_a and artist_b and (artist_a & artist_b):
         base += _cfg.ARTIST_PENALTY
+
+    # ─── Duration mismatch penalty ───────────────────────────────────────
+    # Large relative duration mismatches (e.g. 90s interlude → 360s epic)
+    # create jarring transitions.  Only apply the penalty when both
+    # durations are known and differ beyond the configured tolerance.
+    dur_a_ms = ta.get("duration_ms", 0)
+    dur_b_ms = tb.get("duration_ms", 0)
+    if dur_a_ms > 0 and dur_b_ms > 0:
+        rel_diff = abs(dur_a_ms - dur_b_ms) / max(dur_a_ms, dur_b_ms)
+        if rel_diff > _cfg.DURATION_TOLERANCE:
+            dur_penalty = min(rel_diff * 0.5, 1.0) * 0.10
+            base += dur_penalty
 
     return min(base, 1.0 + _cfg.ALBUM_PENALTY)
 

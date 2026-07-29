@@ -197,13 +197,19 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
 
     plan = _load_anchors_file(pl_id)
     if not plan:
-        _log("No anchors found. Please create anchors first.")
-        return descs, 0.0
+        plan = [{"type": "placeholder"}]
 
     n_anchors = sum(1 for e in plan if e["type"] == "anchor")
     if n_anchors == 0:
-        _log("No anchors in plan — nothing to sort.")
-        return descs, 0.0
+        _log(
+            "No anchors in plan — running unconstrained free-TSP sort over "
+            "all tracks (single open slot, no anchor pinning)."
+        )
+        plan = [{"type": "placeholder"}]
+        # Deliberately NOT returning — fall through. The subsequent
+        # index-array construction below naturally produces anchors_idx=[]
+        # and slots=[True] for this plan, which _solve_atsp_with_anchors()
+        # already handles via its `if not anchors:` free-TSP branch.
 
     # Build index arrays
     desc_by_id = {d["track_id"]: d for d in descs}

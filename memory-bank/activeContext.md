@@ -1,9 +1,14 @@
 # Active Context
 
 ## Current Work Focus
-Anchors page stabilization pass completed (2026-07-24): multi-backend LLM dropdown, ui.notify() ordering fix, session-level Generate Anchors panel persistence, and per-backend client cache de-risking. Test suite at 209/209 passing. All previous description queue infrastructure and batch analysis remain stable.
+Bug fix (2026-07-28): Fixed critical playlist track fetching bug where redundant `_is_track_playable()` filtering in `_load_cached_playlist_tracks()` killed ALL tracks after `get_playlist_tracks()` already filtered and flattened them. App consistently returned 0 tracks for every Spotify playlist.
 
 ## Recent Changes
+
+### 2026-07-28 — Playlist track fetching bug fix (double-filtering)
+- **Root cause**: `_load_cached_playlist_tracks()` in `playlist_source.py` called `get_playlist_tracks()` (which already filters unplayable tracks and returns flattened dicts), then did a SECOND pass with `_is_track_playable()` on those flattened dicts. `_is_track_playable()` expects raw Spotify API items with a nested `track` key — given flattened dicts, `track.get("type")` returned `None` (not `"track"`), causing every track to be filtered out. Result: always 0 tracks, always empty caches.
+- **Fix**: Removed redundant `_is_track_playable()` second-pass filtering and its import from `playlist_source.py`. `get_playlist_tracks()` already handles all unplayable filtering internally. Log message clarified from "raw tracks" to "playable tracks".
+- **Test**: `tests/test_stale_cache_schema.py` passes (1/1).
 
 ### 2026-07-24 — Anchors page stabilization pass (4 bugs fixed)
 - **Bug 1 — Multi-backend LLM model dropdown**: Replaced read-only model label with user-selectable dropdown in Generate Anchors panel. `_available_backend_models()` lists all backends with valid credentials (Ollama always, DeepSeek/Mistral if API keys present). `_on_run_generate` closure-captures `selected_backend` + `selected_model` and passes `backend=selected_backend, model_override=selected_model` to `_init_llm_client()`. 3 tests added.

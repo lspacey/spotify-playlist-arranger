@@ -66,6 +66,15 @@ def set_page(page_name: str) -> None:
 def render_right_panel() -> None:
     """Render the current page content in the right panel."""
     global _right_panel
+    _refresh_nav_buttons()  # keep Anchors/Sorting enabled-state in sync
+                            # with _state.sp on every panel refresh —
+                            # do_connect()'s deferred rebuild calls this
+                            # function directly, bypassing set_page(),
+                            # so nav buttons must be refreshed here too.
+    logger.debug(
+        "DIAG [render_right_panel] container id=%s, page=%s",
+        id(_right_panel) if _right_panel is not None else None, _current_page,
+    )
     try:
         if _right_panel:
             _right_panel.clear()
@@ -75,6 +84,14 @@ def render_right_panel() -> None:
         return
 
     if _right_panel is None:
+        logger.error(
+            "render_right_panel() called but _right_panel is None — this "
+            "usually means playlist_arranger.main was imported as a SECOND, "
+            "independent module object (e.g. because the app was launched "
+            "via 'python -m playlist_arranger.main' instead of "
+            "'python -m playlist_arranger'). Check sys.modules for duplicate "
+            "entries of this module."
+        )
         return
 
     with _right_panel:
@@ -312,5 +329,11 @@ def main():
         logger.info("Playlist Arranger stopped")
 
 
+# WARNING: direct execution as __main__ (e.g. `python -m playlist_arranger.main`)
+# creates a SEPARATE module object from the one other code imports via
+# `from playlist_arranger.main import ...`.  This causes the imported copy
+# to have its own _right_panel=None and stale globals, breaking page rebuilds.
+# Always use `python -m playlist_arranger` (via __main__.py) as the launch
+# command; this guard is kept only for development convenience.
 if __name__ == "__main__":
     main()

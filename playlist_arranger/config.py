@@ -191,9 +191,10 @@ def sync_weights_from_settings(s: "Settings") -> None:
     WEIGHTS["energy"] = s.w_energy
     WEIGHTS["texture"] = s.w_texture
     WEIGHTS["freq_balance"] = s.w_freq_balance
-    global ARTIST_PENALTY, ALBUM_PENALTY
+    global ARTIST_PENALTY, ALBUM_PENALTY, DURATION_TOLERANCE
     ARTIST_PENALTY = s.artist_penalty
     ALBUM_PENALTY = s.album_penalty
+    DURATION_TOLERANCE = s.duration_tolerance
 
 
 # ─── LLM configuration ────────────────────────────────────────────────────────
@@ -231,10 +232,24 @@ LOG_FILE = HOME_DIR / "logs" / "app.log"
 
 
 def setup_logging() -> None:
-    """Configure RotatingFileHandler + console for playlist_arranger namespace."""
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """Configure RotatingFileHandler + console for playlist_arranger namespace.
 
+    IMPORTANT: Must be idempotent — on Windows, NiceGUI's ui.run() uses the
+    ``spawn`` multiprocessing start method via uvicorn, which re-imports
+    ``__main__`` in the child process.  Additionally, ``main.py`` may be
+    re-executed when NiceGUI auto-reload or worker-restart mechanisms
+    re-import the entry module within the SAME process.  Each re-execution
+    calls ``setup_logging()`` on the SAME ``"playlist_arranger"`` logger
+    instance (Python caches loggers by name), and without a guard every call
+    would add another pair of handlers — causing every ``logger.info()`` to
+    fire through N accumulated handler pairs, printing N times.
+    """
     root_logger = logging.getLogger("playlist_arranger")
+    if root_logger.handlers:
+        # Already configured (module re-imported/re-executed) — do not add
+        # duplicate handlers.
+        return
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     root_logger.setLevel(logging.DEBUG)  # handlers filter individually
 
     # Console handler — respects LOG_LEVEL
@@ -282,7 +297,7 @@ class Settings:
 
     artist_penalty: float = 0.18
     album_penalty: float = 0.30
-    duration_tolerance: float = 0.01
+    duration_tolerance: float = 0.10  # 10% — matches DURATION_TOLERANCE default
 
     # Local music
     local_music_dir: str = LOCAL_MUSIC_DIR
