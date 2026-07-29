@@ -38,14 +38,16 @@
 - ✅ Old monolithic `descriptions.py` removed; `load_descriptions`/`save_descriptions` removed from cache/store
 
 ## What's Left to Build
-- [x] **Queue for Analysis feature** — expandable section above "Your Playlists", populated via per-playlist "Add Selected Tracks to Queue for Analysis" button (replaces "Analyze X missing"). Persists to `cache/analysis_queue.json`. Fully isolated from now-playing highlight system. (2026-07-16)
-- [x] **Batch analysis execution logic** — Real sequential playback via `_batch_advance_to_next()` with snapshot+position sequencer, interference detection (`_batch_expected_track_id`), watchdog timer, live queue rendering, thread-safety (RLock), auto-remove analyzed tracks from queue. (2026-07-17/18)
-- [x] **Description generation queue + background worker** — Thread-safe FIFO queue with daemon worker, dedupe, UI buttons, status row, live dialog updates. Old descriptions.py removed. (2026-07-21/22)
-- [x] Expand test suite: 6 Analyze-mode regression tests + ~50 batch-specific regression tests + 36 desc generator tests (125 total)
-- [x] Production-clean verification: `tests/_verify_production_clean.py` ensures `hasattr` checks return False in production
-- [x] **Multi-backend LLM dropdown in Generate Anchors panel** — user can switch between Ollama, DeepSeek, Mistral from dropdown; backend override passed through to `_init_llm_client()` (2026-07-24)
-- [x] **Per-backend client cache** — dict by backend name prevents stale cache when switching backends (2026-07-24)
-- [x] **Session-level panel persistence** — 5 `_gen_last_*` globals remember Generate Anchors panel selections across collapse/expand (in-memory, not disk) (2026-07-24)
+- [x] **Queue for Analysis feature** — (2026-07-16)
+- [x] **Batch analysis execution logic** — (2026-07-17/18)
+- [x] **Description generation queue + background worker** — (2026-07-21/22)
+- [x] Expand test suite: 125 → 303 total (2026-07-29)
+- [x] Production-clean verification (2026-07-29)
+- [x] **Multi-backend LLM dropdown in Generate Anchors panel** (2026-07-24)
+- [x] **Per-backend client cache** (2026-07-24)
+- [x] **Session-level panel persistence** (2026-07-24)
+- [x] **Per-playlist calibration & stats analysis workflow** — `stats_analysis.py`, "Analyze Statistics" UI with weight sliders + CV badges + histograms, solver gating via `stats_cache`, per-component calibration (transition, flatness, dyn_range, onset_str) via `_robust_range()` (2026-07-30)
+- [x] **Distance matrix diagnostics** — CSV dump, histogram PNG, summary stats log line in solver (2026-07-30)
 - [ ] Wire `desc_generator` worker to actually call LLM (placeholder currently)
 - [ ] Wire `run_descriptions()` to `desc_queue_add_many()` + populate `current_descs` from DB
 - [ ] Cross-platform audio capture (macOS/Linux support)

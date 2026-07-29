@@ -162,6 +162,30 @@ _llm_models_used: dict = {}   # model name per backend
 ```
 Cache hit checks both client object AND model name match for the specific requested backend. Legacy `_llm_client`/`_llm_backend_used`/`_llm_model_used` module-level names are updated on cache hit for backward compat with `llm_chat()` which reads them directly.
 
+### 31. Per-Playlist Calibration via `_robust_range()` (2026-07-30)
+Non-trivially-bounded distance components use per-playlist calibration:
+- `dynamic_range`: `_robust_range(feats["dynamic_range"])` → `d_dyn = abs(diff) / dyn_scale`
+- `onset_str`: `_robust_range(feats["onset_str"])` → `d_onset = abs(diff) / onset_scale`
+- `flatness`: `_robust_range(feats["flatness"])` → `d_flat = abs(diff) / flat_scale`
+- `transition`: `_robust_range(raw MFCC cos_dist)` → `d_transition = cos_dist / trans_scale`
+Fixed-range components (bpm/200, key/camelot, energy/60, freq_balance/√2) keep theoretical divisors.
+
+### 32. Stats Analysis Cache with snapshot_id (2026-07-30)
+`stats_analysis.py` implements a cache layer keyed by `(playlist_id, snapshot_id)`:
+- `analyze_playlist_stats()` computes per-component calibration + histograms
+- `save_stats_cache()` persists with pruning (deletes stale snapshot files)
+- `load_stats_cache()` validates snapshot_id + mood_mode + schema completeness
+- JSON schema: `cache/<playlist_id>_<snapshot_id>_stats.json`
+
+### 33. UI Gating via Stats Cache (2026-07-30)
+`smart_sorting.py` gates "Run Sorting" behind a valid stats cache:
+- On playlist select: `load_stats_cache(playlist_id, snapshot_id)` → enable/disable
+- "Analyze Statistics" button runs `analyze_playlist_stats()` in background thread
+- Weight sliders with CV badges (green/yellow/red based on thresholds)
+- "Save & Enable Sorting" writes current slider weights to cache
+- Compact summary state after save ("Analyzed N tracks · weights saved · avg CV X.XX")
+- Mood_mode field detects stale caches when embedding availability changes
+
 **Why**: Switching backends via the dropdown creates new clients per backend. A single-slot cache would silently return the wrong backend's client on subsequent calls. The dict pattern also handles model-only switches (same backend, different model) by checking `cached_model == model` on cache hit.
 
 ### 24. Session-Level In-Memory State Persistence Pattern (2026-07-24)

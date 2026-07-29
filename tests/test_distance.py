@@ -7,7 +7,13 @@ migration (2026-07-29).
 import sys
 sys.path.insert(0, r"e:\Projects\Spotify_playlists\repository")
 
-from playlist_arranger.sorting.distance import _track_distance, WEIGHTS, _SORTING_CACHE
+import numpy as np
+import pytest
+
+from playlist_arranger.sorting.distance import (
+    _track_distance, WEIGHTS, _SORTING_CACHE,
+    _compute_distance_stats, _dump_distance_csv,
+)
 from playlist_arranger.config import Settings, load_settings
 import playlist_arranger.config as _cfg
 from unittest.mock import patch
@@ -155,3 +161,82 @@ def test_todo_comment_near_normalization_constants():
     assert "onset_scale" in content, "distance.py should reference onset_scale"
     assert "robust" in content.lower(), "distance.py should mention robust range"
     assert "_calibrate_texture_scales" in content, "distance.py should contain _calibrate_texture_scales"
+
+
+# ── Distance matrix diagnostics tests ─────────────────────────────────────────
+
+def test_compute_distance_stats_synthetic_5x5():
+    """Given a synthetic 5x5 symmetric matrix with known values, stats are correct."""
+    D = np.array([
+        [0.0, 0.1, 0.2, 0.3, 0.4],
+        [0.1, 0.0, 0.15, 0.25, 0.35],
+        [0.2, 0.15, 0.0, 0.5, 0.6],
+        [0.3, 0.25, 0.5, 0.0, 0.7],
+        [0.4, 0.35, 0.6, 0.7, 0.0],
+    ], dtype=np.float32)
+
+    stats = _compute_distance_stats(D)
+
+    # Off-diagonal entries: 20 values
+    # min=0.1, max=0.7
+    assert stats["n"] == 20, f"Expected 20 off-diagonal entries, got {stats['n']}"
+    assert stats["min"] == pytest.approx(0.1, abs=0.001), f"min: {stats['min']}"
+    assert stats["max"] == pytest.approx(0.7, abs=0.001), f"max: {stats['max']}"
+    # Mean of all 20 off-diagonal values
+    expected_mean = (
+        0.1 + 0.2 + 0.3 + 0.4
+        + 0.1 + 0.15 + 0.25 + 0.35
+        + 0.2 + 0.15 + 0.5 + 0.6
+        + 0.3 + 0.25 + 0.5 + 0.7
+        + 0.4 + 0.35 + 0.6 + 0.7
+    ) / 20.0
+    assert stats["mean"] == pytest.approx(expected_mean, abs=0.001), f"mean: {stats['mean']} vs {expected_mean}"
+    assert stats["median"] == pytest.approx(0.325, abs=0.02)
+    assert stats["std"] > 0.15, f"Expected std > 0.15, got {stats['std']}"
+    # CV = std/mean — should be > 0 for a non-flat matrix
+    assert stats["cv"] > 0.30, f"Expected CV > 0.30 for this non-flat matrix, got {stats['cv']}"
+
+
+def test_compute_distance_stats_flat_matrix():
+    """A nearly-flat matrix yields a very low CV."""
+    D = np.full((4, 4), 0.5, dtype=np.float32)
+    np.fill_diagonal(D, 0.0)
+    stats = _compute_distance_stats(D)
+    # std should be near 0 → CV near 0
+    assert stats["std"] < 0.01, f"Expected std near 0 for flat matrix, got {stats['std']}"
+    assert stats["cv"] < 0.05, f"Expected CV near 0 for flat matrix, got {stats['cv']}"
+    assert stats["min"] == pytest.approx(0.5, abs=0.01)
+    assert stats["max"] == pytest.approx(0.5, abs=0.01)
+
+
+def test_dump_distance_csv_mocked_io(tmp_path):
+    """_dump_distance_csv writes the correct number of rows + header with track names/IDs."""
+    D = np.array([[0.0, 0.25], [0.25, 0.0]], dtype=np.float32)
+    names = ["Song A", "Song B"]
+    ids = ["abc123def456", "xyz789ghi012"]
+    pl_id = "test_playlist_42"
+
+    result = _dump_distance_csv(D, names, ids, pl_id, cache_dir=tmp_path)
+    assert result is not None, "CSV dump should succeed"
+    csv_path = tmp_path / "test_playlist_42_distance_matrix.csv"
+    assert csv_path.exists(), f"Expected {csv_path} to exist"
+
+    content = csv_path.read_text(encoding="utf-8")
+    lines = content.strip().split("\n")
+    # Header + 2 data rows = 3 lines
+    assert len(lines) == 3, f"Expected 3 lines (header + 2 rows), got {len(lines)}"
+    assert "Song A" in lines[0], f"Header should contain track name, got: {lines[0]}"
+    assert "abc123def456" in lines[0], f"Header should contain track ID prefix, got: {lines[0]}"
+    assert "0.000000" in lines[1], "Diagonal cell should be 0.000000"
+    assert "0.250000" in lines[1], "Off-diagonal cell should have distance value"
+
+
+def test_dump_distance_csv_empty_matrix(tmp_path):
+    """_dump_distance_csv on a 1x1 zero matrix still writes a valid CSV."""
+    D = np.zeros((1, 1), dtype=np.float32)
+    result = _dump_distance_csv(D, ["Only Track"], ["id1"], "pl_empty", cache_dir=tmp_path)
+    assert result is not None
+    csv_path = tmp_path / "pl_empty_distance_matrix.csv"
+    assert csv_path.exists()
+    content = csv_path.read_text(encoding="utf-8")
+    assert "Only Track" in content

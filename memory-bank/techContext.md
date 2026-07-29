@@ -40,6 +40,7 @@
 ### Utilities
 | Technology | Version | Purpose |
 |---|---|---|
+| matplotlib | 3.10.8 | Distance histogram + component histogram PNG rendering |
 | Rich | 15.0.0 | Terminal output formatting |
 | python-dotenv | 1.2.2 | .env file loading |
 
@@ -129,6 +130,10 @@ database/
 embeddings/                 # MERT embedding .npy files (per track ID)
 cache/
   settings.json             # Persisted app settings
+  <pl_id>_<snap>_stats.json # Per-playlist calibration stats cache
+  <pl_id>_distance_matrix.csv      # Distance matrix CSV dump (diagnostic)
+  <pl_id>_distance_hist.png        # Distance histogram PNG (diagnostic)
+  <pl_id>_component_hists.png      # Per-component histogram PNG (2×4 composite)
 anchors/
   anchors_<pl_id>.json      # Anchor plans per playlist
   descriptions_<pl_id>.json # Track descriptions per playlist

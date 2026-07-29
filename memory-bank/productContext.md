@@ -43,13 +43,16 @@ Spotify's native playlist management lacks intelligent, sonically-aware reorderi
 - Respects anchor constraints (fixed track positions)
 - Supports placeholders (open slots where solver fills free tracks)
 - 100 runs × adaptive iterations (max(n×500, 5000))
-- Cost function = weighted combination of:
-  - **Mood distance** (35%): cosine distance of MERT embeddings
-  - **Transition smoothness** (25%): MFCC cosine distance between end of track A and start of track B
-  - **BPM drift** (15%): normalized BPM difference
-  - **Key compatibility** (15%): Camelot wheel distance
-  - **Energy continuity** (10%): RMS loudness difference
-- **Penalties**: +0.18 for same artist, +0.30 for same album consecutive tracks
+- Cost function = weighted combination of 7 components:
+  - **Mood** (48%): cosine distance of MERT embeddings or chroma vectors
+  - **Transition** (20%): MFCC cosine distance (per-playlist calibrated via `_robust_range()`)
+  - **BPM** (12%): normalized BPM difference (`|diff|/200`)
+  - **Key** (12%): Camelot wheel distance
+  - **Texture** (10%): harmonic ratio + flatness + dynamic range + onset strength (per-playlist calibrated)
+  - **Energy** (8%): RMS loudness difference (`|diff|/60`)
+  - **Frequency balance** (8%): Euclidean distance of normalized bass/mid/high vectors
+- **Per-playlist calibration**: `flatness`, `dynamic_range`, `onset_str`, and `transition` scales computed via `_robust_range()` on the playlist's actual feature distributions
+- **Penalties**: +0.18 for same artist, +0.30 for same album consecutive tracks; duration mismatch penalty
 
 ### Playlist Structure Types (for AI anchor selection)
 | Structure | Description |

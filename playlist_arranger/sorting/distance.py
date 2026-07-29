@@ -1,5 +1,10 @@
 """Track distance computation for smart sorting."""
 
+import csv
+import logging
+import os
+import pathlib
+
 import numpy as np
 
 import playlist_arranger.config as _cfg
@@ -11,6 +16,8 @@ HOME_DIR = _cfg.HOME_DIR
 
 # ARTIST_PENALTY and ALBUM_PENALTY are read via _cfg in _track_distance()
 # to always pick up the latest value after settings save updates.
+
+logger = logging.getLogger(__name__)
 
 
 def _norm_text(s: str) -> str:
@@ -88,7 +95,8 @@ def _calibrate_texture_scales(all_tracks: list) -> tuple[float, float]:
 
 
 def _track_distance(ta: dict, tb: dict, emb_a, emb_b,
-                    texture_scales=None) -> float:
+                    texture_scales=None, flat_scale=0.01,
+                    transition_scale=0.25) -> float:
     """Compute distance between two tracks using all available features.
 
     Parameters
@@ -96,6 +104,10 @@ def _track_distance(ta: dict, tb: dict, emb_a, emb_b,
     texture_scales : tuple[float, float] | None
         (dyn_range_scale, onset_range_scale) — per-playlist calibrated
         normalization divisors.  If None, defaults to (20.0, 2.0).
+    flat_scale : float
+        Per-playlist flatness calibration divisor.  Defaults to 0.01.
+    transition_scale : float
+        Per-playlist MFCC cosine distance calibration divisor.  Defaults to 0.25.
     """
     if texture_scales is None:
         dyn_scale, onset_scale = 20.0, 2.0
@@ -145,7 +157,7 @@ def _track_distance(ta: dict, tb: dict, emb_a, emb_b,
         va = np.array(mfcc_ea, dtype=np.float32)
         vb = np.array(mfcc_sb, dtype=np.float32)
         n = min(len(va), len(vb))
-        d_transition = min(_cos_dist(va[:n], vb[:n]) / 2.0, 1.0)
+        d_transition = min(_cos_dist(va[:n], vb[:n]) / transition_scale, 1.0)
     else:
         d_transition = 0.5
 
@@ -169,7 +181,7 @@ def _track_distance(ta: dict, tb: dict, emb_a, emb_b,
     # spectral flatness: [0,1] naturally
     flat_a = float(end_a.get("flatness", fa.get("flatness", 0.5)))
     flat_b = float(start_b.get("flatness", fb.get("flatness", 0.5)))
-    d_flat = min(abs(flat_a - flat_b), 1.0)
+    d_flat = min(abs(flat_a - flat_b) / flat_scale, 1.0)
 
     # dynamic range (dB): normalize by per-playlist robust p5-p95 range.
     # If not calibrated, dyn_scale defaults to 20.0 (empirical estimate).
@@ -271,7 +283,7 @@ _SORTING_CACHE = (
 
 def _build_distance_matrix(
     track_indices: list, all_tracks: list, embeddings: list,
-    texture_scales=None,
+    texture_scales=None, flat_scale=0.01, transition_scale=0.25,
 ) -> "np.ndarray":
     """Build pairwise distance matrix for a list of tracks.
 
@@ -280,6 +292,10 @@ def _build_distance_matrix(
     texture_scales : tuple[float, float] | None
         Per-playlist calibration divisors for dynamic_range and onset_str.
         Passed through to ``_track_distance()``.  If None, uses defaults.
+    flat_scale : float
+        Per-playlist flatness calibration divisor.  Defaults to 0.01.
+    transition_scale : float
+        Per-playlist MFCC cosine distance calibration divisor.  Defaults to 0.25.
     """
     n = len(track_indices)
     D = np.zeros((n, n), dtype=np.float32)
@@ -292,5 +308,121 @@ def _build_distance_matrix(
                     embeddings[track_indices[i]],
                     embeddings[track_indices[j]],
                     texture_scales=texture_scales,
+                    flat_scale=flat_scale,
+                    transition_scale=transition_scale,
                 )
     return D
+
+
+# ── Distance matrix diagnostics ──────────────────────────────────────────────
+
+def _compute_distance_stats(D: "np.ndarray") -> dict:
+    """Compute summary statistics over the off-diagonal entries of D.
+
+    Returns a dict with keys: min, max, mean, median, std, cv.
+    ``cv`` is the coefficient of variation (std/mean) — a very low CV
+    (e.g. < 0.15) warns that the matrix is nearly flat and SA has
+    little signal to optimise against.
+    """
+    off_diag = D[D != 0]  # off-diagonal entries (diagonal is always 0)
+    if len(off_diag) == 0:
+        return {"min": 0.0, "max": 0.0, "mean": 0.0, "median": 0.0,
+                "std": 0.0, "cv": 0.0, "n": 0}
+    vals = off_diag.astype(np.float64)
+    mean_v = float(np.mean(vals))
+    std_v = float(np.std(vals))
+    cv_v = std_v / mean_v if mean_v > 1e-9 else 0.0
+    return {
+        "min": float(np.min(vals)),
+        "max": float(np.max(vals)),
+        "mean": mean_v,
+        "median": float(np.median(vals)),
+        "std": std_v,
+        "cv": cv_v,
+        "n": len(vals),
+    }
+
+
+def _dump_distance_csv(
+    D: "np.ndarray",
+    track_names: list[str],
+    track_ids: list[str],
+    pl_id: str,
+    cache_dir: pathlib.Path | None = None,
+) -> str | None:
+    """Write D to ``cache/<pl_id>_distance_matrix.csv`` with track name/ID headers.
+
+    Returns the written file path on success, ``None`` on failure.
+    """
+    if cache_dir is None:
+        cache_dir = _cfg.CACHE_DIR_DEFAULT
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        safe_pl_id = pl_id.replace("/", "_").replace("\\", "_")
+        csv_path = cache_dir / f"{safe_pl_id}_distance_matrix.csv"
+        n = D.shape[0]
+        with open(str(csv_path), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            # Header: empty corner cell + one column per track
+            header = [""] + [
+                f"{track_names[i] or '?'} [{track_ids[i][:12] if track_ids[i] else '?'}]"
+                for i in range(n)
+            ]
+            writer.writerow(header)
+            for i in range(n):
+                row = [
+                    f"{track_names[i] or '?'} [{track_ids[i][:12] if track_ids[i] else '?'}]"
+                ] + [f"{float(D[i, j]):.6f}" if i != j else "0.000000" for j in range(n)]
+                writer.writerow(row)
+        logger.info("Distance matrix dumped to %s", csv_path)
+        return str(csv_path)
+    except Exception:
+        logger.exception("Failed to write distance matrix CSV")
+        return None
+
+
+def _render_distance_histogram(
+    D: "np.ndarray",
+    pl_id: str,
+    cache_dir: pathlib.Path | None = None,
+    bins: int = 12,
+) -> str | None:
+    """Render a histogram PNG of the off-diagonal distances.
+
+    Saves to ``cache/<pl_id>_distance_hist.png``.  Uses a non-interactive
+    matplotlib Agg backend so this works from a background thread.
+
+    Returns the written file path on success, ``None`` on failure.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        logger.exception("Failed to import matplotlib — histogram skipped")
+        return None
+
+    if cache_dir is None:
+        cache_dir = _cfg.CACHE_DIR_DEFAULT
+    try:
+        off_diag = D[D != 0]
+        if len(off_diag) == 0:
+            return None
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        safe_pl_id = pl_id.replace("/", "_").replace("\\", "_")
+        png_path = cache_dir / f"{safe_pl_id}_distance_hist.png"
+
+        fig, ax = plt.subplots(figsize=(5, 2.5))
+        ax.hist(off_diag, bins=bins, color="#4A90D9", edgecolor="white", alpha=0.85)
+        ax.set_xlabel("Distance")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Distance histogram ({len(off_diag)} off-diagonal pairs)", fontsize=10)
+        fig.tight_layout()
+        fig.savefig(str(png_path), dpi=100)
+        plt.close(fig)
+        logger.info("Distance histogram saved to %s", png_path)
+        return str(png_path)
+    except Exception:
+        logger.exception("Failed to render distance histogram")
+        return None

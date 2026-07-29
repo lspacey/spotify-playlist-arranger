@@ -13,10 +13,29 @@ from playlist_arranger.sorting.distance import (
     _load_embedding,
     _build_distance_matrix,
     _SORTING_CACHE,
+    _compute_distance_stats,
+    _dump_distance_csv,
+    _render_distance_histogram,
 )
 from playlist_arranger.sorting.anchors import _load_anchors_file
 
 logger = logging.getLogger(__name__)
+
+# ── Shared state for diagnostics (read by UI after solver returns) ───────────
+_LAST_DISTANCE_HISTOGRAM_PATH: str | None = None
+
+
+def _update_last_histogram_path(path: str | None) -> None:
+    global _LAST_DISTANCE_HISTOGRAM_PATH
+    _LAST_DISTANCE_HISTOGRAM_PATH = path
+
+
+def get_last_histogram_path() -> str | None:
+    """Return the last histogram PNG path, or None if none was generated.
+
+    Called from ``smart_sorting.py`` after ``_run_smart_sorting`` returns.
+    """
+    return _LAST_DISTANCE_HISTOGRAM_PATH
 
 
 def _path_cost(order: list, D) -> float:
@@ -164,7 +183,8 @@ def _solve_atsp_with_anchors(
 
 
 def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
-                       progress_cb=None, settings=None):
+                       progress_cb=None, settings=None,
+                       stats_cache=None, snapshot_id=None):
     """
     Run SA sorting, return (ordered_descs, cost) tuple.
     Pure logic — no UI/no console.
@@ -185,6 +205,12 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
     settings : ``config.Settings``, optional
         If None, ``config.load_settings()`` is called to read SA parameters
         (iterations multiplier, n_runs, T_start, T_end).
+    stats_cache : ``StatsResult`` | None, optional
+        Pre-loaded per-playlist calibration stats.  If None, the solver
+        refuses to run (raises RuntimeError) — sorting requires valid
+        calibration data per the stats-analysis workflow.
+    snapshot_id : str | None
+        Used to re-save the cache with ``last_used_for_sort_at`` timestamp.
     """
     if settings is None:
         from playlist_arranger.config import load_settings
@@ -194,6 +220,46 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
         logger.info("%s", msg)
         if progress_cb:
             progress_cb(msg)
+
+    # ── Validate stats cache ──────────────────────────────────────────────
+    if stats_cache is None:
+        raise RuntimeError(
+            f"No stats analysis available for playlist {pl_id[:12]} — "
+            f"run 'Analyze Statistics' first before sorting."
+        )
+    if "flatness" not in stats_cache.components:
+        raise RuntimeError(
+            f"Stats cache for {pl_id[:12]} is missing flatness calibration — "
+            f"re-run 'Analyze Statistics'."
+        )
+
+    # ── Apply cached calibration scales ───────────────────────────────────
+    dyn_scale_val = stats_cache.components.get("dynamic_range")
+    onset_scale_val = stats_cache.components.get("onset_str")
+    flat_scale_val = stats_cache.components.get("flatness")
+    transition_scale_val = stats_cache.components.get("transition")
+
+    dyn_scale = float(dyn_scale_val.calibration_scale) if dyn_scale_val else 20.0
+    onset_scale = float(onset_scale_val.calibration_scale) if onset_scale_val else 2.0
+    flat_scale = float(flat_scale_val.calibration_scale) if flat_scale_val else 0.01
+    transition_scale = float(transition_scale_val.calibration_scale) if transition_scale_val else 0.25
+
+    _log(
+        f"Using per-playlist calibration: dyn_scale={dyn_scale:.2f}, "
+        f"onset_scale={onset_scale:.2f}, flat_scale={flat_scale:.4f}"
+    )
+
+    # ── Apply cached weights (user-tuned from stats UI) ───────────────────
+    import playlist_arranger.config as _cfg_mod
+    cached_weights = stats_cache.weights_used
+    if cached_weights:
+        for k in ("mood", "bpm", "transition", "key", "energy", "texture", "freq_balance"):
+            if k in cached_weights:
+                _cfg_mod.WEIGHTS[k] = cached_weights[k]
+        _log(f"Applied cached user-tuned weights: {dict(_cfg_mod.WEIGHTS)}")
+    else:
+        # Fallback to config defaults — sync from settings
+        _cfg_mod.sync_weights_from_settings(settings)
 
     plan = _load_anchors_file(pl_id)
     if not plan:
@@ -290,22 +356,11 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
 
     n_total = len(all_tracks)
 
-    # ── Calibrate texture normalization scales per playlist ──────────────
-    # Scales are computed from the CURRENT playlist's feature distributions
-    # (not a global constant) so that a 2 dB dynamic_range difference counts
-    # more in a playlist with a narrow spread than in one spanning 30 dB.
-    from playlist_arranger.sorting.distance import _calibrate_texture_scales
-
-    dyn_scale, onset_scale = _calibrate_texture_scales(all_tracks)
-
-    # Cache key must encompass the calibration scales because they change the
-    # distance matrix D.  Round scales to 3 decimal places to avoid cache
-    # misses from floating-point noise while still being playlist-sensitive.
-    # The track_ids tuple already changes per playlist, and scales are
-    # recomputed per playlist selection, so a separate `scale_key` ensures
-    # cache invalidation if the same track set is recalibrated differently.
-    scale_key = (round(dyn_scale, 3), round(onset_scale, 3))
+    # ── Build distance matrix with per-playlist calibration ───────────────
+    # Scales already loaded from stats cache above — do NOT re-calibrate.
     texture_scales = (dyn_scale, onset_scale)
+    # Include flat_scale in cache key so flatness calibration change invalidates
+    scale_key = (round(dyn_scale, 3), round(onset_scale, 3), round(flat_scale, 6))
     cache_key = (tuple(track_ids), scale_key)
 
     cached = _SORTING_CACHE.get(pl_id)
@@ -319,6 +374,8 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
         D = _build_distance_matrix(
             list(range(n_total)), all_tracks, embeddings,
             texture_scales=texture_scales,
+            flat_scale=flat_scale,
+            transition_scale=transition_scale,
         )
         _SORTING_CACHE[pl_id] = {
             "D": D,
@@ -327,9 +384,29 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
             "embeddings": embeddings,
         }
     _log(
-        f"Calibrated normalization: dynamic_range scale={dyn_scale:.2f} dB, "
-        f"onset_str scale={onset_scale:.2f}"
+        f"Calibration applied: dyn_scale={dyn_scale:.2f}, "
+        f"onset_scale={onset_scale:.2f}, flat_scale={flat_scale:.4f}"
     )
+
+    # ── Distance matrix diagnostics ──────────────────────────────────────────
+    stats = _compute_distance_stats(D)
+    _log(
+        f"Distance matrix stats: min={stats['min']:.2f} max={stats['max']:.2f} "
+        f"mean={stats['mean']:.2f} std={stats['std']:.2f} CV={stats['cv']:.2f} "
+        f"(n={stats['n']})"
+    )
+
+    track_names = [
+        all_tracks[i].get("name", "?") if i < len(all_tracks) else "?"
+        for i in range(len(track_ids))
+    ]
+    csv_path = _dump_distance_csv(D, track_names, track_ids, pl_id)
+    if csv_path:
+        _log(f"Distance matrix dumped to {csv_path}")
+
+    hist_path = _render_distance_histogram(D, pl_id)
+    if hist_path:
+        _update_last_histogram_path(hist_path)
 
     all_indices = list(range(len(all_tracks)))
     iters = max(n_total * settings.sa_iterations_multiplier, 5000)
@@ -362,5 +439,16 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
             tid, {"track_id": tid, "name": "?", "artist": "?"}
         )
         ordered_descs.append(d)
+
+    # ── Re-save cache with sort timestamp for audit trail ─────────────────
+    if snapshot_id:
+        try:
+            import datetime as _dt
+            from playlist_arranger.sorting.stats_analysis import save_stats_cache
+            stats_cache.last_used_for_sort_at = _dt.datetime.now().isoformat()
+            save_stats_cache(stats_cache)
+            _log(f"Stats cache updated with sort timestamp for snapshot {snapshot_id[:12]}")
+        except Exception:
+            logger.exception("Failed to update stats cache sort timestamp")
 
     return ordered_descs, float(best_cost)
