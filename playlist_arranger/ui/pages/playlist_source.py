@@ -24,20 +24,19 @@ from playlist_arranger.analysis import desc_generator as _desc_gen
 from playlist_arranger.ui.desc_dialog import show_desc_dialog
 from playlist_arranger.ui import audio_viz as _viz
 from playlist_arranger.ui import playlist_highlight as _ph
-# ---- Wire playlist_highlight's dependency injection (circular-import avoidance) ----
+from playlist_arranger.sources import playlist_cache as _pc
+from playlist_arranger.ui import desc_status as _ds
+from playlist_arranger.ui import local_section as _ls
+from playlist_arranger.ui import analysis_queue as _aq
+from playlist_arranger.ui import track_table as _tt
+# ---- Wire dependency injection (circular-import avoidance) ----
 logger = logging.getLogger(__name__)
 
 # ─── Description icon click handler (wired per-table via $parent.$emit) ───────
 
 def _on_desc_icon_click(e):
-    """Handler for desc icon clicks — receives the full row dict via $parent.$emit."""
-    row = e.args if e.args else {}
-    tid = row.get("track_id", "") if isinstance(row, dict) else ""
-    tname = row.get("track_name_original", "") if isinstance(row, dict) else ""
-    artist = row.get("artist", "") if isinstance(row, dict) else ""
-    logger.debug("desc icon clicked: track_id=%s", tid[:8] if tid else "?")
-    if tid:
-        show_desc_dialog(tid, tname, artist=artist)
+    """Delegate to ``playlist_arranger.ui.track_table.on_desc_icon_click()``."""
+    _tt.on_desc_icon_click(e)
 
 
 # ─── "Now Playing" card mode state ────────────────────────────────────────────
@@ -323,9 +322,9 @@ def _stop_analyzing():
         _live_ctx.flush_before_stop()
         _live_ctx.stop_poll_thread()
         # Clear simple-analyze queue highlight (batch highlight is separate)
-        _queue_now_playing_row_keys.clear()
-        if _queue_table_ref is not None and not _ba._batch_processing:
-            _queue_table_ref.selected = []
+        _aq._queue_now_playing_row_keys.clear()
+        if _aq._queue_table_ref is not None and not _ba._batch_processing:
+            _aq._queue_table_ref.selected = []
         logger.info("Now Playing: analysis stopped")
 
 
@@ -464,11 +463,11 @@ def _card_listen_thread():
                     if _analyze_mode == 1 and not _ba._batch_processing and tid:
                         with _ui_context_lock, _ph._page_client:
                             _ph._sync_row_highlight(
-                                _queue_table_ref,
-                                _queue_rows_cache,
+                                _aq._queue_table_ref,
+                                _aq._queue_rows_cache,
                                 _state.analysis_queue,
                                 tid,
-                                _queue_now_playing_row_keys,
+                                _aq._queue_now_playing_row_keys,
                                 "queue",
                             )
                 except Exception:
@@ -652,21 +651,21 @@ def _update_np_ui():
         if _needs_queue_highlight:
             # Apply selection highlight on the fresh rows (batch advance only)
             # Find the current batch track's row by ID — don't assume row [0]
-            global _queue_table_ref, _queue_rows_cache
-            if _queue_table_ref is not None and _queue_rows_cache:
+            # queue globals now in _aq module
+            if _aq._queue_table_ref is not None and _aq._queue_rows_cache:
                 ctid = _ba._batch_current_track_id
                 if ctid:
                     # _queue_rows_cache maps to queue positions, not track IDs directly.
                     # Build a local index: find which queue entry has this track ID.
                     target_row = None
                     for i, t in enumerate(_state.analysis_queue):
-                        if t.get("id") == ctid and i < len(_queue_rows_cache):
-                            target_row = _queue_rows_cache[i]
+                        if t.get("id") == ctid and i < len(_aq._queue_rows_cache):
+                            target_row = _aq._queue_rows_cache[i]
                             break
-                if target_row is None and _queue_rows_cache:
-                    target_row = _queue_rows_cache[0]  # fallback: first row
+                if target_row is None and _aq._queue_rows_cache:
+                    target_row = _aq._queue_rows_cache[0]  # fallback: first row
                 if target_row is not None:
-                    _queue_table_ref.selected = [target_row]
+                    _aq._queue_table_ref.selected = [target_row]
         _needs_queue_highlight = False
 
     try:
@@ -690,7 +689,7 @@ def _update_np_ui():
 
     try:
         if _api_counter_label is not None and _state.sp is not None:
-            count = getattr(_state.sp, 'call_count', 0)
+            count = getattr(_state, 'api_calls', 0)
             _api_counter_label.set_text(f"🔄 {count} calls")
     except Exception:
         logger.exception("API counter update failed")
@@ -704,11 +703,11 @@ def _update_np_ui():
             # has its own per-track highlight via _needs_queue_highlight above).
             if _analyze_mode == 1 and not _ba._batch_processing and tid:
                 _ph._sync_row_highlight(
-                    _queue_table_ref,
-                    _queue_rows_cache,
+                    _aq._queue_table_ref,
+                    _aq._queue_rows_cache,
                     _state.analysis_queue,
                     tid,
-                    _queue_now_playing_row_keys,
+                    _aq._queue_now_playing_row_keys,
                     "queue",
                 )
     except Exception:
@@ -846,45 +845,8 @@ def _render_np_inner():
 # ─── Description generator status row renderer ───────────────────────────────
 
 def _render_desc_status():
-    """Render the description generator status info (called once during build
-    and re-rendered on each timer tick)."""
-    # Start the desc generator worker (idempotent)
-    _desc_gen.start_desc_generator()
-
-    qsize = _desc_gen.desc_queue_size()
-    qsize_label = f"{qsize} track{'s' if qsize != 1 else ''} in description queue"
-
-    current_id = _desc_gen.desc_generator_current_track_id
-    current_name = _desc_gen.desc_generator_current_track_name
-    if current_id and current_name:
-        processing_label = f"Currently processing: {current_name[:60]}"
-    elif current_id:
-        processing_label = f"Currently processing: {current_id[:12]}..."
-    else:
-        processing_label = "Idle — no tracks in queue" if qsize == 0 else "Idle — waiting for worker"
-
-    def on_clear():
-        _desc_gen.desc_queue_clear()
-        ui.notify("Description queue cleared", type="positive")
-
-    ui.button(
-        "Stop and clean the queue",
-        on_click=on_clear,
-        color="orange",
-    ).classes("text-xs").props("size=sm")
-
-    def on_update_all():
-        logger.debug("'Update all in background' clicked — not yet implemented")
-
-    ui.button(
-        "Update all in background",
-        on_click=on_update_all,
-        color="blue",
-    ).classes("text-xs").props("size=sm")
-
-    with ui.column().classes("gap-0"):
-        ui.label(processing_label).classes("text-sm text-gray-600 dark:text-gray-400")
-        ui.label(qsize_label).classes("text-xs text-gray-500")
+    """Delegate to ``playlist_arranger.ui.desc_status.render_desc_status()``."""
+    _ds.render_desc_status()
 
 
 # ─── Play track from playlist table ───────────────────────────────────────────
@@ -911,132 +873,13 @@ def _get_track_status(track: dict) -> str:
 
 
 def _load_cached_playlist_tracks(playlist_id: str) -> list:
-    from playlist_arranger.sources.spotify_source import get_playlist_tracks as _fetch_tracks
-    logger.info("Expanding playlist %s", playlist_id[:8])
-    try:
-        pl_data = _state.sp.playlist(playlist_id, fields="snapshot_id,name")
-        snapshot_id = pl_data.get("snapshot_id", "")
-        pl_name = pl_data.get("name", "?")
-    except Exception:
-        snapshot_id = ""
-        pl_name = "?"
-    logger.info("Playlist %s: %s (snapshot=%s)", playlist_id[:8], pl_name, snapshot_id[:8] if snapshot_id else "?")
-
-    if snapshot_id:
-        cache_file = CACHE_DIR_DEFAULT / f"{playlist_id}-{snapshot_id}.tracks.json"
-        if cache_file.exists():
-            try:
-                tracks = json.loads(cache_file.read_text(encoding="utf-8"))
-                count = len(tracks)
-                missing_uri = sum(
-                    1 for t in tracks
-                    if not (t.get("uri") or "").startswith("spotify:track:")
-                )
-                if missing_uri > 0:
-                    logger.warning(
-                        "STALE CACHE SCHEMA: %s — %d/%d tracks missing valid 'uri' "
-                        "field (cache predates uri field being added to "
-                        "get_playlist_tracks()). Deleting stale cache to force re-fetch.",
-                        cache_file, missing_uri, count,
-                    )
-                    try:
-                        cache_file.unlink()
-                    except Exception:
-                        pass
-                    # Fall through to re-fetch from Spotify below
-                elif count == 0:
-                    logger.warning(
-                        "CACHE EMPTY: %s contains 0 tracks — playlist %s may have been "
-                        "cached during a transient error. Deleting stale cache to force "
-                        "re-fetch.", cache_file, playlist_id[:8]
-                    )
-                    try:
-                        cache_file.unlink()
-                    except Exception:
-                        pass
-                    # Fall through to re-fetch from Spotify below
-                else:
-                    logger.info("Loaded %d tracks from cache: %s (%s)", count, cache_file, pl_name)
-                    return tracks
-            except Exception:
-                logger.warning("Corrupted cache file %s, re-fetching", cache_file)
-                try:
-                    cache_file.unlink()
-                except Exception:
-                    pass
-                # Fall through to re-fetch from Spotify below
-
-    logger.info("Fetching tracks from Spotify API for playlist %s (%s)", playlist_id[:8], pl_name)
-    tracks = _fetch_tracks(_state.sp, playlist_id)
-    track_count = len(tracks)
-    logger.info("Spotify API returned %d playable tracks for playlist %s (%s)", track_count, playlist_id[:8], pl_name)
-
-    if not tracks:
-        logger.warning("EMPTY RESULT: 0 playable tracks for playlist %s (%s)",
-                       playlist_id[:8], pl_name)
-
-    # Remove any stale cache files (previous snapshot) before writing new one
-    pattern = str(CACHE_DIR_DEFAULT / f"{playlist_id}-*.tracks.json")
-    for old_file in _glob.glob(pattern):
-        try:
-            pathlib.Path(old_file).unlink()
-        except Exception:
-            pass
-    if snapshot_id:
-        cache_file = CACHE_DIR_DEFAULT / f"{playlist_id}-{snapshot_id}.tracks.json"
-        try:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            cache_file.write_text(json.dumps(tracks, ensure_ascii=False), encoding="utf-8")
-            logger.info("Cached %d tracks to %s", len(tracks), cache_file)
-        except Exception as e:
-            logger.warning("Failed to write cache file: %s", e)
-    return tracks
+    """Delegate to ``playlist_arranger.sources.playlist_cache.load_cached_playlist_tracks()``."""
+    return _pc.load_cached_playlist_tracks(playlist_id)
 
 
 def _inject_desc_tooltip_css():
-    """Inject CSS for description icon tooltips once (idempotent).
-    
-    Uses pure CSS :hover tooltip instead of Quasar <q-tooltip> to avoid
-    flicker when table cells re-render (rows= reassignment, queue rebuild).
-    CSS tooltips are immune to DOM re-render because they have no popup
-    lifecycle — the style simply applies to the new element instantly."""
-    ui.add_head_html('''
-    <style>
-    /* Allow the tooltip to overflow the table cell — QTable cells
-       may inherit overflow:hidden from scrollable table wrappers. */
-    .q-table td:has(.desc-icon-container),
-    .q-table th:has(.desc-icon-container) {
-      overflow: visible !important;
-    }
-    .desc-icon-container {
-      position: relative;
-      display: inline-block;
-      cursor: default;
-    }
-    .desc-icon-tip {
-      visibility: hidden;
-      opacity: 0;
-      position: absolute;
-      bottom: calc(100% + 4px);
-      left: 50%;
-      transform: translateX(-50%);
-      white-space: nowrap;
-      background: rgba(0, 0, 0, 0.82);
-      color: #fff;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-size: 12px;
-      line-height: 1.4;
-      z-index: 10000;
-      pointer-events: none;
-      transition: opacity 0.12s ease;
-    }
-    .desc-icon-container:hover .desc-icon-tip {
-      visibility: visible;
-      opacity: 1;
-    }
-    </style>
-    ''')
+    """Delegate to ``playlist_arranger.ui.track_table.inject_desc_tooltip_css()``."""
+    _tt.inject_desc_tooltip_css()
 
 
 def build_spotify_section(set_page_cb):
@@ -1248,158 +1091,29 @@ _queue_label_ref = None
 
 
 def _persist_queue():
-    _state.save_analysis_queue()
+    _aq.persist_queue()
 
 
 def _rebuild_queue_ui():
     global _queue_table_ref, _queue_rows_cache, _queue_container
-    if _queue_container is None:
-        return
-
-    # ── Safety: skip rebuild if client disconnected (background-thread callback) ──
-    # _on_desc_generated() is invoked from a background worker thread
-    # (_desc_worker_loop → cb(track_id) → _on_desc_generated → _rebuild_queue_ui).
-    # By the time the callback fires, the user may have navigated away or
-    # disconnected, leaving _queue_container as a stale NiceGUI element whose
-    # client has no active socket connection.  Calling .clear() on a
-    # disconnected element triggers a "deleted but still being used" warning.
-    # We check has_socket_connection before any UI mutation and bail out safely.
-    try:
-        client = _queue_container.client
-        if not client.has_socket_connection:
-            logger.debug("Skipping queue UI rebuild — client disconnected")
-            return
-    except Exception:
-        # Cannot verify connection state (element may be in a bad state) —
-        # bail out safely rather than crash or emit a warning.
-        logger.debug("Could not verify client connection — skipping queue UI rebuild")
-        return
-
-    _queue_container.clear()
-    with _queue_container:
-        _render_queue_table()
-        _render_queue_controls()
-    # Single source of truth: re-evaluate batch button enabled state AFTER
-    # every queue rebuild, regardless of which code path triggered it.
-    # Must run outside the context-manager-with in case _render_queue_controls()
-    # failed partway through and left _ba._batch_btn stale.
+    _aq.rebuild_queue_ui()
+    _queue_table_ref = _aq._queue_table_ref
+    _queue_rows_cache = _aq._queue_rows_cache
     _refresh_batch_btn_enabled()
 
 
 def _add_selected_to_queue(pl_id: str, tracks: list):
-    selected_rows = _get_selected_rows(pl_id)
-    if not selected_rows:
-        ui.notify("No tracks selected", type="warning")
-        return
-
-    selected_idxs = sorted(r["idx"] for r in selected_rows)
-    added = 0
-    skipped = 0
-    for idx in selected_idxs:
-        i = idx - 1
-        if 0 <= i < len(tracks):
-            track = tracks[i]
-            with _state.analysis_queue_lock:
-                tid = track.get("id", "")
-                if not tid:
-                    logger.warning("Dedup skipped — track has no id: %s", track.get("name", "?")[:40])
-                    _state.analysis_queue.append(track)
-                    added += 1
-                elif any(t.get("id") == tid for t in _state.analysis_queue):
-                    skipped += 1
-                else:
-                    _state.analysis_queue.append(track)
-                    added += 1
-            # Lock released
-            if skipped and not added:
-                pass  # notification handled below, outside the per-track loop
-        _persist_queue()
-    _update_queue_label()
-    _rebuild_queue_ui()
-    ui.notify(f"Added {added} track(s) to queue" + (f" (skipped {skipped} duplicate(s))" if skipped else ""), type="positive")
-    if skipped:
-        ui.notify(f"{skipped} track(s) already in queue — skipped", type="info")
-    logger.info("Added %d track(s) to analysis queue (total=%d)", added, len(_state.analysis_queue))
-
+    _aq.add_selected_to_queue(pl_id, tracks)
 
 def _update_queue_label():
-    global _queue_label_ref, _queue_expansion_ref
-    n = len(_state.analysis_queue)
-    label = f"Queue for Analysis — {n} track{'s' if n != 1 else ''}"
-    if _queue_label_ref is not None:
-        _queue_label_ref.set_text(label)
-    if _queue_expansion_ref is not None:
-        _queue_expansion_ref.set_text(label)
+    _aq.update_queue_label()
 
 
 def _render_queue_table():
     global _queue_table_ref, _queue_rows_cache
-    if not _state.analysis_queue:
-        ui.label("Queue is empty").classes("text-sm text-gray-400 italic")
-        return
-
-    columns = [
-        {"name": "idx", "label": "#", "field": "idx", "sortable": True},
-        {"name": "name", "label": "Track", "field": "name"},
-        {"name": "artist", "label": "Artist", "field": "artist"},
-        {"name": "duration", "label": "Dur", "field": "duration"},
-        {"name": "desc", "label": "Desc", "field": "desc", "sortable": False},
-        {"name": "status", "label": "Status", "field": "status"},
-    ]
-    rows = []
-    for i, t in enumerate(_state.analysis_queue, 1):
-        dur_ms = t.get("duration_ms", 0)
-        dur_str = f"{dur_ms // 60000}:{(dur_ms // 1000) % 60:02d}" if dur_ms else "?"
-        if _state.analysis_current_track_id and t.get("id") == _state.analysis_current_track_id:
-            status = "⏳ Processing"
-        else:
-            status = _get_track_status(t)
-        # Look up desc status from DB
-        tid = t.get("id", "")
-        entry = _db.get_track(tid) if tid else None
-        desc_info = get_desc_age_info(
-            entry.get("desc_text") if entry else None,
-            entry.get("desc_generated_at") if entry else None,
-        )
-        icon_name = "auto_stories" if desc_info.has_desc else "menu_book"
-        icon_color = desc_info.color
-        icon_caption = desc_info.caption
-        rows.append({"idx": i, "name": t.get("name", "")[:42], "artist": t.get("artist", "")[:40],
-                     "duration": dur_str, "status": status,
-                     "desc": "✓" if desc_info.has_desc else "—",
-                     "desc_icon": icon_name,
-                     "desc_color": icon_color,
-                     "desc_caption": icon_caption,
-                     "track_id": tid,
-                     "track_name_original": t.get("name", "")})
-
-    _queue_table_ref = ui.table(
-        columns=columns, rows=rows, row_key="idx",
-        selection="multiple",
-        pagination={"rowsPerPage": 0},
-    ).classes("w-full").props("dense")
-    _queue_table_ref.add_slot("body-cell-desc", r"""
-    <q-td :props="props">
-      <span class="desc-icon-container">
-        <q-icon :name="props.row.desc_icon" :color="props.row.desc_color" size="18px"
-                style="cursor: pointer;"
-                @click.stop="() => $parent.$emit('desc_click', props.row)" />
-        <span class="desc-icon-tip">{{ props.row.desc_caption }}</span>
-      </span>
-    </q-td>
-    """)
-    _queue_table_ref.on("desc_click", _on_desc_icon_click)
-    _queue_rows_cache = rows
-
-    def on_row_dblclick(e):
-        row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else {}
-        row_idx = row_data.get("idx", 0) - 1
-        if 0 <= row_idx < len(_state.analysis_queue):
-            track = _state.analysis_queue[row_idx]
-            client = ui.context.client
-            ui.timer(0.0, lambda t=track, c=client: asyncio.ensure_future(_play_track(t, client=c)), once=True)
-
-    _queue_table_ref.on("rowDblclick", on_row_dblclick)
+    _aq.render_queue_table()
+    _queue_table_ref = _aq._queue_table_ref
+    _queue_rows_cache = _aq._queue_rows_cache
 
 
 # ─── Batch analysis helpers ──────────────────────────────────────────────────
@@ -1527,10 +1241,10 @@ def _render_queue_controls():
         ui.timer(1.0, _refresh_batch_btn_enabled)
 
         def _on_remove_selected():
-            global _queue_table_ref
-            if _queue_table_ref is None:
+            # _queue_table_ref now accessed via _aq module
+            if _aq._queue_table_ref is None:
                 return
-            selected = list(_queue_table_ref.selected) if hasattr(_queue_table_ref, 'selected') else []
+            selected = list(_aq._queue_table_ref.selected) if hasattr(_aq._queue_table_ref, 'selected') else []
             if not selected:
                 return
             to_remove = sorted((r["idx"] for r in selected), reverse=True)
@@ -1546,8 +1260,8 @@ def _render_queue_controls():
 
         def _refresh_remove_btn():
             nonlocal remove_btn
-            if _queue_table_ref is not None:
-                selected = list(_queue_table_ref.selected) if hasattr(_queue_table_ref, 'selected') else []
+            if _aq._queue_table_ref is not None:
+                selected = list(_aq._queue_table_ref.selected) if hasattr(_aq._queue_table_ref, 'selected') else []
                 remove_btn.set_enabled(len(selected) > 0)
 
         remove_btn = ui.button("Remove Selected Tracks from Queue", on_click=_on_remove_selected, color="orange").classes("text-sm")
@@ -1567,9 +1281,9 @@ def _render_queue_controls():
     # ── Description generation buttons (queue table) ─────────────────────────
     with ui.row().classes("w-full gap-2 mt-1"):
         def _desc_gen_queue_selected():
-            if _queue_table_ref is None:
+            if _aq._queue_table_ref is None:
                 return
-            selected = list(_queue_table_ref.selected) if hasattr(_queue_table_ref, 'selected') else []
+            selected = list(_aq._queue_table_ref.selected) if hasattr(_aq._queue_table_ref, 'selected') else []
             if not selected:
                 ui.notify("No tracks selected", type="warning")
                 return
@@ -1588,8 +1302,8 @@ def _render_queue_controls():
         desc_q_sel_btn.set_enabled(False)
 
         def _refresh_desc_q_sel_btn():
-            if _queue_table_ref is not None:
-                selected = list(_queue_table_ref.selected) if hasattr(_queue_table_ref, 'selected') else []
+            if _aq._queue_table_ref is not None:
+                selected = list(_aq._queue_table_ref.selected) if hasattr(_aq._queue_table_ref, 'selected') else []
                 desc_q_sel_btn.set_enabled(len(selected) > 0)
         ui.timer(0.5, _refresh_desc_q_sel_btn)
 
@@ -1615,16 +1329,10 @@ def _render_queue_controls():
 
 def _render_analysis_queue():
     global _queue_expansion_ref, _queue_label_ref, _queue_container
-    n = len(_state.analysis_queue)
-    label = f"Queue for Analysis — {n} track{'s' if n != 1 else ''}"
-
-    with ui.expansion(label, value=False).classes("w-full mb-4") as _queue_expansion_ref:
-        _queue_expansion_ref.props('header-class="text-lg font-semibold"')
-        _queue_label_ref = ui.label(label)
-        _queue_container = ui.column().classes("w-full")
-        with _queue_container:
-            _render_queue_table()
-            _render_queue_controls()
+    _aq.render_analysis_queue()
+    _queue_expansion_ref = _aq._queue_expansion_ref
+    _queue_label_ref = _aq._queue_label_ref
+    _queue_container = _aq._queue_container
 
 
 def _render_playlists(set_page_cb):
@@ -1678,188 +1386,13 @@ def _render_playlists(set_page_cb):
 
 
 def _get_selected_rows(pl_id: str):
-    table = _ph._playlist_tables.get(pl_id)
-    if table is None:
-        return []
-    selected = list(table.selected) if hasattr(table, 'selected') else []
-    np_key = _ph._now_playing_row_keys.get(pl_id)
-    if np_key is not None:
-        selected = [r for r in selected if r.get("idx") != np_key]
-    return selected
+    """Delegate to ``playlist_arranger.ui.track_table.get_selected_rows()``."""
+    return _tt.get_selected_rows(pl_id)
 
 
 def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
-    in_db = sum(1 for t in tracks if _get_track_status(t) == _state.STATUS_OK)
-    ui.label(f"Total: {len(tracks)} | In DB: {in_db} | Double-click a row to ▶ Play").classes("text-xs text-gray-500 mb-2")
-
-    columns = [
-        {"name": "idx", "label": "#", "field": "idx", "sortable": True},
-        {"name": "name", "label": "Track", "field": "name"},
-        {"name": "artist", "label": "Artist", "field": "artist"},
-        {"name": "duration", "label": "Dur", "field": "duration"},
-        {"name": "desc", "label": "Desc", "field": "desc", "sortable": False},
-        {"name": "status", "label": "Status", "field": "status"},
-    ]
-    rows = []
-    for i, t in enumerate(tracks, 1):
-        dur_ms = t.get("duration_ms", 0)
-        dur_str = f"{dur_ms // 60000}:{(dur_ms // 1000) % 60:02d}" if dur_ms else "?"
-        status = _get_track_status(t)
-        # Look up desc status from DB
-        tid = t.get("id", "")
-        entry = _db.get_track(tid) if tid else None
-        desc_info = get_desc_age_info(
-            entry.get("desc_text") if entry else None,
-            entry.get("desc_generated_at") if entry else None,
-        )
-        icon_name = "auto_stories" if desc_info.has_desc else "menu_book"
-        icon_color = desc_info.color
-        icon_caption = desc_info.caption
-        rows.append({"idx": i, "name": t["name"][:42], "artist": t["artist"][:40],
-                     "duration": dur_str, "status": status,
-                     "desc": "✓" if desc_info.has_desc else "—",
-                     "desc_icon": icon_name,
-                     "desc_color": icon_color,
-                     "desc_caption": icon_caption,
-                     "track_id": tid,
-                     "track_name_original": t.get("name", "")})
-
-    track_table = ui.table(
-        columns=columns, rows=rows, row_key="idx",
-        selection="multiple",
-        pagination={"rowsPerPage": 0},
-    ).classes("w-full").props("dense")
-    track_table.add_slot("body-cell-desc", r"""
-    <q-td :props="props">
-      <span class="desc-icon-container">
-        <q-icon :name="props.row.desc_icon" :color="props.row.desc_color" size="18px"
-                style="cursor: pointer;"
-                @click.stop="() => $parent.$emit('desc_click', props.row)" />
-        <span class="desc-icon-tip">{{ props.row.desc_caption }}</span>
-      </span>
-    </q-td>
-    """)
-    track_table.on("desc_click", _on_desc_icon_click)
-
-    _ph._playlist_tables[pl_id] = track_table
-    _ph._playlist_rows_cache[pl_id] = rows
-
-    def on_row_dblclick(e):
-        row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else {}
-        row_idx = row_data.get("idx", 0) - 1
-        if 0 <= row_idx < len(tracks):
-            track = tracks[row_idx]
-            client = ui.context.client
-            ui.timer(0.0, lambda t=track, c=client: asyncio.ensure_future(_play_track(t, client=c)), once=True)
-            _ph._sync_now_playing_row_highlight(pl_id, track.get("id", ""))
-
-    track_table.on("rowDblclick", on_row_dblclick)
-
-    missing = sum(1 for t in tracks if _get_track_status(t) != _state.STATUS_OK)
-    with ui.row().classes("w-full gap-2 mt-2"):
-        def _build_add_to_queue_btn():
-            btn = ui.button(
-                "Add Selected Tracks to Queue for Analysis",
-                on_click=lambda: _add_selected_to_queue(pl_id, tracks),
-                color="yellow",
-            ).classes("text-sm")
-            btn.set_enabled(len(_get_selected_rows(pl_id)) > 0)
-            def _refresh_btn_enabled():
-                btn.set_enabled(len(_get_selected_rows(pl_id)) > 0)
-            ui.timer(0.5, _refresh_btn_enabled)
-            return btn
-
-        _build_add_to_queue_btn()
-
-        def _add_not_ok_to_queue():
-            not_ok = [t for t in tracks if _state.get_track_status(t) != _state.STATUS_OK]
-            if not not_ok:
-                ui.notify("All tracks are OK — nothing to add", type="info")
-                return
-            added = 0
-            skipped = 0
-            for t in not_ok:
-                with _state.analysis_queue_lock:
-                    tid = t.get("id", "")
-                    if not tid:
-                        logger.warning("Dedup skipped — track has no id: %s", t.get("name", "?")[:40])
-                        _state.analysis_queue.append(t)
-                        added += 1
-                    elif any(q.get("id") == tid for q in _state.analysis_queue):
-                        skipped += 1
-                    else:
-                        _state.analysis_queue.append(t)
-                        added += 1
-                # Lock released
-            _persist_queue()
-            _update_queue_label()
-            _rebuild_queue_ui()
-            if added:
-                ui.notify(f"Added {added} track(s) to queue" + (f" (skipped {skipped} duplicate(s))" if skipped else ""), type="positive")
-            elif skipped:
-                ui.notify(f"All {skipped} track(s) already in queue — nothing to add", type="info")
-            logger.info("Added %d not-OK track(s) to analysis queue (total=%d, skipped %d)", added, len(_state.analysis_queue), skipped)
-
-        ui.button(
-            "Add Not OK Tracks to Queue for Analysis",
-            on_click=_add_not_ok_to_queue,
-            color="yellow",
-        ).classes("text-sm")
-
-        # ── Description generation buttons (playlist table) ──────────────────
-        def _desc_gen_selected():
-            selected_rows = _get_selected_rows(pl_id)
-            if not selected_rows:
-                ui.notify("No tracks selected", type="warning")
-                return
-            track_ids = [r["track_id"] for r in selected_rows if r.get("track_id")]
-            n = _desc_gen.desc_queue_add_many(track_ids)
-            if n > 0:
-                ui.notify(f"Added {n} tracks to description queue", type="positive")
-            else:
-                ui.notify("All selected tracks are already in the description queue", type="info")
-
-        desc_selected_btn = ui.button(
-            "Generate new descriptions for selected tracks",
-            on_click=_desc_gen_selected,
-            color="blue",
-        ).classes("text-sm")
-        desc_selected_btn.set_enabled(len(_get_selected_rows(pl_id)) > 0)
-        def _refresh_desc_sel_btn():
-            desc_selected_btn.set_enabled(len(_get_selected_rows(pl_id)) > 0)
-        ui.timer(0.5, _refresh_desc_sel_btn)
-
-        def _desc_gen_all():
-            track_ids = [t.get("id", "") for t in tracks if t.get("id")]
-            n = _desc_gen.desc_queue_add_many(track_ids)
-            if n > 0:
-                ui.notify(f"Added {n} tracks to description queue", type="positive")
-            else:
-                ui.notify("All tracks are already in the description queue", type="info")
-
-        desc_all_btn = ui.button(
-            "Generate new descriptions for all tracks",
-            on_click=_desc_gen_all,
-            color="blue",
-        ).classes("text-sm")
-        desc_all_btn.set_enabled(len(tracks) > 0)
-
-        if _backup_exists(pl_id):
-            ui.button("Recover from backup", on_click=lambda: _recover_from_backup(pl_id, set_page_cb), color="purple").classes("text-sm")
-
-    def _refresh_status_cells():
-        nonlocal rows, track_table
-        updated = False
-        for i, t in enumerate(tracks):
-            new_status = _get_track_status(t)
-            if rows[i].get("status") != new_status:
-                rows[i]["status"] = new_status
-                updated = True
-        if updated:
-            track_table.rows = rows
-            _ph._playlist_rows_cache[pl_id] = rows
-
-    ui.timer(2.0, _refresh_status_cells)
+    """Delegate to \`\`playlist_arranger.ui.track_table.show_track_compact_table()\`\`."""
+    _tt.show_track_compact_table(tracks, pl_id, pl_name, set_page_cb)
 
 
 def _run_spotify_analysis(tracks):
@@ -1913,63 +1446,50 @@ def _recover_from_backup(pl_id, set_page_cb):
 
 
 def build_local_section(set_page_cb):
-    from playlist_arranger.config import LOCAL_MUSIC_DIR
-    ui.label("Local Files Source").classes("text-2xl font-bold mb-2")
-    current_dir = ui.label("").classes("text-sm text-gray-500")
-    file_list = ui.column().classes("w-full")
-    folder_input = ui.input(label="Folder path", value=str(LOCAL_MUSIC_DIR) if LOCAL_MUSIC_DIR else "").classes("w-full max-w-md")
-    ui.button("Browse", on_click=lambda: scan_folder(folder_input.value)).classes("mb-3")
-
-    def scan_folder(path):
-        if not path:
-            ui.notify("Please enter a folder path", type="warning"); return
-        folder = pathlib.Path(path).resolve()
-        if not folder.is_dir():
-            ui.notify("Folder not found", type="negative"); return
-        current_dir.set_text(f"Browsing: {folder}")
-        file_list.clear()
-        with file_list:
-            if folder.parent != folder:
-                ui.button("📁 ..", on_click=lambda f=folder.parent: scan_folder(str(f))).classes("text-sm w-full text-left")
-            for d in sorted([d for d in folder.iterdir() if d.is_dir()]):
-                ui.button(f"📁 {d.name}", on_click=lambda f=d: scan_folder(str(f))).classes("text-sm w-full text-left")
-            audio_exts = {".mp3", ".flac"}
-            files = sorted([f for f in folder.iterdir() if f.suffix.lower() in audio_exts])
-            if files:
-                ui.label(f"Audio files ({len(files)})").classes("text-sm font-bold mt-2 mb-1")
-                from playlist_arranger.sources.local_source import _read_tags
-                table_rows = []
-                for f in files:
-                    tags = _read_tags(f)
-                    artist = tags["artist"]
-                    title = tags["name"]
-                    display = f"{artist} — {title}" if artist else title
-                    size_kb = f.stat().st_size / 1024
-                    size_str = f"{size_kb:.0f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
-                    table_rows.append({"track": display[:60], "size": size_str})
-                ui.table(columns=[{"name": "track", "label": "Track", "field": "track"}, {"name": "size", "label": "Size", "field": "size"}],
-                         rows=table_rows, row_key="track", pagination=100).classes("w-full")
-                ui.button(f"🎵 Use this folder ({len(files)} tracks)", on_click=lambda f=folder: load_local_folder(f), color="green").classes("mt-2")
-
-    def load_local_folder(folder):
-        from playlist_arranger.sources.local_source import scan_folder as _scan, make_playlist_id
-        tracks = _scan(folder)
-        if not tracks:
-            ui.notify("No readable audio files found", type="warning"); return
-        _state.current_playlist_id = make_playlist_id(folder)
-        _state.current_playlist_name = folder.name
-        _state.current_playlist_source = "local"
-        _state.current_tracks[:] = tracks
-        ui.notify(f"Loaded {len(tracks)} tracks from '{folder.name}'", type="positive")
-        set_page_cb("local_source")
-
-    if _state.current_tracks and _state.current_playlist_source == "local":
-        _show_track_compact_table(_state.current_tracks, _state.current_playlist_id, _state.current_playlist_name, set_page_cb)
+    """Delegate to ``playlist_arranger.ui.local_section.build_local_section()``."""
+    _ls.build_local_section(set_page_cb)
 # ---- Wire playlist_highlight dependency injection (circular-import avoidance) ----
 # Must come after all referenced functions are defined.
 _ph.configure(
     load_cached_playlist_tracks=_load_cached_playlist_tracks,
-    show_track_compact_table=_show_track_compact_table,
+    show_track_compact_table=_tt.show_track_compact_table,
     render_playlists_set_page_cb=_render_playlists_set_page_cb,
     ui_context_lock=_ui_context_lock,
 )
+
+# ---- Wire track_table dependency injection ----
+_tt.configure(
+    state_module=_state,
+    db_module=_db,
+    ph_module=_ph,
+    desc_gen_module=_desc_gen,
+    get_desc_age_info_fn=get_desc_age_info,
+    get_track_status_fn=_get_track_status,
+    play_track_fn=_play_track,
+    add_selected_to_queue_fn=_add_selected_to_queue,
+    persist_queue_fn=_persist_queue,
+    update_queue_label_fn=_update_queue_label,
+    rebuild_queue_ui_fn=_rebuild_queue_ui,
+    recover_from_backup_fn=_recover_from_backup,
+    backup_exists_fn=_backup_exists,
+    show_desc_dialog_fn=show_desc_dialog,
+)
+
+# ---- Wire analysis_queue dependency injection ----
+_aq.configure(
+    state_module=_state,
+    db_module=_db,
+    desc_gen_module=_desc_gen,
+    ph_module=_ph,
+    get_desc_age_info_fn=get_desc_age_info,
+    get_track_status_fn=_get_track_status,
+    play_track_fn=_play_track,
+    desc_icon_click_fn=_tt.on_desc_icon_click,
+    render_queue_controls_fn=_render_queue_controls,
+)
+
+# ---- Wire extracted modules (playlist_cache, desc_status, local_section) ----
+from playlist_arranger.sources.spotify_source import get_playlist_tracks as _get_playlist_tracks_fn
+_pc.configure(state_module=_state, get_playlist_tracks_fn=_get_playlist_tracks_fn)
+_ds.configure(desc_gen_module=_desc_gen)
+_ls.configure(state_module=_state, show_track_compact_table_fn=_tt.show_track_compact_table)

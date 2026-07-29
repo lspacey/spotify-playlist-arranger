@@ -88,6 +88,7 @@ FULL_BUF_MAX = SAMPLE_RATE * 10 * 60
 
 # ─── Spotify constants ────────────────────────────────────────────────────────
 SPOTIFY_SCOPE = (
+    "user-read-private "                 # required for market="from_token" to resolve user country
     "user-read-currently-playing "
     "user-read-playback-state "
     "user-modify-playback-state "

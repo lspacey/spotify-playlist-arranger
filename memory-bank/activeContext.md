@@ -1,9 +1,29 @@
 # Active Context
 
 ## Current Work Focus
-Bug fix (2026-07-28): Fixed critical playlist track fetching bug where redundant `_is_track_playable()` filtering in `_load_cached_playlist_tracks()` killed ALL tracks after `get_playlist_tracks()` already filtered and flattened them. App consistently returned 0 tracks for every Spotify playlist.
+Test-suite stabilization audit (2026-07-29): Diagnosed and fixed a terminal hang and a test-order-dependency bug discovered during a full `pytest tests/` run. Full suite now runs **303 tests, all passing, in 6.75s** with zero hangs and zero failures.
 
 ## Recent Changes
+
+### 2026-07-29 — Test-suite stabilization audit (2 bugs root-caused and fixed)
+
+**Bug 1 — Terminal hang at 99%**: `test_stale_cache_without_uri_field_triggers_refetch` caused pytest to hang indefinitely.
+
+- **Root cause (two-part)**:
+  1. The test mocked `fake_sp.playlist()` but `get_playlist_tracks()` calls `sp.playlist_items()` in a pagination loop. Since `playlist_items` was not mocked, the MagicMock's default iterator produced an infinite loop with `time.sleep(0.3)` per iteration — never seeing `"next": None` to terminate.
+  2. `playlist_cache.py` stores a DI-cached function reference (`_get_playlist_tracks_fn`) wired at module init time by `playlist_source.py`. `mock.patch("...spotify_source.get_playlist_tracks")` could not reach this cached reference — the stale real function was still called.
+- **Fix**: Directly replaced `_pc._get_playlist_tracks_fn` and `_sps._is_track_playable` with lambdas returning canned data. Patched `_pc.CACHE_DIR_DEFAULT` (not `cfg.CACHE_DIR_DEFAULT`) because `playlist_cache.py` imports its own module-level reference. Added `@pytest.mark.timeout(10)` as a hard fail-safe against future mock-completeness bugs.
+- **Files changed**: `tests/test_stale_cache_schema.py`
+
+**Bug 2 — Test-order-dependency**: `test_rebuild_queue_ui_proceeds_when_client_connected` passed in isolation but FAILED when run after `test_batch_advance_no_ui_calls_from_bg_thread` in the full suite.
+
+- **Root cause**: `test_batch_advance_no_ui_calls_from_bg_thread` replaced `ps.ui` with a `_MockUI` instance (which lacks `__enter__`/`__exit__` context manager protocol) to intercept UI calls from a background thread. It never restored the original `ps.ui` reference. All subsequent tests that triggered `_rebuild_queue_ui()` → `_render_queue_controls()` → `with ui.row()` would crash with `TypeError: 'test_batch_analysis._MockUI' object does not support the context manager protocol`.
+- **Fix**: Saved `saved_ui = _src_mod.ui` before replacement and wrapped the test body in `try: ... finally: _src_mod.ui = saved_ui`.
+- **Files changed**: `tests/test_batch_analysis.py`
+
+**Grep sweep**: Confirmed all other module-level attribute swaps (`_save_track_worker_fn`, `_TAVILY_DEBUG_PATH`, `_right_panel`, `_queue_container`, `_get_playlist_tracks_fn`, `CACHE_DIR_DEFAULT`) have proper save/restore teardown. No additional leaks found.
+
+**Recommendation**: Consider extracting a reusable `mock_ui` pytest fixture (save/restore pattern) if more tests need UI interception in the future.
 
 ### 2026-07-28 — Playlist track fetching bug fix (double-filtering)
 - **Root cause**: `_load_cached_playlist_tracks()` in `playlist_source.py` called `get_playlist_tracks()` (which already filters unplayable tracks and returns flattened dicts), then did a SECOND pass with `_is_track_playable()` on those flattened dicts. `_is_track_playable()` expects raw Spotify API items with a nested `track` key — given flattened dicts, `track.get("type")` returned `None` (not `"track"`), causing every track to be filtered out. Result: always 0 tracks, always empty caches.

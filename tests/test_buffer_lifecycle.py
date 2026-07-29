@@ -1,8 +1,8 @@
 """Unit tests for AnalyzeBuffer lifecycle — seek-back, submitted flag, early flush.
 
 Tests the actual live_buffer module functions via LiveAnalyzeContext with mocked state.
-Run:  python tests/_test_buffer_lifecycle.py
 """
+
 import sys
 sys.path.insert(0, r"e:\Projects\Spotify_playlists\repository")
 
@@ -27,9 +27,6 @@ class MockCapture:
 
 
 # ── Helper — create a fresh context for each test ────────────────────────────
-_mode_lock = threading.Lock()
-_mode_flag = [True]  # mutable wrapper so is_analyze_mode reads live
-
 def _new_ctx():
     """Return a fresh LiveAnalyzeContext with a clean mode_lock and flag.
     Injects fake save_track_worker to prevent touching production DB."""
@@ -42,12 +39,13 @@ def _new_ctx():
     return ctx, lock, flag
 
 
-results = []
+# ── Tests ─────────────────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TEST 1: submitted=True → no drain/restart
-# ═══════════════════════════════════════════════════════════════════════════════
-try:
+def test_seekback_submitted_true_no_reflush():
+    """TEST 1: submitted=True → no drain/restart.
+
+    When a buffer is already submitted, sync_analyze_buffer(None) must
+    NOT queue a new task — the buffer was already handled."""
     ctx, lock, flag = _new_ctx()
 
     # Create a buffer that was already submitted
@@ -68,18 +66,14 @@ try:
     with ctx._analyze_worker_lock:
         task_was_queued = len(ctx._analyze_worker_queue) > 0
 
-    if task_was_queued:
-        results.append("FAIL: test_seekback_submitted_true — buffer was re-flushed despite submitted=True")
-    else:
-        results.append("PASS: test_seekback_submitted_true — submitted buffer correctly skipped re-flush")
+    assert not task_was_queued, "Buffer was re-flushed despite submitted=True"
 
-except Exception as e:
-    results.append(f"FAIL: test_seekback_submitted_true — {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TEST 2: submitted=False → drain + restart
-# ═══════════════════════════════════════════════════════════════════════════════
-try:
+def test_seekback_submitted_false_drain_restart():
+    """TEST 2: submitted=False → drain + restart.
+
+    When a buffer is unsubmitted with sufficient coverage (>90%),
+    sync_analyze_buffer(None) must flush it (set submitted=True)."""
     ctx, lock, flag = _new_ctx()
 
     buf = AnalyzeBuffer(
@@ -99,23 +93,20 @@ try:
     # Verify the buffer was flushed — check submitted flag on the buffer
     # rather than queue state, since the async worker may have already
     # popped the task by the time we inspect the queue.
-    if buf.submitted:
-        results.append("PASS: test_seekback_submitted_false — unsubmitted buffer correctly flushed on drain")
-    else:
-        results.append("FAIL: test_seekback_submitted_false — unsubmitted buffer was NOT flushed")
+    assert buf.submitted, "Unsubmitted buffer was NOT flushed"
 
     # Clean up the worker thread if it's still running
     with ctx._analyze_worker_lock:
         ctx._analyze_worker_queue.clear()
         ctx._analyze_worker_busy = False
 
-except Exception as e:
-    results.append(f"FAIL: test_seekback_submitted_false — {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TEST 3: Progressive coverage feed — exactly ONE submission across a loop
-# ═══════════════════════════════════════════════════════════════════════════════
-try:
+def test_progressive_loop_single_submit():
+    """TEST 3: Progressive coverage feed — exactly ONE submission across a loop.
+
+    Feeding audio chunks progressively to collect_samples() + sync_analyze_buffer()
+    should submit exactly once when coverage crosses the 90% threshold — not
+    resubmit on every subsequent chunk."""
     ctx, lock, flag = _new_ctx()
 
     dur_ms = 60000  # 1-minute track
@@ -146,22 +137,18 @@ try:
         ctx.collect_samples(chunk)
         ctx.sync_analyze_buffer(track_info)
 
-    if submission_count[0] == 1:
-        results.append(f"PASS: test_progressive_loop_single_submit — exactly 1 submission (got {submission_count[0]})")
-    else:
-        results.append(f"FAIL: test_progressive_loop_single_submit — expected 1, got {submission_count[0]}")
-
     ctx._submit_analyze_task = original_submit
 
-except Exception as e:
-    results.append(f"FAIL: test_progressive_loop_single_submit — {e}")
-    if 'original_submit' in dir():
-        ctx._submit_analyze_task = original_submit
+    assert submission_count[0] == 1, (
+        f"Expected exactly 1 submission, got {submission_count[0]}"
+    )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TEST 4: collect_samples() — submitted=True → no-op
-# ═══════════════════════════════════════════════════════════════════════════════
-try:
+
+def test_collect_samples_submitted_noop():
+    """TEST 4: collect_samples() — submitted=True → no-op.
+
+    When a buffer is already submitted, collect_samples() must NOT append
+    new chunks or increment samples_count — it's a defensive no-op."""
     ctx, lock, flag = _new_ctx()
 
     buf = AnalyzeBuffer(
@@ -182,18 +169,68 @@ try:
     chunks_unchanged = (len(buf.chunks) == 1)
     count_unchanged = (buf.samples_count == 44100)
 
-    if chunks_unchanged and count_unchanged:
-        results.append("PASS: test_collect_samples_submitted_noop — buffer untouched when submitted=True")
-    else:
-        results.append(f"FAIL: test_collect_samples_submitted_noop — chunks={len(buf.chunks)} (expected 1), count={buf.samples_count} (expected 44100)")
+    assert chunks_unchanged, f"Chunks changed: {len(buf.chunks)} (expected 1)"
+    assert count_unchanged, f"Samples count changed: {buf.samples_count} (expected 44100)"
 
-except Exception as e:
-    results.append(f"FAIL: test_collect_samples_submitted_noop — {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TEST 5: Normal forward playback — seek-back detection never fires
-# ═══════════════════════════════════════════════════════════════════════════════
-try:
+def test_seekback_within_same_track_drains_and_restarts():
+    """TEST 6: Seek-back within the same track — drain partial buffer, start fresh.
+
+    When the same track has a seek-back (progress goes backward), the code
+    should call sync_analyze_buffer(None) to flush the partial buffer, then
+    sync_analyze_buffer(new_track_info) to start a fresh buffer for the
+    restarted playback. The original buffer should be cleared, NOT resubmitted."""
+    ctx, lock, flag = _new_ctx()
+
+    tid = "seek_track"
+    track_info = {"id": tid, "name": "Seek Track", "artist": "Artist",
+                  "album": "Album", "duration_ms": 300000}
+    new_track_info = dict(track_info)  # same track, seek-back to position 0
+
+    buf = AnalyzeBuffer(
+        track_id=tid,
+        track_info=track_info,
+        sample_rate=44100,
+        submitted=False,
+    )
+    # Partial coverage — 100s of 300s = 33.3%, below 90% threshold
+    buf.chunks = [np.random.randn(44100 * 100).astype(np.float32) * 0.1]
+    buf.samples_count = 44100 * 100
+    ctx._analyze_buf = buf
+
+    # Simulate seek-back: drain old partial buffer, start new one
+    ctx.sync_analyze_buffer(None)
+    ctx.sync_analyze_buffer(new_track_info)
+
+    # The old partial buffer should have been cleared (not submitted —
+    # insufficient coverage). A NEW buffer should be created for the
+    # restarted playback.
+    new_buf = ctx._analyze_buf
+    assert new_buf is not None, "No new buffer created after seek-back drain"
+    assert new_buf.track_id == tid, (
+        f"New buffer should be for same track, got {new_buf.track_id}"
+    )
+    assert not new_buf.submitted, "New buffer should be unsubmitted"
+    assert new_buf.samples_count == 0, (
+        f"New buffer should start empty, got {new_buf.samples_count} samples"
+    )
+    # The old buffer should NOT have been submitted (33% << 90% threshold)
+    assert not buf.submitted, (
+        "Old partial buffer should NOT have been submitted (insufficient coverage)"
+    )
+
+    # Clean up
+    with ctx._analyze_worker_lock:
+        ctx._analyze_worker_queue.clear()
+        ctx._analyze_worker_busy = False
+
+
+def test_forward_playback_no_seekback():
+    """TEST 5: Normal forward playback — seek-back detection never fires.
+
+    Simulating a sequence of monotonically increasing progress_ms values
+    (normal forward playback) — the seek-back detection logic must produce
+    zero false positives."""
     tid = "fwd_track"
     progress_sequence = [0, 5000, 12000, 18500, 25000, 32000, 40000, 48000]
     last_progress = 0
@@ -204,22 +241,4 @@ try:
             seek_detected += 1
         last_progress = prog_ms
 
-    if seek_detected == 0:
-        results.append("PASS: test_forward_playback_no_seekback — 0 false positives across 7 forward steps")
-    else:
-        results.append(f"FAIL: test_forward_playback_no_seekback — {seek_detected} false seek-back detections")
-
-except Exception as e:
-    results.append(f"FAIL: test_forward_playback_no_seekback — {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-for r in results:
-    print(r)
-print("=" * 60)
-passed = sum(1 for r in results if r.startswith("PASS"))
-failed = len(results) - passed
-print(f"\n{passed}/{len(results)} passed, {failed} failed")
-if failed > 0:
-    sys.exit(1)
+    assert seek_detected == 0, f"{seek_detected} false seek-back detections"

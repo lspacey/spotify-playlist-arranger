@@ -43,6 +43,12 @@
 | Rich | 15.0.0 | Terminal output formatting |
 | python-dotenv | 1.2.2 | .env file loading |
 
+### Testing
+| Technology | Version | Purpose |
+|---|---|---|
+| pytest | 9.1.1 | Test framework |
+| pytest-timeout | 2.4.0 | Hard timeout fail-safe for tests (prevents CI hangs from incomplete mocks) |
+
 ## Development Setup
 
 ### Prerequisites

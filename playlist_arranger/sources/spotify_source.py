@@ -209,27 +209,70 @@ def get_own_playlists(sp, user_id):
     return playlists
 
 
-def _is_track_playable(item: dict) -> bool:
-    """Check whether a Spotify track item is playable."""
-    track = item.get("track") or item
-    if track.get("is_local"):
-        return False
+def _is_track_playable(item: dict, market: str = "?") -> tuple[bool, str]:
+    """Check whether a Spotify track item is playable.
+
+    Parameters
+    ----------
+    item : dict
+        Raw item dict from ``playlist_items()`` response.  Expected to have
+        a ``"track"`` key containing the nested track object.
+    market : str
+        The ``market`` value that was passed to the API call (e.g.
+        ``"from_token"``, ``"US"``).  Used only for diagnostic log messages.
+
+    Returns
+    -------
+    ``(playable: bool, reason: str)`` where *reason* is a short
+    human-readable explanation when *playable* is ``False``
+    (or ``"ok"`` when the track is playable).
+    """
+    # Spotify's REST API nests the track object under the 'item' key
+    # (not 'track').  Spotipy passes the response through unchanged.
+    track = item.get("track") or item.get("item")
+    if track is None:
+        return False, "track object is None"
+    # is_local lives on the item wrapper, NOT inside the "track" sub-object.
+    # Spotify's API returns the local-file flag at the top level of each
+    # playlist item rather than on the track metadata object.
+    if item.get("is_local"):
+        return False, "is_local=True"
     if track.get("type") != "track":
-        return False
+        return False, f"type='{track.get('type', '?')}' (not 'track')"
     if track.get("is_playable") is False:
-        return False
+        return False, f"is_playable=False for market={market}"
     restrictions = track.get("restrictions")
     if restrictions:
-        return False
-    if "is_playable" not in track and "item" in item:
+        reason_strs = [r.get("reason", "?") for r in restrictions if isinstance(r, dict)]
+        return False, f"restrictions: {', '.join(reason_strs) if reason_strs else str(restrictions)}"
+    # With ``market`` supplied the ``is_playable`` field is ALWAYS
+    # populated (True or False).  If it is absent despite the market
+    # parameter, treat the track as playable — skipping it would be
+    # incorrect because the absence is a data-quality issue, not a
+    # deliberate unavailability signal.
+    if "is_playable" not in track:
+        tid = track.get("id", "?")
+        tname = track.get("name", "?")[:60]
         available_markets = track.get("available_markets")
-        if available_markets is not None and len(available_markets) == 0:
-            return False
-    return True
+        logger = logging.getLogger(__name__)
+        logger.debug(
+            "is_playable MISSING for track '%s' (id=%s), "
+            "available_markets=%s — treating as playable (market=%s was supplied)",
+            tname, tid[:12] if tid else "NONE", available_markets, market,
+        )
+    return True, "ok"
 
 
 def get_playlist_tracks(sp, playlist_id):
-    """Fetch all tracks from a playlist."""
+    """Fetch all tracks from a playlist, filtering unplayable items.
+
+    Each skipped track is logged at DEBUG level with its name, ID, and
+    the exact reason for skipping (e.g. "track is None", "is_local=True",
+    "is_playable=False for market=US", "restrictions: market").
+
+    The ``market="from_token"`` parameter ensures ``is_playable`` is
+    populated on every track object in the response.
+    """
     tracks = []
     limit = 100
     offset = 0
@@ -247,22 +290,52 @@ def get_playlist_tracks(sp, playlist_id):
         for item in items:
             if not item:
                 continue
-            t = item.get("track")
+            t = item.get("track") or item.get("item")  # API returns 'item' key, not 'track'
+            tname = (t or {}).get("name", "?")[:60] if t else "?"
+            tid = (t or {}).get("id", "") if t else ""
+
             if not t:
                 skipped_unplayable += 1
+                # TEMPORARY DEBUG: dump raw item shape to diagnose null-track issue
+                # Remove once BUG 2 root cause (missing user-read-private scope?) is confirmed.
+                if skipped_unplayable <= 3:
+                    logger.warning(
+                        "BUG2-DIAG: track object is None — raw item keys=%s, "
+                        "is_local=%s, item type: %s, playlist=%s",
+                        list(item.keys()) if isinstance(item, dict) else type(item).__name__,
+                        item.get("is_local") if isinstance(item, dict) else "N/A",
+                        type(item).__name__,
+                        playlist_id[:8] if playlist_id else "?",
+                    )
                 continue
-            if item.get("is_local"):  # top-level field on the wrapper item, NOT inside "track" — correct as-is
+            if item.get("is_local"):
                 skipped_unplayable += 1
+                logger.debug(
+                    "Skipping track '%s' (id=%s): is_local=True",
+                    tname, tid[:12] if tid else "NONE",
+                )
                 continue
             if t.get("type") != "track":
                 skipped_unplayable += 1
+                logger.debug(
+                    "Skipping track '%s' (id=%s): type='%s' (not 'track')",
+                    tname, tid[:12] if tid else "NONE", t.get("type", "?"),
+                )
                 continue
-            tid = t.get("id")
             if not tid:
                 skipped_unplayable += 1
+                logger.debug(
+                    "Skipping track '%s': no 'id' field",
+                    tname,
+                )
                 continue
-            if not _is_track_playable(item):
+            playable, reason = _is_track_playable(item, market="from_token")
+            if not playable:
                 skipped_unplayable += 1
+                logger.debug(
+                    "Skipping track '%s' (id=%s): %s",
+                    tname, tid[:12] if tid else "NONE", reason,
+                )
                 continue
             tracks.append(
                 {

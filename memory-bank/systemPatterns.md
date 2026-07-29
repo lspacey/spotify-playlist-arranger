@@ -190,7 +190,48 @@ _gen_panel.clear()
 ### 26. Layout Stability: Buttons-First in Rows (2026-07-22)
 In NiceGUI `ui.row()`, children are laid out left-to-right in creation order. Place **fixed-width** elements (buttons) BEFORE **variable-width** elements (labels) so label content changes don't shift button positions. Applied in `_render_desc_status()`: buttons ("Stop and clean the queue", "Update all in background") created first, then labels wrapped in a `ui.column()`.
 
-### 27. NiceGUI Dialog Lifecycle Pattern
+### 27. Patch DI-Cached Function References Directly (2026-07-29)
+When a module stores a function reference in a module-level variable (e.g., dependency-injection pattern with `configure()`), `mock.patch` on the original module's function name WILL NOT reach the cached reference. Must replace the cached reference directly:
+
+```python
+# WRONG — patch doesn't reach the cached reference:
+with patch("playlist_arranger.sources.spotify_source.get_playlist_tracks", return_value=...):
+    ...
+
+# RIGHT — replace the cached reference directly:
+saved = _pc._get_playlist_tracks_fn
+_pc._get_playlist_tracks_fn = lambda sp, pid: [...]
+try:
+    ...
+finally:
+    _pc._get_playlist_tracks_fn = saved
+```
+
+This applies to any module that uses `configure()`-style dependency injection (see pattern #18).
+
+### 28. Always Restore Module-Level Attribute Swaps in try/finally (2026-07-29)
+Any test that replaces a module-level attribute (`ps.ui = _MockUI()`, `_pc._get_playlist_tracks_fn = ...`, `_state.sp = ...`) MUST save the original value and restore it in a `finally` block. A missing restore causes test-order-dependency bugs where subsequent tests in the same file (or alphabetically later files) crash on the mutated module state.
+
+```python
+# REQUIRED pattern:
+saved_ui = _src_mod.ui
+_src_mod.ui = _MockUI(ui_calls)
+try:
+    ... test body ...
+finally:
+    _src_mod.ui = saved_ui
+```
+
+Grep verification: `grep -rn "= _MockUI\|= fake_\|_fn = \|CACHE_DIR" tests/*.py` and confirm every match has a corresponding restore.
+
+### 29. Use @pytest.mark.timeout() as Fail-Safe Against Infinite Loops (2026-07-29)
+Any test that calls production code paths with mocked external dependencies (especially pagination loops, `while True` with `time.sleep()`, or thread join with no timeout) should carry `@pytest.mark.timeout(N)` to fail fast with a stack trace instead of hanging the CI/terminal indefinitely.
+
+Install: `pip install pytest-timeout` → decorate with `@pytest.mark.timeout(10)`.
+
+This is a defense-in-depth measure — correct mocks should never trigger the timeout, but incomplete mocks (like a missing `playlist_items` mock on a MagicMock) will produce a clear stack trace at the exact hang location instead of a silent hang.
+
+### 30. NiceGUI Dialog Lifecycle Pattern
 `ui.dialog()` does NOT accept `on_close` keyword argument. To detect dialog close:
 ```python
 with ui.dialog(value=True) as dialog:

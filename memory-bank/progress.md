@@ -80,7 +80,13 @@ Batch analysis includes: interference detection (warns if Spotify plays wrong tr
 - `llm/client.py`: Per-backend dict cache (`_llm_clients` keyed by backend name, `_llm_models_used` keyed by backend name). Legacy `_llm_client`/`_llm_backend_used`/`_llm_model_used` maintained for backward compat with `llm_chat()`.
 - `llm/prompts.py`: Added `"custom"` structure type + `anchor_pct` to `PLAYLIST_STRUCTURES` (2026-07-22).
 
-**Test suite**: 85 anchors page tests + 36 desc generator tests + 61 batch analysis tests + 5 buffer lifecycle tests + 17 desc status tests + 6 run tests = **209 total, all passing**. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 15 cache files).
+**Test suite**: **303 tests, all passing** in 6.75s (2026-07-29 audit) — 85 anchors page + 36 desc generator + 61 batch analysis + 5 buffer lifecycle + 17 desc status + 6 analyze regressions + 16 desc status + 4 logging setup + 2 main reimport + 3 module singleton + 1 sorted uris fallback + 14 spotify source + 1 stale cache schema + 1 start sorting no anchors + 4 nav buttons + 4 connect flow + 3 solver no anchors + 9 distance + 4 logging + 2 desc status boundary + 3 desc status caption = 303. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 15 cache files).
+
+**Test-suite stabilization audit (2026-07-29)**:
+- **Hang root-caused**: `test_stale_cache_without_uri_field_triggers_refetch` — the test mocked `playlist()` but not `playlist_items()`, and `playlist_cache.py`'s DI-cached `_get_playlist_tracks_fn` reference wasn't reachable via `mock.patch` on `spotify_source.get_playlist_tracks`. The MagicMock default iterator caused an infinite pagination loop at `spotify_source.py:356` (`time.sleep(0.3)`). Fixed by directly replacing `_pc._get_playlist_tracks_fn` and `_sps._is_track_playable` with lambdas, patching `_pc.CACHE_DIR_DEFAULT` (not `cfg.CACHE_DIR_DEFAULT`), wrapping in try/finally restore, and adding `@pytest.mark.timeout(10)` as a fail-safe.
+- **Test-order-dependency root-caused**: `test_rebuild_queue_ui_proceeds_when_client_connected` failed when run after `test_batch_advance_no_ui_calls_from_bg_thread` because that test replaced `ps.ui` with a `_MockUI` instance (which lacks context manager protocol) and never restored it. Fixed by saving/restoring `_src_mod.ui` in a try/finally block.
+- **Grep sweep**: Confirmed all other module-level swap patterns (`_save_track_worker_fn`, `_TAVILY_DEBUG_PATH`, `_right_panel`, `_queue_container`, `_get_playlist_tracks_fn`, `CACHE_DIR_DEFAULT`) have proper save/restore teardown. No additional leaks found.
+- **Recommendation**: Consider extracting a reusable `mock_ui` pytest fixture (save/restore pattern) if more tests need UI interception in the future — currently only one test uses this pattern.
 
 The application has been tested with RTX 5080 GPU acceleration. All primary features are functional.
 
