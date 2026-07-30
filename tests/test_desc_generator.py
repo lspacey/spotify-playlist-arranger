@@ -302,8 +302,8 @@ def test_smart_sorting_safe_with_empty_descs():
 
 
 def test_start_sorting_disabled_when_track_not_ok():
-    """_refresh_start_button disables the button when any track is not 'OK'."""
-    from unittest.mock import patch, MagicMock
+    """_refresh_buttons disables Run Sorting + shows hint when any track is not 'OK'."""
+    from unittest.mock import patch
     import playlist_arranger.ui.pages.smart_sorting as _ss
 
     class FB:
@@ -316,28 +316,32 @@ def test_start_sorting_disabled_when_track_not_ok():
         def set_visibility(self, v): self._visible = v
 
     old_btn = _ss._start_sort_btn
-    old_warn = _ss._start_sort_warning
+    old_hint = _ss._analyze_hint
+    old_stats = _ss._stats_result
     old_tracks = list(_ss._playlist_tracks)
     try:
         _ss._start_sort_btn = FB()
-        _ss._start_sort_warning = FL()
+        _ss._analyze_hint = FL()
+        _ss._stats_result = None
         with patch("playlist_arranger.ui.pages.smart_sorting.get_track_status",
                    return_value="✗ Not in DB"):
             _ss._playlist_tracks[:] = [{"id": "t1", "name": "T1", "artist": "A"}]
-            _ss._refresh_start_button()
-        assert not _ss._start_sort_btn._enabled, "Button should be DISABLED when track not OK"
-        assert _ss._start_sort_warning._visible, "Warning should be visible"
-        assert "missing audio features" in _ss._start_sort_warning._text, (
-            f"Warning should mention missing features, got: {_ss._start_sort_warning._text}"
+            _ss._refresh_buttons()
+        assert not _ss._start_sort_btn._enabled, (
+            "Button should be DISABLED when track not OK"
+        )
+        assert _ss._analyze_hint._visible, "Hint should be visible"
+        assert "missing audio features" in _ss._analyze_hint._text, (
+            f"Hint should mention missing features, got: {_ss._analyze_hint._text}"
         )
     finally:
         _ss._start_sort_btn = old_btn
-        _ss._start_sort_warning = old_warn
+        _ss._analyze_hint = old_hint
+        _ss._stats_result = old_stats
         _ss._playlist_tracks[:] = old_tracks
 
-
 def test_start_sorting_enabled_when_all_tracks_ok():
-    """_refresh_start_button enables the button when ALL tracks are OK."""
+    """_refresh_buttons enables Run Sorting when ALL tracks OK and stats cache valid."""
     from unittest.mock import patch
     import playlist_arranger.ui.pages.smart_sorting as _ss
 
@@ -351,28 +355,36 @@ def test_start_sorting_enabled_when_all_tracks_ok():
         def set_visibility(self, v): self._visible = v
 
     old_btn = _ss._start_sort_btn
-    old_warn = _ss._start_sort_warning
+    old_hint = _ss._analyze_hint
+    old_stats = _ss._stats_result
     old_tracks = list(_ss._playlist_tracks)
     try:
         _ss._start_sort_btn = FB()
-        _ss._start_sort_warning = FL()
+        _ss._analyze_hint = FL()
+        # Fake a valid stats cache so _refresh_buttons considers the
+        # "has valid cache" condition satisfied.
+        class FakeStats:
+            components = {"flatness": 0.5}
+        _ss._stats_result = FakeStats()
         with patch("playlist_arranger.ui.pages.smart_sorting.get_track_status",
                    return_value="✓ OK"):
             _ss._playlist_tracks[:] = [
                 {"id": "t1", "name": "T1", "artist": "A"},
                 {"id": "t2", "name": "T2", "artist": "B"},
             ]
-            _ss._refresh_start_button()
-        assert _ss._start_sort_btn._enabled, "Button should be ENABLED when all tracks OK"
-        assert not _ss._start_sort_warning._visible, "Warning should be HIDDEN when all OK"
+            _ss._refresh_buttons()
+        assert _ss._start_sort_btn._enabled, (
+            "Button should be ENABLED when all tracks OK + valid stats cache"
+        )
+        assert not _ss._analyze_hint._visible, "Hint should be HIDDEN when all OK"
     finally:
         _ss._start_sort_btn = old_btn
-        _ss._start_sort_warning = old_warn
+        _ss._analyze_hint = old_hint
+        _ss._stats_result = old_stats
         _ss._playlist_tracks[:] = old_tracks
 
-
 def test_start_sorting_disabled_when_no_tracks_loaded():
-    """_refresh_start_button disables the button when playlist_tracks is empty."""
+    """_refresh_buttons disables Run Sorting when track list is empty."""
     import playlist_arranger.ui.pages.smart_sorting as _ss
 
     class FB:
@@ -385,23 +397,25 @@ def test_start_sorting_disabled_when_no_tracks_loaded():
         def set_visibility(self, v): self._visible = v
 
     old_btn = _ss._start_sort_btn
-    old_warn = _ss._start_sort_warning
+    old_hint = _ss._analyze_hint
+    old_stats = _ss._stats_result
     old_tracks = list(_ss._playlist_tracks)
     try:
         _ss._start_sort_btn = FB()
-        _ss._start_sort_warning = FL()
+        _ss._analyze_hint = FL()
+        _ss._stats_result = None
         _ss._playlist_tracks[:] = []  # no tracks
-        _ss._refresh_start_button()
-        assert not _ss._start_sort_btn._enabled, "Button should be DISABLED with empty track list"
-        assert _ss._start_sort_warning._visible, "Warning should be visible"
-        assert "No tracks loaded" in _ss._start_sort_warning._text, (
-            f"Expected 'No tracks loaded', got: {_ss._start_sort_warning._text}"
+        _ss._refresh_buttons()
+        assert not _ss._start_sort_btn._enabled, (
+            "Button should be DISABLED with empty track list"
         )
+        # With zero tracks, no hint about missing features is shown
+        # (the function skips the hint path when _playlist_tracks is empty).
     finally:
         _ss._start_sort_btn = old_btn
-        _ss._start_sort_warning = old_warn
+        _ss._analyze_hint = old_hint
+        _ss._stats_result = old_stats
         _ss._playlist_tracks[:] = old_tracks
-
 
 def test_load_save_descriptions_removed():
     """load_descriptions / save_descriptions no longer exist in cache.store."""
@@ -508,6 +522,45 @@ def _mock_tavily_response_snippets(snippets: list[str] = None) -> dict:
     }
 
 
+def test_tavily_search_query_format_has_quoted_phrases():
+    """_search_track_context builds quoted-phrase query: '{artist}' '{track_name}' ..."""
+    import playlist_arranger.config as cfg
+    orig_key = cfg.TAVILY_API_KEY
+    orig_cap = cfg.TAVILY_MAX_CALLS_PER_RUN
+    try:
+        cfg.TAVILY_API_KEY = "fake-key-for-test"
+        cfg.TAVILY_MAX_CALLS_PER_RUN = 0  # unlimited for this test
+        dg._reset_tavily_call_counter()
+
+        with patch("tavily.TavilyClient") as mock_tc:
+            mock_instance = MagicMock()
+            mock_instance.search.return_value = _mock_tavily_response_answer(
+                "Portishead's 'Sour Times' is a trip-hop classic about heartbreak..."
+            )
+            mock_tc.return_value = mock_instance
+
+            with patch("playlist_arranger.analysis.desc_generator._write_tavily_debug"):
+                dg._search_track_context("Sour Times", "Portishead")
+
+        # Verify the query passed to TavilyClient.search contains
+        # both quoted artist and quoted track name as separate phrases
+        call_kwargs = mock_instance.search.call_args[1]
+        query = call_kwargs["query"]
+        assert '"Portishead"' in query, (
+            f"Query should contain quoted artist: {query!r}"
+        )
+        assert '"Sour Times"' in query, (
+            f"Query should contain quoted track name: {query!r}"
+        )
+        assert "song meaning reception review" in query, (
+            f"Query should contain context keywords: {query!r}"
+        )
+    finally:
+        cfg.TAVILY_API_KEY = orig_key
+        cfg.TAVILY_MAX_CALLS_PER_RUN = orig_cap
+        dg._reset_tavily_call_counter()
+
+
 def test_tavily_search_returns_none_when_key_not_set():
     """_search_track_context returns None when TAVILY_API_KEY is empty."""
     import playlist_arranger.config as cfg
@@ -581,8 +634,11 @@ def test_web_context_appended_to_user_msg_when_present():
         # Verify the LLM was called with web context in the user message
         assert mock_chat.called, "LLM chat was not called"
         user_msg = mock_chat.call_args[0][1]  # second positional arg is user_msg
-        assert "Additional context from web sources" in user_msg, (
+        assert "Web-search context (verify before using)" in user_msg, (
             f"Expected web context section in user message. Got: {user_msg[:200]}"
+        )
+        assert "Use this ONLY for Part 2" in user_msg, (
+            f"Expected Part 2 usage instructions. Got: {user_msg[:200]}"
         )
         assert "Portishead" in user_msg
         assert "Sour Times" in user_msg
@@ -603,8 +659,11 @@ def test_user_msg_unchanged_when_web_context_absent():
             web_context=None,
         )
         user_msg = mock_chat.call_args[0][1]
-        assert "Additional context from web sources" not in user_msg, (
+        assert "Web-search context (verify before using)" not in user_msg, (
             "Web context section should NOT appear when web_context is None"
+        )
+        assert "Use this ONLY for Part 2" not in user_msg, (
+            "Part 2 instructions should NOT appear when web_context is None"
         )
         assert "Write a description of this track." in user_msg
         assert "Test Track" in user_msg
@@ -1241,6 +1300,36 @@ def test_sync_weights_startup_restores_settings_json_values():
 
 # ── Solver tests (Part 4) ────────────────────────────────────────────────────
 
+def _fake_stats_cache():
+    """Minimal fake StatsResult that satisfies the solver's validation checks.
+    Each component value must be a ComponentCalibration (dataclass with
+    .calibration_scale field), not a plain float."""
+    from playlist_arranger.sorting.stats_analysis import ComponentCalibration
+
+    def _cc(scale: float = 1.0):
+        return ComponentCalibration(
+            name="", calibration_scale=scale,
+            observed_min=0.0, observed_max=1.0, observed_cv=0.5,
+            observed_mean=0.5, observed_std=0.2, mood_mode="",
+        )
+
+    class FakeStats:
+        components = dict(
+            flatness=_cc(), bpm=_cc(), rms_db=_cc(), harm_ratio=_cc(),
+            onset_str=_cc(), dynamic_range=_cc(), centroid_hz=_cc(),
+            bass_pct=_cc(), mid_pct=_cc(), high_pct=_cc(),
+            key=_cc(), beat_reg=_cc(), mood=_cc(),
+        )
+        weights_used = dict(
+            mood=1.0, bpm=1.0, transition=1.0, key=1.0,
+            energy=1.0, texture=1.0, freq_balance=1.0,
+        )
+        artist_penalty = 0.2
+        album_penalty = 0.1
+        penalties_and_sa_params = {}
+    return FakeStats()
+
+
 def test_solver_reads_sa_params_from_settings():
     """_run_smart_sorting uses config settings, not hardcoded N_RUNS=100 / *500."""
     import playlist_arranger.config as _cfg
@@ -1315,9 +1404,10 @@ def test_solver_reads_sa_params_from_settings():
         s.sa_T_end = 1e-3
 
         logs = []
+        stats = _fake_stats_cache()
         ordered_descs, cost = _run_smart_sorting(
             fake_db, descs, fake_pl_id, "Test Playlist",
-            progress_cb=logs.append, settings=s,
+            progress_cb=logs.append, settings=s, stats_cache=stats,
         )
 
         # Should have returned 3 tracks (2 free + 1 anchor with 1 open slot)
@@ -1368,9 +1458,10 @@ def test_solver_no_anchors_runs_unconstrained_free_tsp():
 
     with patch.object(solver_mod, "_load_anchors_file", return_value=None), \
          patch.object(solver_mod, "_load_embedding", return_value=None):
+        stats = _fake_stats_cache()
         ordered, cost = _run_smart_sorting(
             fake_db, descs, "nonexistent_pl", "N/A",
-            progress_cb=logs.append,
+            progress_cb=logs.append, stats_cache=stats,
         )
 
     assert len(ordered) == 3, f"Expected 3 ordered tracks, got {len(ordered)}"
@@ -1415,8 +1506,9 @@ def test_solver_progress_callback_delivers_logs():
         anchors_path.write_text(json.dumps(anchors_data), encoding="utf-8")
         _SORTING_CACHE.pop(fake_pl_id, None)
         logs = []
+        stats_cb = _fake_stats_cache()
         _run_smart_sorting(fake_db, descs, fake_pl_id, "Test",
-                           progress_cb=logs.append, settings=s)
+                           progress_cb=logs.append, settings=s, stats_cache=stats_cb)
         # Verify we got the "Building distance matrix" log
         assert any("Building distance matrix" in m or "Using cached" in m for m in logs), (
             f"Expected distance matrix log, got: {logs}"
@@ -1553,8 +1645,9 @@ def test_solver_with_long_n_runs_logging():
         anchors_path.write_text(json.dumps(anchors_data), encoding="utf-8")
         _SORTING_CACHE.pop(fake_pl_id, None)
         logs = []
+        stats_lr = _fake_stats_cache()
         _run_smart_sorting(fake_db, descs, fake_pl_id, "Test",
-                           progress_cb=logs.append, settings=s)
+                           progress_cb=logs.append, settings=s, stats_cache=stats_lr)
         # Should see Run 1/40 and Run 20/40 and Run 40/40
         log_text = "\n".join(logs)
         assert "Run 1/40" in log_text or "Run 1/40" in log_text

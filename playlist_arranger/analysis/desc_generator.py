@@ -239,29 +239,7 @@ def va_intensity_label(valence: float, arousal: float) -> str:
 
 # ── LLM fallback chain ───────────────────────────────────────────────────────
 
-DESC_SYSTEM_PROMPT = (
-    "You are a music expert and audio analyst specializing in contemporary "
-    "music across genres. You receive quantitative audio features extracted "
-    "directly from a recording (tempo, key, spectral features, dynamics, "
-    "frequency balance, and computed Valence/Arousal coordinates from the "
-    "Russell circumplex model), together with track metadata (title, artist, "
-    "album). Write a concise but vivid English description (3-5 sentences) "
-    "of the track's sonic character, mood, energy, and production style. "
-    "Be specific: mention tempo feel, harmonic color, texture, dynamics, and "
-    "the sonic palette that fits the genre implied by the audio features "
-    "(e.g. acoustic instruments, synths, beats, vocals, atmosphere) — do not "
-    "assume it's electronic music unless the features/metadata suggest it. "
-    "Do NOT invent biographical facts about the artist. Do NOT start with "
-    "the track name or artist name as the first word. Reply with the "
-    "description only, no preamble, no markdown formatting.\n\n"
-    "You may also receive web-search context (reviews, listener reactions, "
-    "the song's known meaning or reception) in addition to the audio features. "
-    "When present, blend relevant emotional/thematic insights from this context "
-    "into your description alongside the sonic characteristics — but always "
-    "verify plausibility against the audio features rather than blindly trusting "
-    "external text. Never state unverified biographical claims as fact. If the "
-    "web context is absent, rely solely on the audio features as before."
-)
+from playlist_arranger.llm.prompts import DESCRIPTION_SYSTEM_PROMPT  # canonical base prompt (single source of truth)
 
 
 def _get_llm_candidates(s) -> list:
@@ -380,7 +358,7 @@ def _search_track_context(track_name: str, artist: str) -> str | None:
 
     _tavily_call_count_this_run += 1
 
-    query = f'"{track_name}" "{artist}" song meaning mood reception review'
+    query = f'"{artist}" "{track_name}" song meaning reception review'
 
     try:
         from tavily import TavilyClient  # noqa: F811 — optional dependency
@@ -390,7 +368,7 @@ def _search_track_context(track_name: str, artist: str) -> str | None:
             query=query,
             search_depth="basic",
             max_results=5,
-            include_answer="basic",
+            include_answer=True,  # Union[bool, Literal['basic', 'advanced']] — True requests the synthesized answer
         )
 
         # Debug dump (best-effort, don't block on failure)
@@ -545,14 +523,14 @@ def _try_generate_description(track_name: str, artist: str, album: str,
 
             if web_context:
                 user_msg += (
-                    "\n\nAdditional context from web sources (reviews, meaning, "
-                    "reception — use only as supporting color, do not treat as "
-                    "verified biographical fact):\n" + web_context
+                    f"\n\nWeb-search context (verify before using):\n{web_context}\n\n"
+                    "Use this ONLY for Part 2 (emotional/cultural significance). "
+                    "If it doesn't clearly discuss this specific track, ignore it."
                 )
 
             user_msg += "\n\nWrite a description of this track."
 
-            raw = llm_chat(DESC_SYSTEM_PROMPT, user_msg, temperature=0.7, max_tokens=2000)
+            raw = llm_chat(DESCRIPTION_SYSTEM_PROMPT, user_msg, temperature=0.7, max_tokens=2000)
 
             # Strip blocks if present
             cleaned = _THINK_RE.sub("", raw).strip()

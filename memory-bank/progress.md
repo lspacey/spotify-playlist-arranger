@@ -48,6 +48,8 @@
 - [x] **Session-level panel persistence** (2026-07-24)
 - [x] **Per-playlist calibration & stats analysis workflow** — `stats_analysis.py`, "Analyze Statistics" UI with weight sliders + CV badges + histograms, solver gating via `stats_cache`, per-component calibration (transition, flatness, dyn_range, onset_str) via `_robust_range()` (2026-07-30)
 - [x] **Distance matrix diagnostics** — CSV dump, histogram PNG, summary stats log line in solver (2026-07-30)
+- [x] **Smart Sorting post-save behavior fixes** — RuntimeError on `ui.notify` after `await asyncio.to_thread()`, playlist dropdown refresh after Save as New, track list refresh after Save/Overwrite (2026-07-30)
+- [x] **Smart Sorting stale-reference cleanup** — Reset all 18 UI element globals to None at `build_smart_sorting()` entry, cancel leaked `_log_timer`, defensive RuntimeError guards in `_refresh_save_buttons` / `_refresh_buttons` (2026-07-30)
 - [ ] Wire `desc_generator` worker to actually call LLM (placeholder currently)
 - [ ] Wire `run_descriptions()` to `desc_queue_add_many()` + populate `current_descs` from DB
 - [ ] Cross-platform audio capture (macOS/Linux support)
@@ -82,7 +84,7 @@ Batch analysis includes: interference detection (warns if Spotify plays wrong tr
 - `llm/client.py`: Per-backend dict cache (`_llm_clients` keyed by backend name, `_llm_models_used` keyed by backend name). Legacy `_llm_client`/`_llm_backend_used`/`_llm_model_used` maintained for backward compat with `llm_chat()`.
 - `llm/prompts.py`: Added `"custom"` structure type + `anchor_pct` to `PLAYLIST_STRUCTURES` (2026-07-22).
 
-**Test suite**: **303 tests, all passing** in 6.75s (2026-07-29 audit) — 85 anchors page + 36 desc generator + 61 batch analysis + 5 buffer lifecycle + 17 desc status + 6 analyze regressions + 16 desc status + 4 logging setup + 2 main reimport + 3 module singleton + 1 sorted uris fallback + 14 spotify source + 1 stale cache schema + 1 start sorting no anchors + 4 nav buttons + 4 connect flow + 3 solver no anchors + 9 distance + 4 logging + 2 desc status boundary + 3 desc status caption = 303. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 15 cache files).
+**Test suite**: **363 tests, all passing** in 8.06s (2026-07-30) — 85 anchors page + 36 desc generator + 61 batch analysis + 5 buffer lifecycle + 17 desc status + 6 analyze regressions + 16 desc status + 4 logging setup + 2 main reimport + 3 module singleton + 1 sorted uris fallback + 14 spotify source + 1 stale cache schema + 1 start sorting no anchors + 4 nav buttons + 4 connect flow + 3 solver no ancestors + 14 distance + 4 logging + 2 desc status boundary + 3 desc status caption + 19 smart sorting + 6 analyze regressions + 7 stats analysis + 6 stats workflow + 14 insert last n = 363. Hash baseline: `tests/_pre_suite_hash.json` (674 embeddings, 15 cache files).
 
 **Test-suite stabilization audit (2026-07-29)**:
 - **Hang root-caused**: `test_stale_cache_without_uri_field_triggers_refetch` — the test mocked `playlist()` but not `playlist_items()`, and `playlist_cache.py`'s DI-cached `_get_playlist_tracks_fn` reference wasn't reachable via `mock.patch` on `spotify_source.get_playlist_tracks`. The MagicMock default iterator caused an infinite pagination loop at `spotify_source.py:356` (`time.sleep(0.3)`). Fixed by directly replacing `_pc._get_playlist_tracks_fn` and `_sps._is_track_playable` with lambdas, patching `_pc.CACHE_DIR_DEFAULT` (not `cfg.CACHE_DIR_DEFAULT`), wrapping in try/finally restore, and adding `@pytest.mark.timeout(10)` as a fail-safe.

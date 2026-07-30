@@ -263,6 +263,58 @@ with ui.dialog(value=True) as dialog:
 ```
 `e.args` is falsy when the model-value changes to indicate dialog closed. This fires `_close_dialog_state()` on close only.
 
+### 34. Page Build Entry Stale-Reference Reset (2026-07-30)
+When NiceGUI deletes a page's UI elements on navigation, modules that hold references to those elements via module-level globals MUST reset them all to `None` at the top of the build function BEFORE any new element creation or event handler invocation. This prevents "element has been deleted but is still being used" RuntimeErrors when lazy-created elements (e.g., save buttons that only appear after sorting) survive across page re-navigations.
+
+```python
+def build_some_page():
+    global _btn_a, _btn_b, _spinner
+    # MUST reset ALL UI globals first
+    _btn_a = None
+    _btn_b = None
+    _spinner = None
+    # Only THEN create new elements
+    _btn_a = ui.button(...)
+```
+
+Also cancel any leaked `ui.timer()` instances from previous page instances before creating new ones — background timer callbacks firing against a disconnected client produce "Client has been deleted" warnings.
+
+### 35. Defensive RuntimeError Guards on UI Mutations (2026-07-30)
+Any function that mutates module-level UI element globals (`.set_enabled()`, `.set_visibility()`, `.set_text()`, etc.) SHOULD wrap those calls in `try/except RuntimeError` as a second line of defense against stale references. The explicit reset in pattern #34 is the PRIMARY fix, but this guard catches edge cases where a stale reference survives (e.g., async timing, event callback chains).
+
+```python
+def _refresh_buttons():
+    for btn in (_btn_a, _btn_b):
+        if btn is None:
+            continue
+        try:
+            btn.set_enabled(True)
+        except RuntimeError:
+            logger.debug("UI element already deleted — skipping")
+        except Exception:
+            logger.exception("Unexpected error")
+```
+
+This follows the same principle as the `has_socket_connection` guard in `analysis_queue.py` (pattern #13 drain), but uses `RuntimeError` as the catch target since NiceGUI raises `RuntimeError("element has been deleted")` (not a custom exception class).
+
+### 36. Source-Inspection Tests for UI Code (2026-07-30)
+For NiceGUI page code that can't be easily unit-tested with mocked elements (due to NiceGUI's internal slot/context state), use source-inspection tests that parse the actual `.py` file and verify code structure invariants:
+- Order of operations (e.g., "client = ui.context.client" appears before "asyncio.to_thread")
+- Presence of guard patterns (e.g., "with client:" appears after await)
+- Mandatory cleanup (e.g., all 18 UI globals reset to None before `_on_playlist_selected` call)
+
+```python
+_SRC_PATH = pathlib.Path(__file__).resolve().parent.parent / "playlist_arranger" / "..." / "module.py"
+
+def test_client_captured_before_await():
+    source = _SRC_PATH.read_text(encoding="utf-8")
+    client_pos = source.index("client = ui.context.client")
+    to_thread_pos = source.index("asyncio.to_thread")
+    assert client_pos < to_thread_pos
+```
+
+These tests complement traditional mock-based behavioral tests and catch regressions in code structure that behavioral tests might miss.
+
 ## Component Relationships
 
 ### Data Flow: Spotify Track Analysis

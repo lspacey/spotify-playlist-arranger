@@ -18,7 +18,7 @@ from playlist_arranger.sources.spotify_source import (
     ERROR_USER_MESSAGES,
 )
 from playlist_arranger.cache.store import atomic_write_json
-from playlist_arranger.config import ANCHORS_DIR_DEFAULT
+from playlist_arranger.config import ANCHORS_DIR_DEFAULT, CACHE_DIR_DEFAULT
 from playlist_arranger.sorting.anchors import _load_anchors_file
 from playlist_arranger.ui.components.track_rows import build_track_rows
 from playlist_arranger.ui.state import get_track_status, STATUS_OK
@@ -47,6 +47,8 @@ _spinner = None
 _save_new_btn = None
 _save_current_btn = None
 _save_spinner = None
+_insert_last_btn = None
+_insert_n_input: "ui.number | None" = None
 
 # ── Page-local data ─────────────────────────────────────────────────────────
 _playlist_tracks: list = []
@@ -55,6 +57,7 @@ _sorted_track_uris: list[str] = []
 _save_in_progress: bool = False
 _stats_result = None  # StatsResult | None — current analysis result
 _weight_sliders: dict[str, "ui.number"] = {}
+_adv_inputs: dict[str, "ui.number"] = {}
 _eff_bar_containers: dict[str, "ui.element"] = {}
 _obs_max_cache: dict[str, float] = {}
 _comp_order: list[str] = []
@@ -138,21 +141,83 @@ def _refresh_save_buttons():
     global _save_new_btn, _save_current_btn, _save_spinner, _save_in_progress
     has_results = len(_sorted_track_uris) > 0
     can_save = has_results and not _save_in_progress
-    if _save_new_btn is not None:
-        _save_new_btn.set_enabled(can_save)
-    if _save_current_btn is not None:
-        _save_current_btn.set_enabled(can_save)
+    for btn in (_save_new_btn, _save_current_btn):
+        if btn is None:
+            continue
+        try:
+            btn.set_enabled(can_save)
+        except RuntimeError:
+            logger.debug("Save button already deleted — skipping set_enabled")
+        except Exception:
+            logger.exception("Unexpected error in _refresh_save_buttons set_enabled")
     if _save_spinner is not None:
-        _save_spinner.set_visibility(_save_in_progress)
+        try:
+            _save_spinner.set_visibility(_save_in_progress)
+        except RuntimeError:
+            logger.debug("Save spinner already deleted — skipping set_visibility")
+        except Exception:
+            logger.exception("Unexpected error in _refresh_save_buttons spinner visibility")
+
+
+def _validate_insert_n() -> bool:
+    """Return True if the N input value is a strictly positive integer."""
+    global _insert_n_input
+    if _insert_n_input is None:
+        return False
+    try:
+        val = _insert_n_input.value
+    except Exception:
+        return False
+    if val is None:
+        return False
+    try:
+        n = int(val)
+    except (ValueError, TypeError):
+        return False
+    return n > 0 and float(val) == float(n)
 
 
 def _refresh_buttons():
-    """Update Analyze Statistics + Run Sorting button states."""
+    """Update Analyze Statistics + Run Sorting + Insert N Last Tracks button states.
+
+    All UI-element accesses are guarded with try/except RuntimeError to survive
+    stale references to deleted elements from a previous page instance.
+    """
     global _analyze_stats_btn, _start_sort_btn, _analyze_hint
+    global _insert_last_btn, _insert_n_input
+
+    def _safe_set_enabled(btn, enabled: bool, label: str = "") -> None:
+        if btn is None:
+            return
+        try:
+            btn.set_enabled(enabled)
+        except RuntimeError:
+            logger.debug("UI element %s already deleted — skipping set_enabled", label)
+        except Exception:
+            logger.exception("Unexpected error in _refresh_buttons set_enabled for %s", label)
+
+    def _safe_set_visibility(el, visible: bool, label: str = "") -> None:
+        if el is None:
+            return
+        try:
+            el.set_visibility(visible)
+        except RuntimeError:
+            logger.debug("UI element %s already deleted — skipping set_visibility", label)
+        except Exception:
+            logger.exception("Unexpected error in _refresh_buttons set_visibility for %s", label)
+
+    def _safe_set_text(el, text: str, label: str = "") -> None:
+        if el is None:
+            return
+        try:
+            el.set_text(text)
+        except RuntimeError:
+            logger.debug("UI element %s already deleted — skipping set_text", label)
+        except Exception:
+            logger.exception("Unexpected error in _refresh_buttons set_text for %s", label)
 
     # Analyze Statistics: enabled when tracks are loaded
-    if _analyze_stats_btn is not None:
-        _analyze_stats_btn.set_enabled(len(_playlist_tracks) > 0)
+    _safe_set_enabled(_analyze_stats_btn, len(_playlist_tracks) > 0, "analyze_stats_btn")
 
     # Run Sorting: enabled only when BOTH all tracks are OK AND a valid stats cache exists
     all_ok = len(_playlist_tracks) > 0 and all(
@@ -160,19 +225,23 @@ def _refresh_buttons():
     )
     has_valid_cache = _stats_result is not None and _stats_result.components.get("flatness") is not None
 
-    if _start_sort_btn is not None:
-        _start_sort_btn.set_enabled(all_ok and has_valid_cache)
+    _safe_set_enabled(_start_sort_btn, all_ok and has_valid_cache, "start_sort_btn")
+
+    # Insert N Last Tracks: base preconditions (tracks loaded + valid cache)
+    insert_base_ok = len(_playlist_tracks) > 0 and has_valid_cache
+    insert_n_ok = _validate_insert_n()
+    _safe_set_enabled(_insert_last_btn, insert_base_ok and insert_n_ok, "insert_last_btn")
 
     if _analyze_hint is not None:
         if all_ok and not has_valid_cache:
-            _analyze_hint.set_text("Run Analyze Statistics first")
-            _analyze_hint.set_visibility(True)
+            _safe_set_text(_analyze_hint, "Run Analyze Statistics first", "analyze_hint")
+            _safe_set_visibility(_analyze_hint, True, "analyze_hint")
         elif not all_ok and _playlist_tracks:
             missing = sum(1 for t in _playlist_tracks if get_track_status(t) != STATUS_OK)
-            _analyze_hint.set_text(f"{missing} track(s) missing audio features — analyze them first")
-            _analyze_hint.set_visibility(True)
+            _safe_set_text(_analyze_hint, f"{missing} track(s) missing audio features — analyze them first", "analyze_hint")
+            _safe_set_visibility(_analyze_hint, True, "analyze_hint")
         else:
-            _analyze_hint.set_visibility(False)
+            _safe_set_visibility(_analyze_hint, False, "analyze_hint")
 
 
 def _error_user_message(err: dict | str | None) -> str:
@@ -195,6 +264,7 @@ async def _on_save_new_playlist():
     if not _state.sp:
         ui.notify("Spotify not connected", type="warning")
         return
+    client = ui.context.client
     _save_in_progress = True; _refresh_save_buttons()
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     new_name = f"{_playlist_name}_{ts}" if _playlist_name else f"Sorted_{ts}"
@@ -203,20 +273,25 @@ async def _on_save_new_playlist():
         result = await asyncio.to_thread(create_playlist, _state.sp, new_name, _sorted_track_uris)
     except Exception as exc:
         logger.exception("Failed to create new playlist '%s'", new_name)
-        ui.notify(f"Failed to create playlist: {exc}", type="negative")
+        with client:
+            ui.notify(f"Failed to create playlist: {exc}", type="negative")
     else:
-        try:
-            if result["success"]:
-                pl_info = result.get("playlist") or {}
-                pl_name = pl_info.get("name", new_name) if isinstance(pl_info, dict) else new_name
-                ui.notify(f"Saved to new playlist: {pl_name} ({result['tracks_saved']} tracks)", type="positive")
-            else:
-                err_msg = _error_user_message(result.get("error"))
-                ui.notify(f"Failed to create playlist: {err_msg}", type="negative")
-        except Exception:
-            logger.exception("UI error rendering save result")
+        with client:
+            try:
+                if result["success"]:
+                    pl_info = result.get("playlist") or {}
+                    pl_name = pl_info.get("name", new_name) if isinstance(pl_info, dict) else new_name
+                    ui.notify(f"Saved to new playlist: {pl_name} ({result['tracks_saved']} tracks)", type="positive")
+                    await _refresh_playlist_dropdown()
+                else:
+                    err_msg = _error_user_message(result.get("error"))
+                    ui.notify(f"Failed to create playlist: {err_msg}", type="negative")
+            except Exception:
+                logger.exception("UI error rendering save result")
     finally:
-        _save_in_progress = False; _refresh_save_buttons()
+        _save_in_progress = False
+        with client:
+            _refresh_save_buttons()
 
 
 def _backup_playlist_snapshot(sp, pl_id: str, pl_name: str):
@@ -254,30 +329,40 @@ async def _on_save_current_playlist():
         ui.notify("Spotify not connected", type="warning"); return
     n = len(_sorted_track_uris)
 
+    client = ui.context.client
+
     def _do_overwrite():
         async def _execute():
             global _save_in_progress
-            _save_in_progress = True; _refresh_save_buttons()
+            _save_in_progress = True
+            with client:
+                _refresh_save_buttons()
             result = None
             try:
                 bk = _backup_playlist_snapshot(_state.sp, pl_id, _playlist_name)
                 if bk is None:
-                    ui.notify("Proceeding without backup — could not save playlist snapshot", type="warning")
+                    with client:
+                        ui.notify("Proceeding without backup — could not save playlist snapshot", type="warning")
                 result = await asyncio.to_thread(reorder_playlist, _state.sp, pl_id, _sorted_track_uris)
             except Exception as exc:
                 logger.exception("Failed to reorder playlist '%s' (%s)", _playlist_name, pl_id[:8])
-                ui.notify(f"Failed to reorder playlist: {exc}", type="negative")
+                with client:
+                    ui.notify(f"Failed to reorder playlist: {exc}", type="negative")
             else:
-                try:
-                    if result["success"]:
-                        ui.notify(f"Playlist reordered: {_playlist_name} ({n} tracks)", type="positive")
-                    else:
-                        err_msg = _error_user_message(result.get("error"))
-                        ui.notify(f"Reorder failed: {err_msg}", type="negative")
-                except Exception:
-                    logger.exception("UI error rendering reorder result")
+                with client:
+                    try:
+                        if result["success"]:
+                            ui.notify(f"Playlist reordered: {_playlist_name} ({n} tracks)", type="positive")
+                            await _refresh_current_playlist_tracks()
+                        else:
+                            err_msg = _error_user_message(result.get("error"))
+                            ui.notify(f"Reorder failed: {err_msg}", type="negative")
+                    except Exception:
+                        logger.exception("UI error rendering reorder result")
             finally:
-                _save_in_progress = False; _refresh_save_buttons()
+                _save_in_progress = False
+                with client:
+                    _refresh_save_buttons()
         asyncio.ensure_future(_execute())
 
     with ui.dialog() as confirm_dialog, ui.card():
@@ -287,6 +372,68 @@ async def _on_save_current_playlist():
             ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
             ui.button("Confirm", on_click=lambda: (confirm_dialog.close(), _do_overwrite())).props("color=red")
     confirm_dialog.open()
+
+
+async def _refresh_playlist_dropdown():
+    """Re-fetch user playlists and update the dropdown options in place.
+
+    Called after successfully creating a new playlist via Save as New Playlist.
+    Preserves the currently selected playlist value.
+    """
+    global _sort_select
+    if _sort_select is None:
+        return
+    try:
+        if not _state.sp or not _state.spotify_user_id:
+            return
+        playlists = await asyncio.to_thread(get_own_playlists, _state.sp, _state.spotify_user_id)
+        options = {pl["id"]: pl["name"] for pl in playlists}
+        current_value = _sort_select.value
+        _sort_select.set_options(options)
+        if current_value and current_value in options:
+            _sort_select.value = current_value
+    except Exception:
+        logger.exception("Failed to refresh playlist dropdown after save-as-new")
+
+
+async def _refresh_current_playlist_tracks():
+    """Re-fetch this playlist's tracks from Spotify after overwrite.
+
+    Called after a successful reorder_playlist in Save/Overwrite Current Playlist.
+    Updates the local track list, writes the cache file with the new snapshot_id,
+    and triggers a page redraw so the on-page track list reflects the new order
+    immediately.
+    """
+    global _playlist_tracks, _current_snapshot_id
+
+    pl_id = getattr(_state, "selected_playlist_id", None)
+    if not pl_id:
+        return
+    try:
+        tracks = await asyncio.to_thread(get_playlist_tracks, _state.sp, pl_id)
+        if not tracks:
+            logger.warning("get_playlist_tracks returned empty list for %s after reorder", pl_id[:8])
+            return
+        _playlist_tracks = tracks
+
+        # Update snapshot_id and write cache
+        try:
+            pl_data = _state.sp.playlist(pl_id, fields="snapshot_id,name")
+            _current_snapshot_id = pl_data.get("snapshot_id", "")
+        except Exception:
+            logger.exception("Failed to fetch snapshot_id after reorder for %s", pl_id[:8])
+            _current_snapshot_id = ""
+
+        if _current_snapshot_id:
+            cache_file = CACHE_DIR_DEFAULT / f"{pl_id}-{_current_snapshot_id}.tracks.json"
+            try:
+                atomic_write_json(cache_file, tracks)
+            except Exception:
+                logger.exception("Failed to write track cache after reorder for %s", pl_id[:8])
+
+        _rebuild_all()
+    except Exception:
+        logger.exception("Failed to refresh playlist tracks after reorder")
 
 
 def _rebuild_all():
@@ -445,6 +592,11 @@ async def _on_analyze_statistics():
         return
 
     _drain_log_queue()
+
+    # ── Preserve existing cache's penalties_and_sa_params on re-analyze ──
+    # (Same cache-over-settings precedence as weights — see B.3 fix above)
+    if existing_cache is not None and existing_cache.penalties_and_sa_params:
+        _stats_result.penalties_and_sa_params = dict(existing_cache.penalties_and_sa_params)
 
     # Render the full stats panel
     _render_full_stats_panel()
@@ -628,7 +780,7 @@ def _render_full_stats_panel():
                                 value=init_val, min=0.0, max=2.0, step=0.01,
                                 format="%.3f" if key == "duration_tolerance" else "%.2f",
                             ).classes("w-36").props("dense")
-                            setattr(inp, "_adv_key", key)
+                            _adv_inputs[key] = inp
                             with ui.tooltip().classes("text-xs max-w-sm"):
                                 ui.label(_adv_descriptions.get(key, ""))
                 # SA params column
@@ -650,7 +802,7 @@ def _render_full_stats_panel():
                                 value=init_val, min=vmin, max=vmax, step=step,
                                 format=fmt,
                             ).classes("w-44").props("dense")
-                            setattr(inp, "_adv_key", key)
+                            _adv_inputs[key] = inp
                             with ui.tooltip().classes("text-xs max-w-sm"):
                                 ui.label(_adv_descriptions.get(key, ""))
 
@@ -781,6 +933,17 @@ def _on_save_stats():
     for comp_name, slider in _weight_sliders.items():
         current_weights[comp_name] = float(slider.value)
     _stats_result.weights_used = current_weights
+
+    # Collect current advanced param values from UI inputs
+    # n_runs and iterations_multiplier must be int, not float (range() requires int)
+    if _adv_inputs:
+        current_params = {}
+        for key, inp in _adv_inputs.items():
+            val = float(inp.value)
+            if key in ("iterations_multiplier", "n_runs"):
+                val = int(val)
+            current_params[key] = val
+        _stats_result.penalties_and_sa_params = current_params
 
     from playlist_arranger.sorting.stats_analysis import save_stats_cache
     try:
@@ -939,13 +1102,109 @@ async def _on_start_sorting():
 
 
 def _restore_ui_after_sorting(*, failure: bool = False):
-    global _start_sort_btn, _spinner, _logs_expansion
+    global _start_sort_btn, _spinner, _logs_expansion, _insert_last_btn
     if _start_sort_btn is not None:
         _start_sort_btn.set_enabled(True)
     if _spinner is not None:
         _spinner.set_visibility(False)
     if failure and _logs_expansion is not None:
         _logs_expansion.value = True
+    # Re-validate insert button after sort completes
+    _refresh_buttons()
+
+
+# ── Insert N Last Tracks async handler ──────────────────────────────────────
+
+async def _on_insert_last_n():
+    """Run greedy insertion of the last N tracks in a background thread."""
+    global _insert_last_btn, _insert_n_input, _spinner, _sorted_track_uris
+    global _results_container
+
+    pl_id = getattr(_state, "selected_playlist_id", None)
+    if not pl_id:
+        ui.notify("No playlist selected", type="warning")
+        return
+    if not _playlist_tracks:
+        ui.notify("No tracks loaded", type="warning")
+        return
+
+    # Defensive validation (button should already be disabled otherwise)
+    if not _validate_insert_n():
+        ui.notify("N must be a positive integer", type="warning")
+        return
+    n = int(_insert_n_input.value)
+
+    if _insert_last_btn is not None:
+        _insert_last_btn.set_enabled(False)
+    if _spinner is not None:
+        _spinner.set_visibility(True)
+
+    _clear_results()
+
+    from playlist_arranger.database import db as _db
+    try:
+        db_dict = _db.load_all()
+    except Exception as exc:
+        logger.exception("Failed to load DB for insert")
+        ui.notify(f"Failed to load track database: {exc}", type="negative")
+        if _insert_last_btn is not None:
+            _insert_last_btn.set_enabled(True)
+        if _spinner is not None:
+            _spinner.set_visibility(False)
+        return
+
+    from playlist_arranger.sorting.insert import insert_last_n_tracks
+
+    try:
+        result_tracks, total_cost = await asyncio.to_thread(
+            insert_last_n_tracks,
+            _playlist_tracks,
+            n,
+            db_dict,
+            _stats_result,
+        )
+    except Exception as exc:
+        logger.exception("Insert N last tracks failed")
+        ui.notify(f"Insert failed: {exc}", type="negative")
+        if _insert_last_btn is not None:
+            _insert_last_btn.set_enabled(True)
+        if _spinner is not None:
+            _spinner.set_visibility(False)
+        return
+
+    if _spinner is not None:
+        _spinner.set_visibility(False)
+
+    # Build ordered_descs for result rendering (matching _on_start_sorting convention)
+    ordered_descs = []
+    for t in result_tracks:
+        tid = t.get("id", "")
+        desc = {"track_id": tid, "name": t.get("name", "?"), "artist": t.get("artist", "?")}
+        ordered_descs.append(desc)
+
+    # Convert to URIs for save buttons
+    _sorted_track_uris = []
+    _dropped_no_id = 0
+    for t in result_tracks:
+        uri = t.get("uri") or ""
+        if not uri.startswith("spotify:track:"):
+            tid = t.get("id") or t.get("track_id") or ""
+            uri = f"spotify:track:{tid}" if tid else ""
+        if uri.startswith("spotify:track:"):
+            _sorted_track_uris.append(uri)
+        else:
+            _dropped_no_id += 1
+    if _dropped_no_id:
+        logger.warning("%d track(s) dropped from save list — no track_id/uri available", _dropped_no_id)
+
+    if _results_container is not None:
+        _results_container.clear()
+        with _results_container:
+            _render_sorted_results(ordered_descs, total_cost)
+
+    _refresh_save_buttons()
+    _refresh_buttons()
+    ui.notify(f"Insert complete — {n} track(s) merged (cost: {total_cost:.4f})", type="positive")
 
 
 # ── UI rendering ────────────────────────────────────────────────────────────
@@ -1044,6 +1303,33 @@ def build_smart_sorting():
     global _playlist_tracks, _playlist_name, _sorted_track_uris
     global _log_timer
     global _save_new_btn, _save_current_btn, _save_spinner
+    global _insert_last_btn, _insert_n_input
+
+    # ── Stale-reference cleanup ────────────────────────────────────────────
+    _sort_select = None
+    _track_list_container = None
+    _anchors_list_container = None
+    _analyze_stats_btn = None
+    _start_sort_btn = None
+    _analyze_hint = None
+    _logs_expansion = None
+    _logs_content = None
+    _logs_summary = None
+    _histogram_image = None
+    _stats_panel = None
+    _results_container = None
+    _spinner = None
+    _save_new_btn = None
+    _save_current_btn = None
+    _save_spinner = None
+    _insert_last_btn = None
+    _insert_n_input = None
+    if _log_timer is not None:
+        try:
+            _log_timer.cancel()
+        except Exception:
+            logger.debug("Failed to cancel old _log_timer — already disconnected")
+        _log_timer = None
 
     ui.label("Sorting").classes("text-2xl font-bold mb-4")
 
@@ -1082,7 +1368,7 @@ def build_smart_sorting():
     with _anchors_list_container:
         _render_anchors_list()
 
-    # ── 4. Analyze Statistics + Run Sorting buttons ───────────────────────
+    # ── 4. Analyze Statistics + Run Sorting + Insert N Last Tracks ─────────
     with ui.row().classes("gap-2 items-center mt-2"):
         _analyze_stats_btn = ui.button(
             "Analyze Statistics",
@@ -1092,6 +1378,15 @@ def build_smart_sorting():
             "Run Sorting",
             on_click=_on_start_sorting,
         ).props("color=green")
+        _insert_last_btn = ui.button(
+            "Insert N Last Tracks",
+            on_click=_on_insert_last_n,
+        ).props("color=blue")
+        _insert_n_input = ui.number(
+            label="N", value=1, min=1, step=1,
+            format="%.0f",
+        ).classes("w-20").props("dense")
+        _insert_n_input.on_value_change(lambda e: _refresh_buttons())
         _spinner = ui.spinner(size="sm")
         _spinner.set_visibility(False)
 
