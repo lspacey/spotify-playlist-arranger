@@ -143,3 +143,93 @@ def test_save_stats_uses_current_slider_values():
         assert saved_result.weights_used["mood"] == 0.60
         assert saved_result.weights_used["bpm"] == 0.05
         assert saved_result.weights_used["transition"] == 0.15
+
+
+# ── B.3 regression test: Re-analyze must load weights from cache, not settings ──
+
+def test_re_analyze_loads_weights_from_cache():
+    """When cache exists with distinctive weights, _on_analyze_statistics
+    must initialize sliders from cache.weights_used — NOT from settings.json.
+
+    Reproduces CRITICAL bug: clicking 'Re-analyze' reverted weights to defaults.
+    """
+    import asyncio
+    import playlist_arranger.ui.pages.smart_sorting as ss
+    from playlist_arranger.ui import state as _state
+
+    # Setup: cache with distinctive weights (mood=0.05 is NOT a settings default)
+    _state.selected_playlist_id = "pl_reanalyze"
+    _setup_page_state()
+    ss._current_snapshot_id = "snap_reanalyze"
+    ss._stats_result = _mock_stats_result()
+    ss._stats_result.weights_used = {
+        "mood": 0.05, "bpm": 0.30, "transition": 0.15,
+        "key": 0.10, "energy": 0.20, "texture": 0.05, "freq_balance": 0.15,
+    }
+    ss._weight_sliders = {}  # No sliders yet (simulates pre-render state)
+
+    # Mock the analysis pipeline so we don't actually call Spotify/DB
+    mock_analyze = MagicMock(return_value=ss._stats_result)
+
+    with patch.object(ss, "_logs_expansion"), \
+         patch.object(ss, "_spinner"), \
+         patch.object(ss, "_enqueue_log"), \
+         patch.object(ss, "_drain_log_queue"), \
+         patch.object(ss, "_render_full_stats_panel"), \
+         patch.object(ss, "ui") as mock_ui, \
+         patch("playlist_arranger.database.db.load_all",
+               return_value={"t1": {"features": {}, "start_seg": {}, "end_seg": {}},
+                              "t2": {"features": {}, "start_seg": {}, "end_seg": {}}}), \
+         patch("playlist_arranger.sorting.distance._load_embedding",
+               return_value=None), \
+         patch("playlist_arranger.sorting.stats_analysis.analyze_playlist_stats",
+               return_value=mock_analyze()) as mock_analyze_fn, \
+         patch("playlist_arranger.sorting.stats_analysis.load_stats_cache",
+               return_value=ss._stats_result) as mock_load_cache:
+
+        ss._analyze_stats_btn = MagicMock()
+        asyncio.run(ss._on_analyze_statistics())
+
+        # The key assertion: weights passed to analyze_playlist_stats must
+        # come from the cache (mood=0.05), NOT from settings.json (mood=0.35)
+        mock_analyze_fn.assert_called_once()
+        call_args = mock_analyze_fn.call_args
+        weights_arg = call_args.kwargs.get("weights") or call_args[0][4]
+        assert weights_arg["mood"] == 0.05, (
+            f"B.3 REGRESSION: mood weight should be 0.05 (from cache), "
+            f"got {weights_arg.get('mood')} (likely from settings.json)"
+        )
+        assert weights_arg["bpm"] == 0.30
+        assert weights_arg["freq_balance"] == 0.15
+
+
+def test_cache_round_trip_preserves_penalties_and_sa_params(tmp_path):
+    """save_stats_cache → load_stats_cache round-trips penalties_and_sa_params."""
+    import playlist_arranger.config as _cfg
+    from playlist_arranger.sorting.stats_analysis import save_stats_cache, load_stats_cache
+
+    original_cache = _cfg.CACHE_DIR_DEFAULT
+    _cfg.CACHE_DIR_DEFAULT = tmp_path
+
+    try:
+        sr = _mock_stats_result()
+        sr.playlist_id = "pl_penalty_test"
+        sr.snapshot_id = "snap_penalty"
+        sr.penalties_and_sa_params = {
+            "artist_penalty": 0.25,
+            "album_penalty": 0.45,
+            "duration_tolerance": 0.15,
+            "iterations_multiplier": 600,
+            "n_runs": 120,
+            "T_start": 2.0,
+            "T_end": 0.0005,
+        }
+        save_stats_cache(sr)
+
+        loaded = load_stats_cache("pl_penalty_test", "snap_penalty")
+        assert loaded is not None
+        assert loaded.penalties_and_sa_params == sr.penalties_and_sa_params
+        assert loaded.penalties_and_sa_params["artist_penalty"] == 0.25
+        assert loaded.penalties_and_sa_params["T_end"] == 0.0005
+    finally:
+        _cfg.CACHE_DIR_DEFAULT = original_cache

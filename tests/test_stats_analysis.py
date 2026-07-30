@@ -253,3 +253,73 @@ def test_cv_thresholds_are_reasonable():
     assert CV_GOOD_THRESHOLD > CV_MODERATE_THRESHOLD
     assert CV_GOOD_THRESHOLD < 1.0
     assert CV_MODERATE_THRESHOLD < 1.0
+
+
+def test_calibration_scales_stored_correctly_for_dyn_range_and_onset():
+    """Regression: dynamic_range.calibration_scale and onset_str.calibration_scale
+    must be the actual per-playlist calibrated values, NOT silently defaulted to 1.0.
+
+    The earlier f"{comp_name}_scale" key lookup failed because the calibration dict
+    uses keys "dyn_scale" and "onset_scale", not "dynamic_range_scale" and
+    "onset_str_scale".  This test asserts the SCALE_KEY_MAP fix is in place.
+    """
+    # Synthetic tracks with KNOWN dynamic_range spread: 5, 10, 20 dB
+    # p5-p95 range of [5,5,5,10,10,10,20,20,20]×3 (features/start/end) = 15.0
+    # Floor is 0.5, so expected dyn_scale ≈ 15.0
+    tracks = []
+    for db_val in [5.0, 10.0, 20.0]:
+        feats = {
+            "bpm": 120, "rms_db": -15,
+            "harm_ratio": 0.9, "flatness": 0.003,
+            "dynamic_range": db_val, "onset_str": 0.5,
+            "bass": 0.33, "mid": 0.34, "high": 0.33,
+            "camelot": "8B",
+            "mfcc20": [0.1] * 20,
+            "chroma_cens": [0.5] * 12,
+        }
+        tracks.append({"features": feats, "start_seg": feats, "end_seg": feats})
+
+    result = analyze_playlist_stats(
+        playlist_id="cal_test",
+        snapshot_id="snap_cal",
+        all_tracks=tracks,
+        embeddings=[],
+    )
+
+    dyn_comp = result.components["dynamic_range"]
+    onset_comp = result.components["onset_str"]
+
+    # dynamic_range: p5-p95 of [5,5,5,10,10,10,20,20,20] across 9 values
+    # p5 ≈ 5.0, p95 ≈ 20.0 → range ≈ 15.0, floored to max(15.0, 0.5) = 15.0
+    # It won't be exactly 15.0 due to interpolation, but must be >> 1.0
+    assert dyn_comp.calibration_scale > 1.0, (
+        f"dynamic_range.calibration_scale = {dyn_comp.calibration_scale:.4f} — "
+        f"expected >> 1.0 (regression: SCALE_KEY_MAP lookup was returning 1.0)"
+    )
+    assert 10.0 <= dyn_comp.calibration_scale <= 20.0, (
+        f"dynamic_range.calibration_scale = {dyn_comp.calibration_scale:.4f} — "
+        f"expected in [10.0, 20.0] range"
+    )
+
+    # onset_str: all tracks have onset_str=0.5 → zero spread → floor 0.1
+    assert onset_comp.calibration_scale == 0.1, (
+        f"onset_str.calibration_scale = {onset_comp.calibration_scale:.4f} — "
+        f"expected 0.1 (floor, zero spread)"
+    )
+
+    # Flatness and transition should also have real calibrated values (not 1.0)
+    # Flatness: all tracks have flatness=0.003 → zero spread → floor 0.002
+    flat_comp = result.components["flatness"]
+    assert flat_comp.calibration_scale == 0.002, (
+        f"flatness.calibration_scale = {flat_comp.calibration_scale:.6f} — "
+        f"expected 0.002 (floor, zero spread)"
+    )
+
+    # Components without calibration should be 1.0 (fixed theoretical divisors)
+    for name in ["mood", "bpm", "key", "energy", "texture", "freq_balance", "harm_ratio"]:
+        comp = result.components.get(name)
+        if comp is not None:
+            assert comp.calibration_scale == 1.0, (
+                f"{name}.calibration_scale = {comp.calibration_scale} — "
+                f"expected 1.0 (no per-playlist calibration for this component)"
+            )

@@ -58,6 +58,7 @@ class StatsResult:
     analysed_at: str = ""
     components: dict[str, ComponentCalibration] = field(default_factory=dict)
     weights_used: dict[str, float] = field(default_factory=dict)
+    penalties_and_sa_params: dict = field(default_factory=dict)
     last_used_for_sort_at: str | None = None
 
 
@@ -95,6 +96,7 @@ def save_stats_cache(result: StatsResult) -> str:
         "snapshot_id": result.snapshot_id,
         "analysed_at": result.analysed_at,
         "weights_used": result.weights_used,
+        "penalties_and_sa_params": result.penalties_and_sa_params,
         "last_used_for_sort_at": result.last_used_for_sort_at,
         "components": {},
     }
@@ -151,6 +153,7 @@ def load_stats_cache(playlist_id: str, snapshot_id: str) -> StatsResult | None:
         snapshot_id=snapshot_id,
         analysed_at=raw.get("analysed_at", ""),
         weights_used=raw.get("weights_used", {}),
+        penalties_and_sa_params=raw.get("penalties_and_sa_params", {}),
         last_used_for_sort_at=raw.get("last_used_for_sort_at"),
     )
     for name, cdata in components_raw.items():
@@ -400,6 +403,16 @@ def analyze_playlist_stats(
     has_embeddings = any(e is not None for e in embeddings)
     mood_mode = "embedding" if has_embeddings else "chroma_fallback"
 
+    # ── Map component names to their calibration dict keys ──────────────
+    # Only 4 components use per-playlist calibration; all others use fixed
+    # theoretical divisors → correctly default to 1.0 (no calibration needed).
+    SCALE_KEY_MAP = {
+        "dynamic_range": "dyn_scale",
+        "onset_str": "onset_scale",
+        "flatness": "flatness_scale",
+        "transition": "transition_scale",
+    }
+
     for comp_name in ["mood", "bpm", "transition", "key", "energy", "texture", "freq_balance",
                       "harm_ratio", "flatness", "dynamic_range", "onset_str"]:
         vals = comp_vals.get(comp_name)
@@ -412,7 +425,7 @@ def analyze_playlist_stats(
         hist_counts, hist_edges = np.histogram(arr, bins=HISTOGRAM_BINS)
         result.components[comp_name] = ComponentCalibration(
             name=comp_name,
-            calibration_scale=calibration.get(f"{comp_name}_scale", 1.0),
+            calibration_scale=calibration.get(SCALE_KEY_MAP.get(comp_name), 1.0),
             mood_mode=mood_mode if comp_name == "mood" else "",
             observed_min=float(np.min(arr)),
             observed_max=float(np.max(arr)),

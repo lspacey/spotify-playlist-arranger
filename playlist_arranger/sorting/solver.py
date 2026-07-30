@@ -249,8 +249,16 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
         f"onset_scale={onset_scale:.2f}, flat_scale={flat_scale:.4f}"
     )
 
-    # ── Apply cached weights (user-tuned from stats UI) ───────────────────
+    # ── Apply cached weights and penalties (user-tuned from stats UI) ─────
     import playlist_arranger.config as _cfg_mod
+    # Snapshot originals so we can restore on failure — prevents
+    # cross-playlist leakage if sorting playlist A raises an
+    # exception after mutating the shared globals.
+    _saved_weights = dict(_cfg_mod.WEIGHTS)
+    _saved_artist_penalty = _cfg_mod.ARTIST_PENALTY
+    _saved_album_penalty = _cfg_mod.ALBUM_PENALTY
+    _saved_duration_tolerance = _cfg_mod.DURATION_TOLERANCE
+
     cached_weights = stats_cache.weights_used
     if cached_weights:
         for k in ("mood", "bpm", "transition", "key", "energy", "texture", "freq_balance"):
@@ -261,194 +269,226 @@ def _run_smart_sorting(db: dict, descs: list, pl_id: str, pl_name: str,
         # Fallback to config defaults — sync from settings
         _cfg_mod.sync_weights_from_settings(settings)
 
-    plan = _load_anchors_file(pl_id)
-    if not plan:
-        plan = [{"type": "placeholder"}]
+    # ── Apply cached penalties (artist, album, duration_tolerance) ──────
+    cached_params = stats_cache.penalties_and_sa_params if stats_cache.penalties_and_sa_params else {}
+    if cached_params:
+        for key, attr_name in [("artist_penalty", "ARTIST_PENALTY"),
+                               ("album_penalty", "ALBUM_PENALTY"),
+                               ("duration_tolerance", "DURATION_TOLERANCE")]:
+            if key in cached_params:
+                setattr(_cfg_mod, attr_name, cached_params[key])
+        _log(f"Applied cached penalties: artist={_cfg_mod.ARTIST_PENALTY:.3f}, "
+             f"album={_cfg_mod.ALBUM_PENALTY:.3f}, "
+             f"duration_tolerance={_cfg_mod.DURATION_TOLERANCE:.3f}")
 
-    n_anchors = sum(1 for e in plan if e["type"] == "anchor")
-    if n_anchors == 0:
-        _log(
-            "No anchors in plan — running unconstrained free-TSP sort over "
-            "all tracks (single open slot, no anchor pinning)."
-        )
-        plan = [{"type": "placeholder"}]
-        # Deliberately NOT returning — fall through. The subsequent
-        # index-array construction below naturally produces anchors_idx=[]
-        # and slots=[True] for this plan, which _solve_atsp_with_anchors()
-        # already handles via its `if not anchors:` free-TSP branch.
+    # ── Apply cached SA params to the local settings copy ──────────────
+    # (settings is a local object — no global mutation, no leak risk)
+    if cached_params:
+        for key, attr_name in [("iterations_multiplier", "sa_iterations_multiplier"),
+                               ("n_runs", "sa_n_runs"),
+                               ("T_start", "sa_T_start"),
+                               ("T_end", "sa_T_end")]:
+            if key in cached_params:
+                setattr(settings, attr_name, cached_params[key])
 
-    # Build index arrays
-    desc_by_id = {d["track_id"]: d for d in descs}
-    track_ids = [d["track_id"] for d in descs]
-    tid_to_idx = {tid: i for i, tid in enumerate(track_ids)}
+    try:
+        plan = _load_anchors_file(pl_id)
+        if not plan:
+            plan = [{"type": "placeholder"}]
 
-    anchors_idx = [
-        tid_to_idx[e["track_id"]] for e in plan if e["type"] == "anchor"
-    ]
-    slots = []
-    ap = [j for j, e in enumerate(plan) if e["type"] == "anchor"]
-    if ap:
-        slots = [
-            any(plan[k]["type"] == "placeholder" for k in range(0, ap[0]))
-        ]
-        for i in range(len(ap) - 1):
-            slots.append(
-                any(
-                    plan[k]["type"] == "placeholder"
-                    for k in range(ap[i] + 1, ap[i + 1])
-                )
+        n_anchors = sum(1 for e in plan if e["type"] == "anchor")
+        if n_anchors == 0:
+            _log(
+                "No anchors in plan — running unconstrained free-TSP sort over "
+                "all tracks (single open slot, no anchor pinning)."
             )
-        slots.append(
-            any(
-                plan[k]["type"] == "placeholder"
-                for k in range(ap[-1] + 1, len(plan))
-            )
-        )
+            plan = [{"type": "placeholder"}]
+            # Deliberately NOT returning — fall through. The subsequent
+            # index-array construction below naturally produces anchors_idx=[]
+            # and slots=[True] for this plan, which _solve_atsp_with_anchors()
+            # already handles via its `if not anchors:` free-TSP branch.
 
-    # Load track data from DB + embeddings
-    all_tracks = [db[tid] for tid in track_ids if tid in db]
-    if len(all_tracks) != len(track_ids):
-        _log("Some tracks not in DB — sorting may be degraded.")
-        valid_ids = [
-            t.get("track_id", tid)
-            for tid, t in zip(track_ids, all_tracks)
+        # Build index arrays
+        desc_by_id = {d["track_id"]: d for d in descs}
+        track_ids = [d["track_id"] for d in descs]
+        tid_to_idx = {tid: i for i, tid in enumerate(track_ids)}
+
+        anchors_idx = [
+            tid_to_idx[e["track_id"]] for e in plan if e["type"] == "anchor"
         ]
-        new_tid_to_idx = {tid: i for i, tid in enumerate(valid_ids)}
-        filtered_anchors = []
-        new_plan = []
-        for e in plan:
-            if (
-                e["type"] == "anchor"
-                and e["track_id"] in new_tid_to_idx
-            ):
-                filtered_anchors.append(new_tid_to_idx[e["track_id"]])
-                new_plan.append(e)
-            elif e["type"] == "placeholder":
-                new_plan.append(e)
-        anchors_idx = filtered_anchors
         slots = []
-        ap_new = [j for j, e in enumerate(new_plan) if e["type"] == "anchor"]
-        if ap_new:
+        ap = [j for j, e in enumerate(plan) if e["type"] == "anchor"]
+        if ap:
             slots = [
-                any(
-                    new_plan[k]["type"] == "placeholder"
-                    for k in range(0, ap_new[0])
-                )
+                any(plan[k]["type"] == "placeholder" for k in range(0, ap[0]))
             ]
-            for i in range(len(ap_new) - 1):
+            for i in range(len(ap) - 1):
                 slots.append(
                     any(
-                        new_plan[k]["type"] == "placeholder"
-                        for k in range(ap_new[i] + 1, ap_new[i + 1])
+                        plan[k]["type"] == "placeholder"
+                        for k in range(ap[i] + 1, ap[i + 1])
                     )
                 )
             slots.append(
                 any(
-                    new_plan[k]["type"] == "placeholder"
-                    for k in range(ap_new[-1] + 1, len(new_plan))
+                    plan[k]["type"] == "placeholder"
+                    for k in range(ap[-1] + 1, len(plan))
                 )
             )
-        all_tracks = [db[tid] for tid in valid_ids]
-        track_ids = valid_ids
-        tid_to_idx = new_tid_to_idx
 
-    embeddings = [_load_embedding(tid, db) for tid in track_ids]
+        # Load track data from DB + embeddings
+        all_tracks = [db[tid] for tid in track_ids if tid in db]
+        if len(all_tracks) != len(track_ids):
+            _log("Some tracks not in DB — sorting may be degraded.")
+            valid_ids = [
+                t.get("track_id", tid)
+                for tid, t in zip(track_ids, all_tracks)
+            ]
+            new_tid_to_idx = {tid: i for i, tid in enumerate(valid_ids)}
+            filtered_anchors = []
+            new_plan = []
+            for e in plan:
+                if (
+                    e["type"] == "anchor"
+                    and e["track_id"] in new_tid_to_idx
+                ):
+                    filtered_anchors.append(new_tid_to_idx[e["track_id"]])
+                    new_plan.append(e)
+                elif e["type"] == "placeholder":
+                    new_plan.append(e)
+            anchors_idx = filtered_anchors
+            slots = []
+            ap_new = [j for j, e in enumerate(new_plan) if e["type"] == "anchor"]
+            if ap_new:
+                slots = [
+                    any(
+                        new_plan[k]["type"] == "placeholder"
+                        for k in range(0, ap_new[0])
+                    )
+                ]
+                for i in range(len(ap_new) - 1):
+                    slots.append(
+                        any(
+                            new_plan[k]["type"] == "placeholder"
+                            for k in range(ap_new[i] + 1, ap_new[i + 1])
+                        )
+                    )
+                slots.append(
+                    any(
+                        new_plan[k]["type"] == "placeholder"
+                        for k in range(ap_new[-1] + 1, len(new_plan))
+                    )
+                )
+            all_tracks = [db[tid] for tid in valid_ids]
+            track_ids = valid_ids
+            tid_to_idx = new_tid_to_idx
 
-    n_total = len(all_tracks)
+        embeddings = [_load_embedding(tid, db) for tid in track_ids]
 
-    # ── Build distance matrix with per-playlist calibration ───────────────
-    # Scales already loaded from stats cache above — do NOT re-calibrate.
-    texture_scales = (dyn_scale, onset_scale)
-    # Include flat_scale in cache key so flatness calibration change invalidates
-    scale_key = (round(dyn_scale, 3), round(onset_scale, 3), round(flat_scale, 6))
-    cache_key = (tuple(track_ids), scale_key)
+        n_total = len(all_tracks)
 
-    cached = _SORTING_CACHE.get(pl_id)
-    if cached and cached.get("track_ids") == cache_key:
-        D = cached["D"]
-        _log(f"Using cached distance matrix ({n_total}×{n_total})")
-    else:
+        # ── Build distance matrix with per-playlist calibration ───────────
+        # Scales already loaded from stats cache above — do NOT re-calibrate.
+        texture_scales = (dyn_scale, onset_scale)
+        # Include flat_scale in cache key so flatness calibration change invalidates
+        scale_key = (round(dyn_scale, 3), round(onset_scale, 3), round(flat_scale, 6))
+        cache_key = (tuple(track_ids), scale_key)
+
+        cached = _SORTING_CACHE.get(pl_id)
+        if cached and cached.get("track_ids") == cache_key:
+            D = cached["D"]
+            _log(f"Using cached distance matrix ({n_total}×{n_total})")
+        else:
+            _log(
+                f"Building distance matrix for {n_total} tracks ({n_total*n_total} pairs)..."
+            )
+            D = _build_distance_matrix(
+                list(range(n_total)), all_tracks, embeddings,
+                texture_scales=texture_scales,
+                flat_scale=flat_scale,
+                transition_scale=transition_scale,
+            )
+            _SORTING_CACHE[pl_id] = {
+                "D": D,
+                "track_ids": cache_key,
+                "all_tracks": all_tracks,
+                "embeddings": embeddings,
+            }
         _log(
-            f"Building distance matrix for {n_total} tracks ({n_total*n_total} pairs)..."
+            f"Calibration applied: dyn_scale={dyn_scale:.2f}, "
+            f"onset_scale={onset_scale:.2f}, flat_scale={flat_scale:.4f}"
         )
-        D = _build_distance_matrix(
-            list(range(n_total)), all_tracks, embeddings,
-            texture_scales=texture_scales,
-            flat_scale=flat_scale,
-            transition_scale=transition_scale,
+
+        # ── Distance matrix diagnostics ───────────────────────────────────
+        stats = _compute_distance_stats(D)
+        _log(
+            f"Distance matrix stats: min={stats['min']:.2f} max={stats['max']:.2f} "
+            f"mean={stats['mean']:.2f} std={stats['std']:.2f} CV={stats['cv']:.2f} "
+            f"(n={stats['n']})"
         )
-        _SORTING_CACHE[pl_id] = {
-            "D": D,
-            "track_ids": cache_key,
-            "all_tracks": all_tracks,
-            "embeddings": embeddings,
-        }
-    _log(
-        f"Calibration applied: dyn_scale={dyn_scale:.2f}, "
-        f"onset_scale={onset_scale:.2f}, flat_scale={flat_scale:.4f}"
-    )
 
-    # ── Distance matrix diagnostics ──────────────────────────────────────────
-    stats = _compute_distance_stats(D)
-    _log(
-        f"Distance matrix stats: min={stats['min']:.2f} max={stats['max']:.2f} "
-        f"mean={stats['mean']:.2f} std={stats['std']:.2f} CV={stats['cv']:.2f} "
-        f"(n={stats['n']})"
-    )
+        track_names = [
+            all_tracks[i].get("name", "?") if i < len(all_tracks) else "?"
+            for i in range(len(track_ids))
+        ]
+        csv_path = _dump_distance_csv(D, track_names, track_ids, pl_id)
+        if csv_path:
+            _log(f"Distance matrix dumped to {csv_path}")
 
-    track_names = [
-        all_tracks[i].get("name", "?") if i < len(all_tracks) else "?"
-        for i in range(len(track_ids))
-    ]
-    csv_path = _dump_distance_csv(D, track_names, track_ids, pl_id)
-    if csv_path:
-        _log(f"Distance matrix dumped to {csv_path}")
+        hist_path = _render_distance_histogram(D, pl_id)
+        if hist_path:
+            _update_last_histogram_path(hist_path)
 
-    hist_path = _render_distance_histogram(D, pl_id)
-    if hist_path:
-        _update_last_histogram_path(hist_path)
+        all_indices = list(range(len(all_tracks)))
+        iters = max(n_total * settings.sa_iterations_multiplier, 5000)
+        N_RUNS = settings.sa_n_runs
+        T_start = settings.sa_T_start
+        T_end = settings.sa_T_end
 
-    all_indices = list(range(len(all_tracks)))
-    iters = max(n_total * settings.sa_iterations_multiplier, 5000)
-    N_RUNS = settings.sa_n_runs
-    T_start = settings.sa_T_start
-    T_end = settings.sa_T_end
+        _log(f"SA: {N_RUNS} runs × {iters} iterations (T={T_start}→{T_end})")
+        best_order, best_cost = None, float("inf")
+        for run in range(N_RUNS):
+            candidate = _solve_atsp_with_anchors(
+                all_indices, anchors_idx, slots, D,
+                iterations=iters, T_start=T_start, T_end=T_end,
+            )
+            cost = _path_cost(candidate, D)
+            if cost < best_cost:
+                best_cost, best_order = cost, candidate
+            if (run + 1) % 20 == 0 or run == 0:
+                _log(f"  Run {run+1}/{N_RUNS}  best={best_cost:.4f}")
 
-    _log(f"SA: {N_RUNS} runs × {iters} iterations (T={T_start}→{T_end})")
-    best_order, best_cost = None, float("inf")
-    for run in range(N_RUNS):
-        candidate = _solve_atsp_with_anchors(
-            all_indices, anchors_idx, slots, D,
-            iterations=iters, T_start=T_start, T_end=T_end,
-        )
-        cost = _path_cost(candidate, D)
-        if cost < best_cost:
-            best_cost, best_order = cost, candidate
-        if (run + 1) % 20 == 0 or run == 0:
-            _log(f"  Run {run+1}/{N_RUNS}  best={best_cost:.4f}")
+        ordered = best_order
+        _log(f"Best cost: {best_cost:.4f}")
 
-    ordered = best_order
-    _log(f"Best cost: {best_cost:.4f}")
+        # Build ordered list
+        ordered_descs = []
+        anchor_set = set(anchors_idx)
+        for idx in ordered:
+            tid = track_ids[idx]
+            d = desc_by_id.get(
+                tid, {"track_id": tid, "name": "?", "artist": "?"}
+            )
+            ordered_descs.append(d)
 
-    # Build ordered list
-    ordered_descs = []
-    anchor_set = set(anchors_idx)
-    for idx in ordered:
-        tid = track_ids[idx]
-        d = desc_by_id.get(
-            tid, {"track_id": tid, "name": "?", "artist": "?"}
-        )
-        ordered_descs.append(d)
+        # ── Re-save cache with sort timestamp for audit trail ─────────────
+        if snapshot_id:
+            try:
+                import datetime as _dt
+                from playlist_arranger.sorting.stats_analysis import save_stats_cache
+                stats_cache.last_used_for_sort_at = _dt.datetime.now().isoformat()
+                save_stats_cache(stats_cache)
+                _log(f"Stats cache updated with sort timestamp for snapshot {snapshot_id[:12]}")
+            except Exception:
+                logger.exception("Failed to update stats cache sort timestamp")
 
-    # ── Re-save cache with sort timestamp for audit trail ─────────────────
-    if snapshot_id:
-        try:
-            import datetime as _dt
-            from playlist_arranger.sorting.stats_analysis import save_stats_cache
-            stats_cache.last_used_for_sort_at = _dt.datetime.now().isoformat()
-            save_stats_cache(stats_cache)
-            _log(f"Stats cache updated with sort timestamp for snapshot {snapshot_id[:12]}")
-        except Exception:
-            logger.exception("Failed to update stats cache sort timestamp")
-
-    return ordered_descs, float(best_cost)
+        return ordered_descs, float(best_cost)
+    finally:
+        # Restore global WEIGHTS and PENALTIES to pre-sort state so a
+        # failure in playlist A's sort doesn't leak A's tuned values into
+        # playlist B's distance computation.
+        _cfg_mod.WEIGHTS.clear()
+        _cfg_mod.WEIGHTS.update(_saved_weights)
+        _cfg_mod.ARTIST_PENALTY = _saved_artist_penalty
+        _cfg_mod.ALBUM_PENALTY = _saved_album_penalty
+        _cfg_mod.DURATION_TOLERANCE = _saved_duration_tolerance

@@ -5,9 +5,7 @@ Start Sorting button with ATSP+SA solver, thread-safe progress logs, and sorted 
 import asyncio
 import datetime
 import logging
-import pathlib
 import queue
-import threading
 
 from nicegui import ui
 
@@ -38,17 +36,14 @@ _track_list_container = None
 _anchors_list_container = None
 _analyze_stats_btn = None
 _start_sort_btn = None
-_start_sort_warning = None
 _analyze_hint: ui.label | None = None
 _logs_expansion = None
 _logs_content: ui.label | None = None
 _logs_summary: ui.label | None = None
 _histogram_image: ui.image | None = None
 _stats_panel: ui.element | None = None
-_stats_summary_line: ui.label | None = None
 _results_container = None
 _spinner = None
-_save_section_container = None
 _save_new_btn = None
 _save_current_btn = None
 _save_spinner = None
@@ -60,6 +55,9 @@ _sorted_track_uris: list[str] = []
 _save_in_progress: bool = False
 _stats_result = None  # StatsResult | None — current analysis result
 _weight_sliders: dict[str, "ui.number"] = {}
+_eff_bar_containers: dict[str, "ui.element"] = {}
+_obs_max_cache: dict[str, float] = {}
+_comp_order: list[str] = []
 _current_snapshot_id: str = ""
 
 # ── Thread-safe log queue ───────────────────────────────────────────────────
@@ -311,21 +309,75 @@ def _clear_results():
         _results_container.clear()
 
 
-def _update_logs_summary():
+def _update_logs_summary(*, weights: dict[str, float] | None = None) -> None:
+    """Refresh the summary line from current weights/cache/settings.
+
+    If *weights* is None, uses ``_build_weights_from_sliders_or_cache()``
+    which resolves slider values > cache > settings.json.
+    """
     global _logs_summary
     if _logs_summary is None:
         return
-    s = load_settings()
+    if weights is None:
+        weights = _build_weights_from_sliders_or_cache()
+    params = _build_penalties_and_sa_from_cache_or_settings()
     summary_lines = [
-        f"Weights: mood={s.w_mood:.2f}, bpm={s.w_bpm:.2f}, transition={s.w_transition:.2f}, key={s.w_key:.2f}, "
-        f"energy={s.w_energy:.2f}, texture={s.w_texture:.2f}, freq_balance={s.w_freq_balance:.2f}",
-        f"Penalties: artist={s.artist_penalty:.3f}, album={s.album_penalty:.3f}, duration_tolerance={s.duration_tolerance:.3f}",
-        f"SA: iterations_multiplier={s.sa_iterations_multiplier}, n_runs={s.sa_n_runs}, T_start={s.sa_T_start:.4g}, T_end={s.sa_T_end:.4g}",
+        f"Weights: mood={weights.get('mood', 0):.2f}, bpm={weights.get('bpm', 0):.2f}, "
+        f"transition={weights.get('transition', 0):.2f}, key={weights.get('key', 0):.2f}, "
+        f"energy={weights.get('energy', 0):.2f}, texture={weights.get('texture', 0):.2f}, "
+        f"freq_balance={weights.get('freq_balance', 0):.2f}",
+        f"Penalties: artist={params.get('artist_penalty', 0):.3f}, "
+        f"album={params.get('album_penalty', 0):.3f}, "
+        f"duration_tolerance={params.get('duration_tolerance', 0):.3f}",
+        f"SA: iterations_multiplier={params.get('iterations_multiplier', 0)}, "
+        f"n_runs={params.get('n_runs', 0)}, T_start={params.get('T_start', 0):.4g}, "
+        f"T_end={params.get('T_end', 0):.4g}",
     ]
     _logs_summary.set_text("\n".join(summary_lines))
 
 
 # ── Analyze Statistics async handler ─────────────────────────────────────────
+
+def _build_weights_from_sliders_or_cache() -> dict[str, float]:
+    """Return current weights: slider values if sliders exist, else cache, else settings.json defaults.
+
+    This is the SINGLE source of truth for "what weights are currently in effect"
+    — used by summary line rendering (B.2) and analysis initialization (B.3).
+    """
+    if _weight_sliders:
+        return {cn: float(slider.value) for cn, slider in _weight_sliders.items()}
+
+    if _stats_result is not None and _stats_result.weights_used:
+        return dict(_stats_result.weights_used)
+
+    s = load_settings()
+    return {
+        "mood": s.w_mood, "bpm": s.w_bpm, "transition": s.w_transition,
+        "key": s.w_key, "energy": s.w_energy, "texture": s.w_texture,
+        "freq_balance": s.w_freq_balance,
+    }
+
+
+def _build_penalties_and_sa_from_cache_or_settings() -> dict:
+    """Return penalties and SA params from cache if available, else settings.json.
+
+    Cache precedence rule (same as weights): if a saved stats cache exists
+    with cached params, use those. Otherwise fall back to settings.json.
+    """
+    if _stats_result is not None and hasattr(_stats_result, "penalties_and_sa_params") and _stats_result.penalties_and_sa_params:
+        return dict(_stats_result.penalties_and_sa_params)
+
+    s = load_settings()
+    return {
+        "artist_penalty": s.artist_penalty,
+        "album_penalty": s.album_penalty,
+        "duration_tolerance": s.duration_tolerance,
+        "iterations_multiplier": s.sa_iterations_multiplier,
+        "n_runs": s.sa_n_runs,
+        "T_start": s.sa_T_start,
+        "T_end": s.sa_T_end,
+    }
+
 
 async def _on_analyze_statistics():
     """Run per-playlist stats analysis in a background thread."""
@@ -347,8 +399,25 @@ async def _on_analyze_statistics():
     if _logs_expansion is not None:
         _logs_expansion.value = True
 
-    # Show progress in logs
-    _enqueue_log("Starting per-playlist analysis...")
+    # ── B.3 fix: check cache FIRST for weights, fall back to settings ─────
+    # Try loading existing cache to preserve user-tuned weights on Re-analyze
+    existing_cache = None
+    if _current_snapshot_id:
+        try:
+            from playlist_arranger.sorting.stats_analysis import load_stats_cache
+            existing_cache = load_stats_cache(pl_id, _current_snapshot_id)
+        except Exception:
+            logger.debug("No existing stats cache for %s", pl_id[:8])
+
+    if existing_cache is not None and existing_cache.weights_used:
+        weights = dict(existing_cache.weights_used)
+    else:
+        s = load_settings()
+        weights = {
+            "mood": s.w_mood, "bpm": s.w_bpm, "transition": s.w_transition,
+            "key": s.w_key, "energy": s.w_energy, "texture": s.w_texture,
+            "freq_balance": s.w_freq_balance,
+        }
 
     try:
         from playlist_arranger.database import db as _db
@@ -359,12 +428,6 @@ async def _on_analyze_statistics():
         track_ids = [t["id"] for t in _playlist_tracks]
         all_tracks = [db_dict[tid] for tid in track_ids if tid in db_dict]
         embeddings = [_load_embedding(tid, db_dict) for tid in track_ids]
-        s = load_settings()
-        weights = {
-            "mood": s.w_mood, "bpm": s.w_bpm, "transition": s.w_transition,
-            "key": s.w_key, "energy": s.w_energy, "texture": s.w_texture,
-            "freq_balance": s.w_freq_balance,
-        }
 
         _stats_result = await asyncio.to_thread(
             analyze_playlist_stats,
@@ -410,70 +473,186 @@ def _render_full_stats_panel():
     with _stats_panel:
         ui.label(f"Per-Playlist Analysis — {n_tracks} tracks").classes("text-lg font-bold mb-2")
 
-        # ── Weight sliders with CV badges ──────────────────────────────────
-        comp_order = ["mood", "bpm", "transition", "key", "energy", "texture", "freq_balance"]
-        default_weights = {
-            "mood": 0.48, "bpm": 0.12, "transition": 0.20,
-            "key": 0.12, "energy": 0.08, "texture": 0.10, "freq_balance": 0.08,
-        }
-        cached_w = sr.weights_used if sr.weights_used else default_weights
+        # ── CV explanation ─────────────────────────────────────────────────
+        with ui.row().classes("gap-2 items-center mb-2"):
+            ui.icon("info", size="18px").props("color=grey")
+            with ui.tooltip().classes("text-xs max-w-md whitespace-pre-wrap"):
+                ui.label(
+                    "CV (coefficient of variation) = std / mean of this component's "
+                    "distances across all track pairs in this playlist.\n\n"
+                    "Higher CV means more variation between tracks — the algorithm "
+                    "has clearer signal to distinguish them on this dimension.\n"
+                    "Low CV means tracks are similar on this dimension regardless of "
+                    "the configured weight — increasing the weight won't help much if "
+                    "CV is low.\n\n"
+                    "● green: CV > 0.20 — good signal   |   "
+                    "● yellow: 0.10–0.20 — moderate   |   "
+                    "● red: CV < 0.10 — flat, weight has little effect"
+                )
 
+        # ── Weight sliders + CV + effective contribution (one row each) ────
+        comp_order = ["mood", "bpm", "transition", "key", "energy", "texture", "freq_balance"]
+        from playlist_arranger.config import WEIGHTS as _cfg_weights
+        cached_w = sr.weights_used if sr.weights_used else _cfg_weights
+
+        global _eff_bar_containers, _obs_max_cache, _comp_order
+        _comp_order = comp_order
         _weight_sliders = {}
+
+        # pre-compute observed_max for each component
+        _obs_max_cache = {}
+        for comp_name in comp_order:
+            comp = sr.components.get(comp_name)
+            _obs_max_cache[comp_name] = comp.observed_max if comp else 0.0
+
+        # containers for each component's contribution bar (re-rendered live)
+        _eff_bar_containers = {}
+
+        # ── Component descriptions (verified against distance.py) ──────────
+        _comp_descriptions = {
+            "mood": "Overall emotional/timbral similarity between tracks (via audio embeddings or chroma). "
+                    "Higher weight prioritizes smooth mood transitions over other factors.",
+            "bpm": "Tempo difference between consecutive tracks. "
+                   "Higher weight keeps tempo changes gradual; lower weight allows tempo jumps if other factors align better.",
+            "transition": "Timbral/textural similarity at track boundaries (via MFCC). "
+                          "Higher weight favors tracks that blend smoothly into each other at the mix point.",
+            "key": "Harmonic (Camelot wheel) compatibility between tracks. "
+                   "Higher weight enforces harmonic mixing — tracks in compatible keys are placed adjacent.",
+            "energy": "Loudness/intensity difference between tracks. "
+                      "Higher weight smooths energy transitions; lower weight allows more dramatic loud/quiet contrasts.",
+            "texture": "Combined harmonic ratio, spectral flatness, dynamic range, and onset strength similarity. "
+                       "Higher weight groups tracks with similar production texture together.",
+            "freq_balance": "Similarity in bass/mid/high frequency distribution. "
+                            "Higher weight keeps the frequency 'shape' of the mix consistent across the playlist.",
+        }
 
         for comp_name in comp_order:
             comp = sr.components.get(comp_name)
             cv = comp.observed_cv if comp else 0.0
             if cv > CV_GOOD_THRESHOLD:
-                badge_color = "green"; badge_text = "● good signal"
+                badge_color = "green"; badge_text = "● good"
             elif cv >= CV_MODERATE_THRESHOLD:
                 badge_color = "orange"; badge_text = "● moderate"
             else:
                 badge_color = "red"; badge_text = "● flat"
 
-            with ui.row().classes("gap-4 items-center mb-1"):
-                ui.label(f"{comp_name}").classes("text-sm w-24")
-                init_val = float(cached_w.get(comp_name, default_weights.get(comp_name, 0.1)))
-                slider = ui.number(
-                    label=None, value=init_val, min=0.0, max=1.0, step=0.01,
-                    format="%.2f",
-                ).classes("w-24").props("dense")
-                slider.on_value_change(lambda e, cn=comp_name: _on_weight_changed(cn, e.value))
-                _weight_sliders[comp_name] = slider
-                ui.label(f"CV={cv:.2f}").classes(f"text-xs text-{badge_color}-500 ml-2")
+            with ui.column().classes("mb-2 w-full"):
+                with ui.row().classes("gap-3 items-center w-full"):
+                    # Component name
+                    ui.label(f"{comp_name}").classes("text-sm w-20")
 
-        # ── Effective contribution bar chart ────────────────────────────────
-        ui.separator().classes("my-2")
-        ui.label("Effective contribution (observed_max × weight):").classes("text-sm font-semibold mb-1")
-        _effective_contribution_container = ui.column().classes("w-full")
+                    # Weight slider
+                    init_val = float(cached_w.get(comp_name, _cfg_weights.get(comp_name, 0.1)))
+                    slider = ui.number(
+                        label=None, value=init_val, min=0.0, max=1.0, step=0.01,
+                        format="%.2f",
+                    ).classes("w-20").props("dense")
+                    slider.on_value_change(lambda e, cn=comp_name: _on_weight_changed(cn, e.value))
+                    _weight_sliders[comp_name] = slider
 
-        def _redraw_contribution():
-            _effective_contribution_container.clear()
-            with _effective_contribution_container:
-                total = 0.0
-                items = []
-                for comp_name in comp_order:
-                    comp = sr.components.get(comp_name)
-                    obs_max = comp.observed_max if comp else 0.0
-                    w = float(_weight_sliders[comp_name].value) if comp_name in _weight_sliders else 0.0
-                    eff = obs_max * w
-                    items.append((comp_name, eff))
-                    total += eff
-                for comp_name, eff in items:
-                    pct = (eff / total * 100) if total > 0 else 0
-                    bar_width = int(pct * 2)  # scale to ~200px
-                    ui.label(
-                        f"{comp_name:>14s}  {eff:.4f}  ({pct:5.1f}%)"
-                    ).classes("text-xs font-mono")
+                    # CV badge
+                    ui.label(f"CV={cv:.2f} {badge_text}").classes(f"text-xs text-{badge_color}-500 w-28")
 
-        _redraw_contribution()
+                    # Effective contribution (live-updated)
+                    container = ui.column().classes("flex-grow")
+                    _eff_bar_containers[comp_name] = container
 
-        # ── Histogram (combined multi-panel PNG) ────────────────────────────
+                # Description caption (muted, below the main row)
+                desc = _comp_descriptions.get(comp_name, "")
+                ui.label(desc).classes("text-xs text-gray-500 dark:text-gray-500 ml-24")
+
+        # ── Render ALL effective contribution bars AFTER all sliders exist ──
+        # (B.1 fix: computing one bar before others' sliders exist causes 100%)
+        _redraw_all_eff_bars()
+
+        # ── Histogram (combined single-row 7-panel PNG) ─────────────────────
         ui.separator().classes("my-2")
         hist_path = _render_composite_histogram()
         if hist_path:
-            ui.image(hist_path).classes("max-w-2xl")
+            ui.image(hist_path).classes("max-w-full")
+            # Caption explaining histograms
+            with ui.row().classes("gap-2 items-start mt-1"):
+                ui.icon("info", size="16px").props("color=grey")
+                with ui.tooltip().classes("text-xs max-w-md whitespace-pre-wrap"):
+                    ui.label(
+                        "How to read these histograms:\n"
+                        "Each shows the distribution of pairwise distances for that component "
+                        "across all tracks (before calibration/weighting).\n\n"
+                        "• Concentrated near zero with a right tail → most track pairs are "
+                        "similar, with a few outliers — good for smooth transitions.\n"
+                        "• Wide spread or multi-peaked → tracks vary a lot — can create more "
+                        "dramatic contrasts.\n"
+                        "• Bimodal → the playlist may have two distinct sub-groups on that "
+                        "dimension.\n\n"
+                        "Note: 'key' is naturally discrete (12 Camelot wheel positions), so "
+                        "its histogram looks like a bar chart of evenly-spaced values — "
+                        "unlike the other 6 continuous components."
+                    )
         else:
             ui.label("Histogram not available (matplotlib missing?)").classes("text-sm text-gray-500")
+
+        # ── Advanced: Penalties & Annealing Parameters (collapsible) ────────
+        with ui.expansion("Advanced: Penalties & Annealing Parameters", value=False).classes("w-full mt-2"):
+            _penalty_params = _build_penalties_and_sa_from_cache_or_settings()
+            _adv_descriptions = {
+                "artist_penalty": "Extra distance added when two tracks share the same artist. "
+                                  "Higher value spreads out an artist's tracks more across the playlist.",
+                "album_penalty": "Extra distance added when two tracks share the same album. "
+                                 "Higher value spreads out same-album tracks more.",
+                "duration_tolerance": "THRESHOLD (not a scaling factor): relative duration difference below "
+                                      "this value incurs ZERO penalty. Only when two consecutive tracks differ "
+                                      "in duration by MORE than this fraction is a penalty applied "
+                                      "(penalty = min(rel_diff × 0.5, 1.0) × 0.10). "
+                                      "Higher tolerance = penalty only kicks in for LARGER duration gaps.",
+                "iterations_multiplier": "Controls how many SA iterations run per restart, "
+                                         "scaled by track count (iterations = track_count × this value). "
+                                         "Higher = slower but more thorough search.",
+                "n_runs": "Number of independent SA restarts with different random starting orders. "
+                          "Higher = more likely to find the global optimum, but slower.",
+                "T_start": "Simulated annealing starting temperature. "
+                           "Higher values allow the algorithm to explore worse solutions early on.",
+                "T_end": "Simulated annealing ending temperature. "
+                         "As temperature cools to this value, the algorithm settles into a fixed order. "
+                         "Rarely needs tuning.",
+            }
+
+            with ui.row().classes("gap-4 items-start flex-wrap"):
+                # Penalties column
+                with ui.column().classes("gap-1"):
+                    ui.label("Penalties").classes("text-sm font-bold")
+                    for key in ["artist_penalty", "album_penalty", "duration_tolerance"]:
+                        init_val = float(_penalty_params.get(key, 0))
+                        with ui.row().classes("gap-2 items-center"):
+                            inp = ui.number(
+                                label=key.replace("_", " ").title(),
+                                value=init_val, min=0.0, max=2.0, step=0.01,
+                                format="%.3f" if key == "duration_tolerance" else "%.2f",
+                            ).classes("w-36").props("dense")
+                            setattr(inp, "_adv_key", key)
+                            with ui.tooltip().classes("text-xs max-w-sm"):
+                                ui.label(_adv_descriptions.get(key, ""))
+                # SA params column
+                with ui.column().classes("gap-1"):
+                    ui.label("Simulated Annealing").classes("text-sm font-bold")
+                    for key in ["iterations_multiplier", "n_runs", "T_start", "T_end"]:
+                        init_val = float(_penalty_params.get(key, 0))
+                        if key == "T_end":
+                            step, fmt, vmin, vmax = 1e-4, "%.0e", 1e-8, 1e-2
+                        elif key == "T_start":
+                            step, fmt, vmin, vmax = 0.1, "%.1f", 0.1, 10.0
+                        elif key == "n_runs":
+                            step, fmt, vmin, vmax = 1, "%.0f", 10, 500
+                        else:
+                            step, fmt, vmin, vmax = 1, "%.0f", 100, 2000
+                        with ui.row().classes("gap-2 items-center"):
+                            inp = ui.number(
+                                label=key.replace("_", " ").title(),
+                                value=init_val, min=vmin, max=vmax, step=step,
+                                format=fmt,
+                            ).classes("w-44").props("dense")
+                            setattr(inp, "_adv_key", key)
+                            with ui.tooltip().classes("text-xs max-w-sm"):
+                                ui.label(_adv_descriptions.get(key, ""))
 
         # ── Save & Enable Sorting ───────────────────────────────────────────
         ui.separator().classes("my-2")
@@ -483,6 +662,7 @@ def _render_full_stats_panel():
 def _render_composite_histogram() -> str | None:
     """Render 7 histograms as one combined 2×4 PNG. Returns path or None."""
     try:
+        import numpy as np
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -500,8 +680,9 @@ def _render_composite_histogram() -> str | None:
     CACHE_DIR_DEFAULT.mkdir(parents=True, exist_ok=True)
 
     comp_order = ["mood", "bpm", "transition", "key", "energy", "texture", "freq_balance"]
-    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
-    axes_flat = axes.flatten()
+    fig, axes = plt.subplots(1, 7, figsize=(14, 2.2))
+    # axes is a 1D array when nrows=1
+    axes_flat = axes if hasattr(axes, "__len__") else [axes]
 
     for idx, comp_name in enumerate(comp_order):
         ax = axes_flat[idx]
@@ -513,23 +694,78 @@ def _render_composite_histogram() -> str | None:
                    color="#4A90D9", edgecolor="white", alpha=0.85)
         else:
             ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes,
-                    fontsize=9, color="gray")
-        ax.set_title(comp_name, fontsize=9)
-        ax.tick_params(labelsize=7)
+                    fontsize=8, color="gray")
+        ax.set_title(comp_name, fontsize=8)
+        ax.tick_params(labelsize=6)
 
-    # Last panel blank
-    axes_flat[7].set_visible(False)
     fig.tight_layout()
     fig.savefig(str(png_path), dpi=120)
     plt.close(fig)
     return str(png_path)
 
 
+def _redraw_one_eff_bar(comp_name: str):
+    """Recompute + re-render the effective-contribution bar for ONE component."""
+    if comp_name not in _eff_bar_containers:
+        return
+    container = _eff_bar_containers[comp_name]
+    if container is None:
+        return
+    container.clear()
+
+    # compute effective contribution for ALL components (needed for %)
+    total = 0.0
+    effs = {}
+    for cn in _comp_order:
+        w = float(_weight_sliders[cn].value) if cn in _weight_sliders else 0.0
+        effs[cn] = _obs_max_cache.get(cn, 0.0) * w
+        total += effs[cn]
+
+    eff = effs.get(comp_name, 0.0)
+    pct = (eff / total * 100) if total > 0 else 0
+    bar_width = max(int(pct * 1.5), 2)  # scale to ~150px max, min 2px visibility
+
+    with container:
+        with ui.row().classes("gap-2 items-center no-wrap"):
+            ui.label(f"{eff:.4f}").classes("text-xs font-mono w-16 text-right")
+            ui.label(f"({pct:5.1f}%)").classes("text-xs font-mono w-16")
+            ui.html(
+                f'<div style="background:#4A90D9;height:8px;width:{bar_width}px;'
+                f'border-radius:2px;"></div>'
+            ).classes("self-center")
+
+
+def _redraw_all_eff_bars():
+    """Re-render all effective-contribution bars (called on any weight change)."""
+    for cn in _comp_order:
+        _redraw_one_eff_bar(cn)
+
+
+# ── Debounce: avoid re-rendering on every .01 step during slider drag ────────
+_debounce_timers: dict[str, "ui.timer | None"] = {}
+
+
 def _on_weight_changed(comp_name: str, value: float):
-    """Recompute effective contribution display on weight change (debounced in-place)."""
+    """Live-update effective contribution bars on weight slider change."""
+    global _debounce_timers
     if _stats_panel is None:
         return
-    _render_full_stats_panel()
+
+    # Cancel any existing debounce timer for this component
+    old_timer = _debounce_timers.get(comp_name)
+    if old_timer is not None:
+        try:
+            old_timer.deactivate()
+            old_timer.delete()
+        except Exception:
+            pass
+
+    # Debounce: re-render after 200ms of no changes — also update summary line (B.2)
+    def _on_debounce(cm: str):
+        _redraw_all_eff_bars()
+        _update_logs_summary()
+    timer = ui.timer(0.2, lambda cn=comp_name: _on_debounce(cn), once=True)
+    _debounce_timers[comp_name] = timer
 
 
 def _on_save_stats():
@@ -555,13 +791,14 @@ def _on_save_stats():
         return
 
     ui.notify("Statistics saved, weights locked in — ready to sort", type="positive")
+    _update_logs_summary()  # B.2: refresh summary after save
     _refresh_buttons()
     _render_stats_panel_summary()
 
 
 def _render_stats_panel_summary():
     """Show a compact summary instead of the full panel with sliders."""
-    global _stats_panel, _stats_summary_line
+    global _stats_panel
 
     if _stats_panel is not None:
         _stats_panel.clear()
@@ -788,7 +1025,7 @@ def _render_sorted_results(ordered_descs: list, best_cost: float, ordered_tracks
     ]
     ui.label(f"Sorted Results — {len(ordered_descs)} tracks (cost: {best_cost:.4f})").classes("text-lg font-bold mb-2 mt-4")
     ui.table(columns=columns, rows=rows, row_key="idx", pagination={"rowsPerPage": 0}).classes("w-full").props("dense")
-    global _save_new_btn, _save_current_btn, _save_spinner, _save_section_container
+    global _save_new_btn, _save_current_btn, _save_spinner
     with ui.row().classes("gap-2 items-center mt-4"):
         _save_new_btn = ui.button("Save into New Playlist", on_click=_on_save_new_playlist).props("color=blue")
         _save_current_btn = ui.button("Save into Current Playlist", on_click=_on_save_current_playlist).props("color=orange")
@@ -801,7 +1038,7 @@ def _render_sorted_results(ordered_descs: list, best_cost: float, ordered_tracks
 
 def build_smart_sorting():
     global _sort_select, _track_list_container, _anchors_list_container
-    global _analyze_stats_btn, _start_sort_btn, _start_sort_warning, _analyze_hint
+    global _analyze_stats_btn, _start_sort_btn, _analyze_hint
     global _logs_expansion, _logs_content, _logs_summary, _histogram_image, _stats_panel
     global _results_container, _spinner
     global _playlist_tracks, _playlist_name, _sorted_track_uris
