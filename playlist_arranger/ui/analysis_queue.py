@@ -22,6 +22,8 @@ import logging
 
 from nicegui import ui
 
+from playlist_arranger.ui import table_pagination as _tp
+
 logger = logging.getLogger(__name__)
 
 # ── Injected dependencies (wired by playlist_source.py at module init) ────────
@@ -102,9 +104,14 @@ def rebuild_queue_ui():
         return
 
     _queue_container.clear()
+    # Clamp saved page after potential track removals (e.g. analysis-complete
+    # auto-removal) — if user was on page 3 of 3 and one track dropped the
+    # total to 2 pages, clamp to page 2 instead of leaving an out-of-range val.
+    _tp.clamp_page_to_valid("__queue__", len(_state.analysis_queue))
     with _queue_container:
-        render_queue_table()
+        # Controls above the table for immediate access
         _render_queue_controls_fn()
+        render_queue_table()
     # Single source of truth: re-evaluate batch button enabled state AFTER
     # every queue rebuild, regardless of which code path triggered it.
     # Must run outside the context-manager-with in case _render_queue_controls_fn()
@@ -206,8 +213,10 @@ def render_queue_table():
     _queue_table_ref = ui.table(
         columns=columns, rows=rows, row_key="idx",
         selection="multiple",
-        pagination={"rowsPerPage": 0},
+        pagination=_tp.get_default_pagination(),
+        on_pagination_change=_tp.on_pagination_change_handler("__queue__"),
     ).classes("w-full").props("dense")
+    _tp.apply_pagination(_queue_table_ref, "__queue__")
     _queue_table_ref.add_slot("body-cell-desc", r"""
     <q-td :props="props">
       <span class="desc-icon-container">
@@ -253,5 +262,6 @@ def render_analysis_queue():
         _queue_label_ref = ui.label(label)
         _queue_container = ui.column().classes("w-full")
         with _queue_container:
-            render_queue_table()
+            # Controls above the table for immediate access
             _render_queue_controls_fn()
+            render_queue_table()

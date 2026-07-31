@@ -139,6 +139,17 @@ def build_settings_dialog():
                     label="Duration Tol", value=s.duration_tolerance, min=0.0, max=1.0, step=0.01,
                 ).classes("w-32")
 
+        # ─── Page size ──────────────────────────────────────────────────────
+        with ui.card().classes("w-full"):
+            ui.label("Table Pagination").classes("text-lg font-bold mb-2")
+            ui.label("Default number of rows per page for playlist and queue tables.").classes("text-xs text-gray-500 mb-2")
+            page_size_options = {5: "5", 10: "10", 15: "15", 20: "20", 25: "25", 50: "50", 0: "All (no pagination)"}
+            page_size_select = ui.select(
+                label="Default page size",
+                options=page_size_options,
+                value=s.default_page_size if s.default_page_size in page_size_options else 15,
+            ).classes("w-full max-w-md")
+
         # ─── Audio device ───────────────────────────────────────────────────
         with ui.card().classes("w-full"):
             ui.label("Audio Device").classes("text-lg font-bold mb-2")
@@ -211,6 +222,7 @@ def build_settings_dialog():
             s_new.ollama_model = ollama_model_input.value
             s_new.deepseek_model = deepseek_model_input.value
             s_new.mistral_model = mistral_model_input.value
+            s_new.default_page_size = int(page_size_select.value)
             if device_select.value:
                 s_new.selected_audio_device_index = int(device_select.value)
 

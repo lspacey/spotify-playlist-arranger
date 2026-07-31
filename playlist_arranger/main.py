@@ -243,6 +243,15 @@ def main_page():
                     on_click=lambda: dark.set_value(not dark.value),
                 ).props("flat color=white")
 
+    # ── Connection lifecycle monitoring ────────────────────────────────────
+    client = ui.context.client
+    client.on_disconnect(
+        lambda c=client: logging.getLogger("playlist_arranger.main").debug(
+            "DIAG [disconnect] client=%s page=%s",
+            c.id, _current_page,
+        )
+    )
+
     with ui.row().classes("w-full h-[calc(100vh-64px)]"):
         # ─── Left sidebar ───────────────────────────────────────────────────
         with ui.column().classes("w-48 bg-gray-100 dark:bg-gray-900 p-4 gap-2 h-full"):
@@ -294,7 +303,21 @@ def main_page():
         # ─── Right panel ────────────────────────────────────────────────────
         global _right_panel
         with ui.column().classes("flex-1 p-6 overflow-y-auto h-full") as _right_panel:
-            build_welcome()
+            # On reconnect, restore the last active page instead of flashing Welcome.
+            # _current_page persists across client reconnects because it's a
+            # module-level global, not per-client state.
+            if _current_page == "welcome":
+                build_welcome()
+            elif _current_page == "spotify_source":
+                build_spotify_section(set_page)
+            elif _current_page == "local_source":
+                build_local_section(set_page)
+            elif _current_page == "anchors":
+                build_anchors()
+            elif _current_page == "sorting":
+                build_smart_sorting()
+            else:
+                build_welcome()  # unknown page — safe default
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -322,6 +345,7 @@ def main():
             port=8082,
             reload=False,
             show=True,
+            reconnect_timeout=75.0,
         )
     except KeyboardInterrupt:
         logger.info("Shutdown requested (Ctrl-C) — exiting cleanly.")

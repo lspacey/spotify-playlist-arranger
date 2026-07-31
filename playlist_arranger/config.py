@@ -313,6 +313,9 @@ class Settings:
     # Audio
     selected_audio_device_index: int | None = SELECTED_AUDIO_DEVICE_INDEX
 
+    # UI
+    default_page_size: int = 15  # 5, 10, 15, 20, 25, 50, or 0 (show All)
+
     # Anchor generation
     custom_anchor_prompt: str = ""
 

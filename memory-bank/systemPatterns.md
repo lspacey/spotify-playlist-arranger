@@ -298,6 +298,20 @@ def _refresh_buttons():
 This follows the same principle as the `has_socket_connection` guard in `analysis_queue.py` (pattern #13 drain), but uses `RuntimeError` as the catch target since NiceGUI raises `RuntimeError("element has been deleted")` (not a custom exception class).
 
 ### 36. Source-Inspection Tests for UI Code (2026-07-30)
+
+### 37. Per-Table Pagination State Persistence (2026-07-31)
+Each `ui.table` instance (playlist track tables keyed by playlist ID, queue table keyed by `"__queue__"`) stores its live pagination state in `playlist_arranger/ui/table_pagination.py`. On table rebuild (desc generation callback, queue mutation, status refresh), the saved `{rowsPerPage, page}` is restored instead of resetting to the Settings.json default.
+
+Pattern:
+1. Before clearing/rebuilding a table, read the current `.pagination` dict from the old table via `on_pagination_change` handler (NiceGUI fires this with `ValueChangeEventArguments` containing the pagination dict).
+2. Store in per-table cache keyed by table identity (playlist ID or `"__queue__"`).
+3. After constructing the new `ui.table(...)`, call `apply_pagination(table, key)` which reads saved state (or falls back to Settings.json `default_page_size`).
+4. After track removals, call `clamp_page_to_valid()` to handle edge case where fewer total rows means saved page is now out of range.
+
+The Settings.json default is configurable via `Settings > Table Pagination > Default page size` (values: 5, 10, 15, 20, 25, 50, 0=All).
+
+### 38. Stricter Audio-Signal Validation (2026-07-31)
+`get_track_status()` in `state.py` now includes an 8th check after all existing DB/embedding/feature/duration checks pass: if the stored RMS level (`rms_db` in the features dict) is below -50 dB, the track is classified as `STATUS_LOW_SIGNAL` ("✗ Low signal — check capture device") even though a DB entry exists. This catches cases where audio was captured from the wrong device (silence / very quiet room noise) vs real music (-20 to -3 dB typical). Threshold aligns with the existing silence-gate constant `SILENCE_RMS_THRESHOLD = 0.001` in config.py.
 For NiceGUI page code that can't be easily unit-tested with mocked elements (due to NiceGUI's internal slot/context state), use source-inspection tests that parse the actual `.py` file and verify code structure invariants:
 - Order of operations (e.g., "client = ui.context.client" appears before "asyncio.to_thread")
 - Presence of guard patterns (e.g., "with client:" appears after await)

@@ -15,6 +15,8 @@ import logging
 
 from nicegui import ui
 
+from playlist_arranger.ui import table_pagination as _tp
+
 logger = logging.getLogger(__name__)
 
 # ── Injected dependencies (wired by playlist_source.py at module init) ────────
@@ -175,39 +177,10 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
                      "track_id": tid,
                      "track_name_original": t.get("name", "")})
 
-    track_table = ui.table(
-        columns=columns, rows=rows, row_key="idx",
-        selection="multiple",
-        pagination={"rowsPerPage": 0},
-    ).classes("w-full").props("dense")
-    track_table.add_slot("body-cell-desc", r"""
-    <q-td :props="props">
-      <span class="desc-icon-container">
-        <q-icon :name="props.row.desc_icon" :color="props.row.desc_color" size="18px"
-                style="cursor: pointer;"
-                @click.stop="() => $parent.$emit('desc_click', props.row)" />
-        <span class="desc-icon-tip">{{ props.row.desc_caption }}</span>
-      </span>
-    </q-td>
-    """)
-    track_table.on("desc_click", on_desc_icon_click)
-
-    _ph._playlist_tables[pl_id] = track_table
-    _ph._playlist_rows_cache[pl_id] = rows
-
-    def on_row_dblclick(e):
-        row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else {}
-        row_idx = row_data.get("idx", 0) - 1
-        if 0 <= row_idx < len(tracks):
-            track = tracks[row_idx]
-            client = ui.context.client
-            ui.timer(0.0, lambda t=track, c=client: asyncio.ensure_future(_play_track(t, client=c)), once=True)
-            _ph._sync_now_playing_row_highlight(pl_id, track.get("id", ""))
-
-    track_table.on("rowDblclick", on_row_dblclick)
-
+    # ── Action buttons (above the table — users shouldn't scroll past
+    #     hundreds of rows to find them) ──────────────────────────────────
     missing = sum(1 for t in tracks if _get_track_status(t) != _state.STATUS_OK)
-    with ui.row().classes("w-full gap-2 mt-2"):
+    with ui.row().classes("w-full gap-2 mb-2"):
         def _build_add_to_queue_btn():
             btn = ui.button(
                 "Add Selected Tracks to Queue for Analysis",
@@ -298,6 +271,42 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
         if _backup_exists_fn(pl_id):
             ui.button("Recover from backup", on_click=lambda: _recover_from_backup_fn(pl_id, set_page_cb), color="purple").classes("text-sm")
 
+    # ── Track table (below the action buttons) ────────────────────────────
+    # Use per-playlist pagination state: saved override → Settings.json default
+    default_pg = _tp.get_default_pagination()
+    track_table = ui.table(
+        columns=columns, rows=rows, row_key="idx",
+        selection="multiple",
+        pagination={"rowsPerPage": default_pg["rowsPerPage"]},
+        on_pagination_change=_tp.on_pagination_change_handler(pl_id),
+    ).classes("w-full").props("dense")
+    _tp.apply_pagination(track_table, pl_id)
+    track_table.add_slot("body-cell-desc", r"""
+    <q-td :props="props">
+      <span class="desc-icon-container">
+        <q-icon :name="props.row.desc_icon" :color="props.row.desc_color" size="18px"
+                style="cursor: pointer;"
+                @click.stop="() => $parent.$emit('desc_click', props.row)" />
+        <span class="desc-icon-tip">{{ props.row.desc_caption }}</span>
+      </span>
+    </q-td>
+    """)
+    track_table.on("desc_click", on_desc_icon_click)
+
+    _ph._playlist_tables[pl_id] = track_table
+    _ph._playlist_rows_cache[pl_id] = rows
+
+    def on_row_dblclick(e):
+        row_data = e.args[1] if isinstance(e.args, list) and len(e.args) >= 2 else {}
+        row_idx = row_data.get("idx", 0) - 1
+        if 0 <= row_idx < len(tracks):
+            track = tracks[row_idx]
+            client = ui.context.client
+            ui.timer(0.0, lambda t=track, c=client: asyncio.ensure_future(_play_track(t, client=c)), once=True)
+            _ph._sync_now_playing_row_highlight(pl_id, track.get("id", ""))
+
+    track_table.on("rowDblclick", on_row_dblclick)
+
     def _refresh_status_cells():
         nonlocal rows, track_table
         updated = False
@@ -307,7 +316,10 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
                 rows[i]["status"] = new_status
                 updated = True
         if updated:
-            track_table.rows = rows
-            _ph._playlist_rows_cache[pl_id] = rows
+            try:
+                track_table.update()
+            except Exception:
+                logger.debug("track_table.update() failed during status cell refresh for playlist %s",
+                             pl_id[:8] if pl_id else "?")
 
     ui.timer(2.0, _refresh_status_cells)

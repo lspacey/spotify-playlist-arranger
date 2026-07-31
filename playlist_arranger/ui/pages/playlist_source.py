@@ -109,13 +109,15 @@ def _on_analysis_complete(track_info: dict):
     logger.info("Auto-removed %d occurrence(s) of '%s' from analysis queue (after successful analysis)",
                 removed, track_info.get("name", "?")[:40])
     # _page_client now accessed via _ph._page_client
-    if _ph._page_client is not None:
+    if _ph._page_client is not None and getattr(_ph._page_client, 'has_socket_connection', False):
         try:
             with _ui_context_lock, _ph._page_client:
                 _update_queue_label()
                 _rebuild_queue_ui()
                 ui.notify(f"'{track_info.get('name', '?')[:30]}' removed from queue (analysis complete)",
                           type="positive")
+        except RuntimeError:
+            logger.debug("_on_analysis_complete: client disconnected mid-callback")
         except Exception:
             logger.exception("Failed to rebuild queue UI from analysis-complete callback")
 
@@ -146,7 +148,7 @@ def _on_desc_generated(track_id: str):
     if not track_id:
         return
     logger.debug("Description generated for track_id=%s", track_id[:8] if track_id else "?")
-    if _ph._page_client is not None:
+    if _ph._page_client is not None and getattr(_ph._page_client, 'has_socket_connection', False):
         try:
             with _ui_context_lock, _ph._page_client:
                 # Refresh queue table if visible
@@ -157,23 +159,32 @@ def _on_desc_generated(track_id: str):
                         table_ref = _ph._playlist_tables.get(pid)
                         if table_ref is None:
                             continue
-                        # Update desc_age info for matching row
+                        # Update desc_age info for matching row IN PLACE, then
+                        # call .update() (cheaper than full .rows reassignment).
                         updated = False
                         for row in rows_cache:
-                            if row.get("track_id") == track_id:
-                                entry = _db.get_track(track_id)
-                                desc_info = get_desc_age_info(
-                                    entry.get("desc_text") if entry else None,
-                                    entry.get("desc_generated_at") if entry else None,
-                                )
-                                row["desc_icon"] = "auto_stories" if desc_info.has_desc else "menu_book"
-                                row["desc_color"] = desc_info.color
-                                row["desc_caption"] = desc_info.caption
-                                row["desc"] = "✓" if desc_info.has_desc else "—"
-                                updated = True
-                                break
+                            try:
+                                if row.get("track_id") == track_id:
+                                    entry = _db.get_track(track_id)
+                                    desc_info = get_desc_age_info(
+                                        entry.get("desc_text") if entry else None,
+                                        entry.get("desc_generated_at") if entry else None,
+                                    )
+                                    row["desc_icon"] = "auto_stories" if desc_info.has_desc else "menu_book"
+                                    row["desc_color"] = desc_info.color
+                                    row["desc_caption"] = desc_info.caption
+                                    row["desc"] = "✓" if desc_info.has_desc else "—"
+                                    updated = True
+                                    break
+                            except Exception:
+                                logger.debug("Failed to update desc row in playlist %s for track %s",
+                                             pid[:8] if pid else "?", track_id[:8] if track_id else "?")
                         if updated:
-                            table_ref.rows = rows_cache
+                            try:
+                                table_ref.update()
+                            except Exception:
+                                logger.debug("table_ref.update() failed for playlist %s after desc generation",
+                                             pid[:8] if pid else "?")
                     except Exception:
                         logger.debug("Failed to refresh playlist table %s after desc generation", pid[:8] if pid else "?")
 
@@ -997,8 +1008,11 @@ def build_spotify_section(set_page_cb):
                 device_select.on("update:model-value", on_device_change)
                 ui.button(icon="refresh", on_click=_refresh_spotify_devices).props("flat round dense size=sm").tooltip("Refresh devices")
 
-            if _state.sp:
-                ui.timer(0.2, _refresh_spotify_devices, once=True)
+                # Auto-populate device list if already connected (normal page
+                # load when sp was set from a previous session, or the
+                # deferred rebuild after do_connect() sets _state.sp).
+                if _state.sp is not None:
+                    _do_refresh()
 
         with ui.column().classes("w-[60%]"):
             from playlist_arranger.audio.capture import list_loopback_devices, start_audio_capture, stop_capture
@@ -1088,7 +1102,6 @@ _queue_now_playing_row_keys = {}  # track→idx for now-playing highlight (analy
 _queue_container = None
 _queue_expansion_ref = None
 _queue_label_ref = None
-
 
 def _persist_queue():
     _aq.persist_queue()
@@ -1391,7 +1404,7 @@ def _get_selected_rows(pl_id: str):
 
 
 def _show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
-    """Delegate to \`\`playlist_arranger.ui.track_table.show_track_compact_table()\`\`."""
+    """Delegate to ``playlist_arranger.ui.track_table.show_track_compact_table()``."""
     _tt.show_track_compact_table(tracks, pl_id, pl_name, set_page_cb)
 
 

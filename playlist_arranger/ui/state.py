@@ -130,6 +130,7 @@ STATUS_EMBEDDING_MISSING = "✗ Embedding file missing"
 STATUS_INCOMPLETE = "✗ Incomplete features"
 STATUS_DURATION_MISMATCH = "✗ Duration mismatch"
 STATUS_MISSING_ID = "✗ Missing ID"
+STATUS_LOW_SIGNAL = "✗ Low signal — check capture device"
 
 
 def get_track_status(track: dict) -> str:
@@ -191,6 +192,17 @@ def get_track_status(track: dict) -> str:
         diff = abs(stored_dur - real_dur) / real_dur
         if diff > DURATION_TOLERANCE:
             return STATUS_DURATION_MISMATCH
+
+    # 8. Audio level check — verify captured audio is loud enough to be real
+    # music, not silence/noise from the wrong capture device.  Aligned with
+    # the silence-gate constant in config.py (SILENCE_RMS_THRESHOLD = 0.001
+    # linear → -60 dB).  We use -50 dB as the validation threshold:
+    # real music typically sits at -20 to -3 dB; room noise / wrong-device
+    # silence is much lower.
+    LOW_SIGNAL_RMS_DB_THRESHOLD = -50.0
+    rms_db = features.get("rms_db")
+    if rms_db is not None and isinstance(rms_db, (int, float)) and rms_db < LOW_SIGNAL_RMS_DB_THRESHOLD:
+        return STATUS_LOW_SIGNAL
 
     return STATUS_OK
 

@@ -22,6 +22,8 @@ Smart Sorting page post-save behavior improvements, RuntimeError fixes, and stal
 - Monitor for any remaining stale-reference issues on other pages (Spotify Source, Anchors, Stats, Batch Analysis)
 - Consider applying the same `client = ui.context.client` pattern to `_on_start_sorting` and `_on_insert_last_n` if issues arise
 - Track any leftover nicegui "Client has been deleted" warning patterns in production logs
+- Verify pagination persistence works correctly in real browser usage with large playlists
+- Monitor production logs for low-signal status flagging false positives on tracks with unusually quiet intros
 
 ## Active Decisions
 - **Pattern #1 (capture client before await)** is now the DEFAULT for all new async handler code in this project
