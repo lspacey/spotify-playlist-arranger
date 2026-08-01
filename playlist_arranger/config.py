@@ -8,6 +8,7 @@ import pathlib
 import logging
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
+import time
 
 # ─── Home directory (where .env lives) ─────────────────────────────────────────
 HOME_DIR = pathlib.Path(__file__).parent.parent.resolve()
@@ -232,6 +233,57 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip()
 LOG_FILE = HOME_DIR / "logs" / "app.log"
 
 
+class RetryRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that retries on PermissionError during rollover.
+
+    On Windows, ``os.rename()`` inside ``doRollover()`` can fail with
+    ``WinError 32`` ("file in use by another process") when a temporary lock
+    is held by antivirus scanners, search indexers, or another instance of
+    the application.  This subclass retries the rollover up to
+    *max_attempts* times with an exponential backoff before giving up and
+    skipping the rotation for this cycle (instead of crashing the logging
+    thread).
+
+    Parameters
+    ----------
+    max_attempts : int
+        Maximum number of PermissionError retries per rollover attempt
+        (default 3).
+    retry_base_s : float
+        Base sleep duration in seconds; each retry waits
+        ``retry_base_s * (2 ** (attempt - 1))`` (default 0.05 → 50ms, 100ms,
+        200ms).
+    """
+
+    def __init__(self, *args, max_attempts: int = 3, retry_base_s: float = 0.05,
+                 **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._max_attempts = max_attempts
+        self._retry_base_s = retry_base_s
+
+    def doRollover(self) -> None:
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                super().doRollover()
+                return
+            except PermissionError:
+                if attempt == self._max_attempts:
+                    # Last attempt also failed — log to stderr (this handler
+                    # is mid-rollover so we cannot safely log to the file
+                    # itself) and skip rotation this cycle.
+                    import sys as _sys
+                    delay = self._retry_base_s * (2 ** (attempt - 1))
+                    _sys.stderr.write(
+                        f"[{self.__class__.__name__}] PermissionError during "
+                        f"doRollover() — {self._max_attempts} attempts "
+                        f"exhausted (last delay {delay:.3f}s); skipping "
+                        f"rotation this cycle\n"
+                    )
+                    return
+                delay = self._retry_base_s * (2 ** (attempt - 1))
+                time.sleep(delay)
+
+
 def setup_logging() -> None:
     """Configure RotatingFileHandler + console for playlist_arranger namespace.
 
@@ -262,9 +314,13 @@ def setup_logging() -> None:
     ))
     root_logger.addHandler(console)
 
-    # Rotating file handler — always DEBUG for maximum detail
-    file_handler = RotatingFileHandler(
+    # Rotating file handler — always DEBUG for maximum detail.
+    # ``delay=True`` defers opening the log file until the first emit(),
+    # which shrinks the window where the file handle is held open and
+    # reduces the chance of PermissionError during rollover on Windows.
+    file_handler = RetryRotatingFileHandler(
         str(LOG_FILE), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+        delay=True,
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(
