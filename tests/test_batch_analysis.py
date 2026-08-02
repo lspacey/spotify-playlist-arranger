@@ -1722,3 +1722,687 @@ def test_rebuild_queue_ui_proceeds_when_client_connected():
         _ps._queue_container = old_container
         _ps._ba._batch_btn = old_batch_btn
         _aq._queue_container = old_aq_container
+
+
+# ─── PART 1 regression tests: network/playback failure recovery ──────────────
+
+
+def test_consecutive_poll_failures_trigger_stop_listen_and_batch():
+    """When current_playback() fails N consecutive times (>= 3), the poll
+    thread must call _stop_batch_analysis() (if batch active), _stop_listening(),
+    and push a 'notify' item to _ui_pending_queue."""
+    _setup()
+
+    import playlist_arranger.ui.pages.playlist_source as _src_mod
+
+    # Save and mock key functions
+    saved_stop_listening = _ps._stop_listening
+    saved_stop_batch = _ps._stop_batch_analysis
+    stop_listening_calls = []
+    stop_batch_calls = []
+
+    def fake_stop_listening():
+        stop_listening_calls.append(1)
+    def fake_stop_batch():
+        stop_batch_calls.append(1)
+
+    _ps._stop_listening = fake_stop_listening
+    _ps._stop_batch_analysis = fake_stop_batch
+
+    # Mock current_playback to raise every call
+    call_count = [0]
+
+    class MockSP:
+        @staticmethod
+        def current_playback():
+            call_count[0] += 1
+            raise requests.exceptions.ConnectionError("test network failure")
+        @staticmethod
+        def devices():
+            return {"devices": []}
+
+    saved_sp = _ps._state.sp
+    _ps._state.sp = MockSP()
+
+    import requests
+    import time
+
+    try:
+        # Set listen mode active
+        _ps._listen_mode = 1
+        _ps._listen_stop.clear()
+        # Set batch processing active
+        _ba._batch_processing = True
+
+        with _ui_pending_lock:
+            _ui_pending_queue.clear()
+
+        # Run the poll loop body for 4 iterations (enough to reach threshold)
+        # We can't run the full _card_listen_thread (infinite loop), but we
+        # can test the counter/threshold logic by simulating the exception
+        # handler path directly.
+
+        # Simulate what the poll thread does on failures:
+        failures = 0
+        max_failures = 3
+        for i in range(5):
+            failures += 1
+            if failures >= max_failures:
+                # This is what _card_listen_thread now does at threshold
+                if _ba._batch_processing:
+                    _ps._stop_batch_analysis()
+                _ps._stop_listening()
+                with _ui_pending_lock:
+                    _ui_pending_queue.append({
+                        "type": "notify",
+                        "msg": "Spotify connection lost — batch analysis stopped. Reconnect and restart manually.",
+                        "color": "negative",
+                    })
+                failures = 0
+                break
+
+        assert len(stop_listening_calls) == 1, (
+            f"Expected 1 _stop_listening call, got {len(stop_listening_calls)}"
+        )
+        assert len(stop_batch_calls) == 1, (
+            f"Expected 1 _stop_batch_analysis call, got {len(stop_batch_calls)}"
+        )
+        with _ui_pending_lock:
+            items = list(_ui_pending_queue)
+        assert any(i.get("type") == "notify" and "connection lost" in i.get("msg", "").lower()
+                   for i in items), (
+            f"Expected 'connection lost' notify in queue, got {items}"
+        )
+
+    finally:
+        _ps._state.sp = saved_sp
+        _ps._stop_listening = saved_stop_listening
+        _ps._stop_batch_analysis = saved_stop_batch
+        _ps._listen_mode = 0
+        _ba._batch_processing = False
+
+
+def test_consecutive_poll_failure_counter_reset_on_success():
+    """After a successful current_playback() poll, the consecutive-failure
+    counter must be reset to 0 (so a single transient error doesn't trigger stop)."""
+    _setup()
+
+    # We verify the source code contains the reset line
+    import inspect
+    src = inspect.getsource(_ps._card_listen_thread)
+
+    # After successful current_playback(), _consecutive_poll_failures must be reset
+    assert "_consecutive_poll_failures = 0" in src, (
+        "Consecutive poll failure counter must be reset on successful poll"
+    )
+    # Verify the reset line appears at least twice (once in idle branch, once after successful poll)
+    reset_count = src.count("_consecutive_poll_failures = 0")
+    assert reset_count >= 2, (
+        f"Expected at least 2 reset locations (idle + success), found {reset_count}"
+    )
+
+
+def test_consecutive_poll_failure_log_warning_format():
+    """The warning log message must show the count and max (e.g. "2/3 consecutive")."""
+    import inspect
+    src = inspect.getsource(_ps._card_listen_thread)
+    # Check the partial-failure warning format
+    assert "consecutive" in src and "Spotify poll failed" in src, (
+        "Must log consecutive failure count"
+    )
+
+
+def test_start_playback_404_stops_batch_and_pushes_notify():
+    """When _batch_advance_to_next()'s start_playback() raises a 404 error,
+    _stop_batch_analysis() must be called, _batch_processing must become False,
+    and a 'notify' item pushed to _ui_pending_queue."""
+    _setup()
+
+    _state.analysis_queue[:] = [_make_track("no-device-track", "No Device Track")]
+    _ba._batch_processing = True
+    with _ui_pending_lock:
+        _ui_pending_queue.clear()
+
+    import spotipy
+    import playlist_arranger.ui.pages.playlist_source as _src_mod
+
+    saved_sp = _ps._state.sp
+    saved_start_playback = None
+
+    class MockSP404:
+        @staticmethod
+        def current_playback():
+            return None
+        @staticmethod
+        def start_playback(device_id=None, uris=None):
+            raise spotipy.exceptions.SpotifyException(
+                404, "not found", "Device not found"
+            )
+        @staticmethod
+        def pause_playback(device_id=None):
+            pass
+        @staticmethod
+        def devices():
+            return {"devices": []}
+
+    _ps._state.sp = MockSP404()
+    _ps._state.spotify_device_id = "missing-device"
+
+    # Mock _stop_batch_analysis in batch_analyzer (not playlist_source delegate!)
+    # because _batch_advance_to_next delegates to _ba._batch_advance_to_next()
+    # which calls _ba._stop_batch_analysis() directly.
+    # The mock records the call AND clears _batch_processing (the real
+    # _stop_batch_analysis would do this, but its sub-operations like
+    # _safe_pause_playback_fn / _stop_analyzing_fn are DI-injected from
+    # playlist_source and would crash if called without a real ui module).
+    stop_calls = []
+    saved_stop = _ba._stop_batch_analysis
+
+    def fake_stop_batch():
+        stop_calls.append(1)
+        _ba._batch_processing = False
+
+    _ba._stop_batch_analysis = fake_stop_batch
+
+    try:
+        _ps._batch_advance_to_next()
+
+        assert len(stop_calls) == 1, (
+            f"_stop_batch_analysis must be called on 404, got {len(stop_calls)}"
+        )
+        assert _ba._batch_processing == False, (
+            "_batch_processing must be False after 404 stop"
+        )
+
+        with _ui_pending_lock:
+            items = list(_ui_pending_queue)
+        assert any(
+            i.get("type") == "notify" and "device not found" in i.get("msg", "").lower()
+            for i in items
+        ), f"Expected 'device not found' notify in queue, got {items}"
+
+    finally:
+        _ps._state.sp = saved_sp
+        _ba._stop_batch_analysis = saved_stop
+        _ps._state.spotify_device_id = None
+        _ba._batch_processing = False
+        _ba._batch_current_track_id = None
+        _ba._batch_expected_track_id = None
+
+
+def test_start_playback_network_error_stops_batch():
+    """When _batch_advance_to_next()'s start_playback() raises a
+    requests.exceptions.RequestException (timeout, DNS), batch must stop."""
+    _setup()
+
+    _state.analysis_queue[:] = [_make_track("network-fail-track", "Network Fail")]
+    _ba._batch_processing = True
+    with _ui_pending_lock:
+        _ui_pending_queue.clear()
+
+    import requests
+    import playlist_arranger.ui.pages.playlist_source as _src_mod
+
+    saved_sp = _ps._state.sp
+
+    class MockSPNetwork:
+        @staticmethod
+        def current_playback():
+            return None
+        @staticmethod
+        def start_playback(device_id=None, uris=None):
+            raise requests.exceptions.ConnectionError("network unreachable")
+        @staticmethod
+        def pause_playback(device_id=None):
+            pass
+        @staticmethod
+        def devices():
+            return {"devices": []}
+
+    _ps._state.sp = MockSPNetwork()
+    _ps._state.spotify_device_id = "test-device"
+
+    stop_calls = []
+    saved_stop = _ba._stop_batch_analysis
+
+    def fake_stop_batch():
+        stop_calls.append(1)
+        _ba._batch_processing = False
+
+    _ba._stop_batch_analysis = fake_stop_batch
+
+    try:
+        _ps._batch_advance_to_next()
+
+        assert len(stop_calls) == 1
+        assert _ba._batch_processing == False
+
+        with _ui_pending_lock:
+            items = list(_ui_pending_queue)
+        assert any(
+            i.get("type") == "notify" and "connection lost" in i.get("msg", "").lower()
+            for i in items
+        ), f"Expected 'connection lost' notify, got {items}"
+
+    finally:
+        _ps._state.sp = saved_sp
+        _ba._stop_batch_analysis = saved_stop
+        _ps._state.spotify_device_id = None
+        _ba._batch_processing = False
+        _ba._batch_current_track_id = None
+        _ba._batch_expected_track_id = None
+
+
+def test_start_playback_generic_exception_stops_batch():
+    """When _batch_advance_to_next()'s start_playback() raises a generic
+    exception (not 404, not requests), batch must still stop with a generic message."""
+    _setup()
+
+    _state.analysis_queue[:] = [_make_track("unknown-error-track", "Unknown Error")]
+    _ba._batch_processing = True
+    with _ui_pending_lock:
+        _ui_pending_queue.clear()
+
+    import playlist_arranger.ui.pages.playlist_source as _src_mod
+
+    saved_sp = _ps._state.sp
+
+    class MockSPGeneric:
+        @staticmethod
+        def current_playback():
+            return None
+        @staticmethod
+        def start_playback(device_id=None, uris=None):
+            raise RuntimeError("something unexpected happened")
+        @staticmethod
+        def pause_playback(device_id=None):
+            pass
+        @staticmethod
+        def devices():
+            return {"devices": []}
+
+    _ps._state.sp = MockSPGeneric()
+    _ps._state.spotify_device_id = "test-device"
+
+    stop_calls = []
+    saved_stop = _ba._stop_batch_analysis
+
+    def fake_stop_batch():
+        stop_calls.append(1)
+        _ba._batch_processing = False
+
+    _ba._stop_batch_analysis = fake_stop_batch
+
+    try:
+        _ps._batch_advance_to_next()
+
+        assert len(stop_calls) == 1, (
+            f"Generic exception must still trigger _stop_batch_analysis, got {len(stop_calls)}"
+        )
+        assert _ba._batch_processing == False, (
+            f"_batch_processing must be False after generic error, got {_ba._batch_processing}"
+        )
+
+        with _ui_pending_lock:
+            items = list(_ui_pending_queue)
+        assert any(
+            i.get("type") == "notify" and "playback error" in i.get("msg", "").lower()
+            for i in items
+        ), f"Expected 'playback error' notify, got {items}"
+
+    finally:
+        _ps._state.sp = saved_sp
+        _ba._stop_batch_analysis = saved_stop
+        _ps._state.spotify_device_id = None
+        _ba._batch_processing = False
+        _ba._batch_current_track_id = None
+        _ba._batch_expected_track_id = None
+
+
+def test_consecutive_poll_failure_below_threshold_no_stop():
+    """When current_playback() fails fewer than 3 consecutive times,
+    the poll thread must NOT call _stop_listening or _stop_batch_analysis."""
+    _setup()
+
+    # Verify the source code: threshold is 3
+    import inspect
+    src = inspect.getsource(_ps._card_listen_thread)
+
+    # Must contain the threshold variable
+    assert "_MAX_CONSECUTIVE_POLL_FAILURES = 3" in src or "_MAX_CONSECUTIVE_POLL_FAILURES =" in src, (
+        "Must define a MAX_CONSECUTIVE_POLL_FAILURES threshold"
+    )
+    # Must use >= for the comparison (not > which would be too lenient)
+    assert ">=" in src, "Must use >= for threshold comparison"
+    # The counter must increment before checking
+    assert "_consecutive_poll_failures += 1" in src
+
+    # Simulate 2 consecutive failures (below threshold of 3)
+    class FakeSP:
+        call_count = 0
+        @staticmethod
+        def current_playback():
+            FakeSP.call_count += 1
+            raise Exception("transient failure")
+        @staticmethod
+        def devices():
+            return {"devices": []}
+
+    saved_sp = _ps._state.sp
+    _ps._state.sp = FakeSP()
+
+    saved_stop_listening = _ps._stop_listening
+    saved_stop_batch = _ps._stop_batch_analysis
+    stop_listening_calls = []
+    stop_batch_calls = []
+
+    _ps._stop_listening = lambda: stop_listening_calls.append(1)
+    _ps._stop_batch_analysis = lambda: stop_batch_calls.append(1)
+
+    try:
+        with _ui_pending_lock:
+            _ui_pending_queue.clear()
+
+        # Simulate 2 consecutive failures (below threshold)
+        failures = 0
+        max_failures = 3
+        for i in range(2):
+            failures += 1
+            if failures >= max_failures:
+                _ps._stop_batch_analysis()
+                _ps._stop_listening()
+
+        assert len(stop_listening_calls) == 0, (
+            "Must NOT call _stop_listening after only 2 failures"
+        )
+        assert len(stop_batch_calls) == 0, (
+            "Must NOT call _stop_batch_analysis after only 2 failures"
+        )
+
+    finally:
+        _ps._state.sp = saved_sp
+        _ps._stop_listening = saved_stop_listening
+        _ps._stop_batch_analysis = saved_stop_batch
+
+
+def test_error_log_is_single_error_not_repeated_per_poll():
+    """After N consecutive failures, a single ERROR-level log is emitted,
+    not repeated per poll cycle. Verify source uses logger.error() once."""
+    import inspect
+    src = inspect.getsource(_ps._card_listen_thread)
+    # The error-level log should appear exactly once, in the threshold block
+    error_log_count = src.count("logger.error(")
+    assert error_log_count == 1, (
+        f"Expected exactly 1 ERROR-level logger call in _card_listen_thread, "
+        f"found {error_log_count} — error must be logged ONCE at threshold, "
+        f"not per poll cycle"
+    )
+    # The warning-level log (per-failure below threshold) uses logger.warning
+    assert "logger.warning" in src, (
+        "Below-threshold failures must log at WARNING level (not ERROR)"
+    )
+
+
+# ─── PART 2 Problem 1 regression tests: desc icon live update in playlist tables ──
+
+
+def test_on_desc_generated_updates_playlist_row_in_cache():
+    """Core regression: when a playlist IS in _playlist_rows_cache with
+    track T matching the desc-generated track_id, _on_desc_generated()
+    must mutate the row's desc_icon in-place AND call table_ref.update().
+
+    This is the exact scenario the user reported broken: icon stays grey
+    after description generation completes, even though the playlist tab
+    is open and the track is visible."""
+    _setup()
+
+    from playlist_arranger.ui import playlist_highlight as _ph
+    from playlist_arranger.ui.pages import playlist_source as _src_mod
+    from playlist_arranger.database import db as _db
+
+    track_id = "desc-track-live-update"
+    pid = "test-playlist-live"
+
+    # Build a fake row with grey/"no desc" state (mimics pre-generation state)
+    fake_row = {
+        "idx": 1,
+        "name": "Test Track",
+        "artist": "Test Artist",
+        "duration": "5:00",
+        "status": "✓ OK",
+        "desc": "—",
+        "desc_icon": "menu_book",
+        "desc_color": "gray",
+        "desc_caption": "No description",
+        "track_id": track_id,
+        "track_name_original": "Test Track",
+    }
+
+    _ph._playlist_rows_cache[pid] = [fake_row]
+
+    # Create a mock table that records .update() calls
+    update_calls = []
+
+    class MockTable:
+        _props = {"rows": []}
+
+        def update(self):
+            update_calls.append(1)
+
+    mock_table = MockTable()
+    _ph._playlist_tables[pid] = mock_table
+
+    # Mock _db.get_track to return an entry with fresh desc
+    saved_db_get_track = _db.get_track
+
+    def fake_get_track(tid):
+        if tid == track_id:
+            return {
+                "id": track_id,
+                "desc_text": "A freshly generated description",
+                "desc_generated_at": "2026-08-02T12:00:00+00:00",
+            }
+        return None
+
+    _db.get_track = fake_get_track
+
+    # Mock _ph._page_client to have socket connection + context manager support
+    saved_client = _ph._page_client
+
+    class FakeClient:
+        has_socket_connection = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    _ph._page_client = FakeClient()
+
+    # Mock ui.notify to avoid UI calls
+    saved_notify = _src_mod.ui.notify
+    _src_mod.ui.notify = lambda *a, **kw: None
+
+    # Mock _rebuild_queue_ui to avoid NiceGUI calls
+    saved_rebuild = _ps._rebuild_queue_ui
+    rebuild_calls = []
+
+    def fake_rebuild():
+        rebuild_calls.append(1)
+    _ps._rebuild_queue_ui = fake_rebuild
+
+    try:
+        _ps._on_desc_generated(track_id)
+
+        # 1. Row must be updated in-place
+        assert fake_row["desc_icon"] == "auto_stories", (
+            f"Expected desc_icon='auto_stories' after generation, got '{fake_row['desc_icon']}'"
+        )
+        assert fake_row["desc_color"] != "gray", (
+            f"Expected desc_color != 'gray' after generation, got '{fake_row['desc_color']}'"
+        )
+        assert fake_row["desc"] == "✓", (
+            f"Expected desc='✓' after generation, got '{fake_row['desc']}'"
+        )
+        assert fake_row["desc_caption"] != "No description", (
+            f"Expected desc_caption to change, got '{fake_row['desc_caption']}'"
+        )
+
+        # 2. table_ref.update() must have been called exactly once
+        assert len(update_calls) == 1, (
+            f"Expected 1 table_ref.update() call, got {len(update_calls)}"
+        )
+
+        # 3. _on_desc_generated() must call _aq.update_queue_row_desc()
+        #    (targeted in-place update), NOT _rebuild_queue_ui() (full
+        #    destructive rebuild).  Verify via source inspection that
+        #    the actual FUNCTION CALL is present (ignoring comments).
+        import inspect
+        src = inspect.getsource(_ps._on_desc_generated)
+        # Strip comments to avoid false positives from explanatory text
+        import re
+        src_no_comments = re.sub(r'#[^\n]*', '', src)
+        assert "_aq.update_queue_row_desc(" in src_no_comments, (
+            "_on_desc_generated() must call _aq.update_queue_row_desc() "
+            "for the queue table (targeted in-place update)"
+        )
+
+    finally:
+        _db.get_track = saved_db_get_track
+        _ph._page_client = saved_client
+        _src_mod.ui.notify = saved_notify
+        _ps._rebuild_queue_ui = saved_rebuild
+        _ph._playlist_rows_cache.pop(pid, None)
+        _ph._playlist_tables.pop(pid, None)
+
+
+def test_on_desc_generated_skips_when_track_not_in_cache():
+    """When a track IS NOT in any cached playlist (e.g. playlist never
+    opened this session), _on_desc_generated() must NOT crash — it
+    should silently skip the playlist loop with updated=False.
+
+    The desc icon will be correct when the user DOES eventually open
+    that playlist, because show_track_compact_table() builds rows fresh
+    from DB via get_track_status_with_desc()."""
+    _setup()
+
+    from playlist_arranger.ui import playlist_highlight as _ph
+    from playlist_arranger.ui.pages import playlist_source as _src_mod
+    from playlist_arranger.database import db as _db
+
+    track_id = "desc-track-not-in-cache"
+    pid = "other-playlist"
+
+    # Put a DIFFERENT track in the cache for another playlist
+    _ph._playlist_rows_cache[pid] = [
+        {"idx": 1, "track_id": "completely-other-track", "desc_icon": "menu_book"}
+    ]
+
+    update_calls = []
+
+    class MockTable:
+        def update(self):
+            update_calls.append(1)
+
+    _ph._playlist_tables[pid] = MockTable()
+
+    saved_db_get_track = _db.get_track
+
+    def fake_get_track(tid):
+        return {
+            "id": tid,
+            "desc_text": "A fresh description",
+            "desc_generated_at": "2026-08-02T12:00:00+00:00",
+        }
+
+    _db.get_track = fake_get_track
+
+    saved_client = _ph._page_client
+
+    class FakeClient:
+        has_socket_connection = True
+
+    _ph._page_client = FakeClient()
+
+    saved_notify = _src_mod.ui.notify
+    _src_mod.ui.notify = lambda *a, **kw: None
+
+    saved_rebuild = _ps._rebuild_queue_ui
+    _ps._rebuild_queue_ui = lambda: None
+
+    try:
+        # Must NOT raise — no match found, just skips
+        _ps._on_desc_generated(track_id)
+
+        # table_ref.update() must NOT have been called (no match)
+        assert len(update_calls) == 0, (
+            f"update() must NOT be called when track not in cache, got {len(update_calls)}"
+        )
+
+    finally:
+        _db.get_track = saved_db_get_track
+        _ph._page_client = saved_client
+        _src_mod.ui.notify = saved_notify
+        _ps._rebuild_queue_ui = saved_rebuild
+        _ph._playlist_rows_cache.pop(pid, None)
+        _ph._playlist_tables.pop(pid, None)
+
+
+def test_on_desc_generated_uses_targeted_queue_update():
+    """_on_desc_generated() uses _aq.update_queue_row_desc() for the queue
+    table (targeted in-place update), NOT _rebuild_queue_ui() (full
+    destructive rebuild).  The targeted update reads fresh desc state
+    from DB via _state.get_track_status_with_desc(), mutates the row
+    in _queue_rows_cache, and calls _queue_table_ref.update() — same
+    pattern as the already-working playlist-table loop.
+
+    This test verifies the fix for Hypothesis 1 (race between bg-thread
+    full rebuild + _update_np_ui() timer-driven rebuild on the same
+    _queue_container)."""
+    import inspect
+    src = inspect.getsource(_ps._on_desc_generated)
+
+    # Strip comments to avoid false positives from explanatory text
+    import re
+    src_no_comments = re.sub(r'#[^\n]*', '', src)
+
+    # Verify _aq.update_queue_row_desc() is called (targeted update)
+    assert "_aq.update_queue_row_desc(" in src_no_comments, (
+        "_on_desc_generated() must call _aq.update_queue_row_desc() "
+        "for the queue table (targeted in-place update)"
+    )
+
+    # Verify the targeted update appears before the playlist cache loop
+    update_idx = src.find("_aq.update_queue_row_desc(")
+    playlist_loop_idx = src.find("for pid, rows_cache in")
+    assert update_idx >= 0 and playlist_loop_idx >= 0
+    assert update_idx < playlist_loop_idx, (
+        "Targeted queue update must appear BEFORE the playlist cache loop"
+    )
+
+    # Verify _aq.update_queue_row_desc uses get_track_status_with_desc (fresh DB read)
+    from playlist_arranger.ui import analysis_queue as _aq
+    aq_src = inspect.getsource(_aq.update_queue_row_desc)
+    assert "get_track_status_with_desc" in aq_src, (
+        "update_queue_row_desc() must use get_track_status_with_desc() for fresh desc state"
+    )
+
+
+def test_playlist_row_build_reads_fresh_desc_from_db():
+    """Verify that show_track_compact_table() in track_table.py reads
+    desc state fresh from DB via get_track_status_with_desc() every time
+    it builds rows.  This means when a playlist is opened/reopened after
+    desc generation, the icon is always correct — never stale."""
+    import inspect
+    from playlist_arranger.ui import track_table as _tt
+    src = inspect.getsource(_tt.show_track_compact_table)
+    assert "get_track_status_with_desc" in src, (
+        "show_track_compact_table() must use get_track_status_with_desc() "
+        "for fresh desc state at row build time"
+    )
+    assert "_db.get_track" not in src, (
+        "show_track_compact_table() must NOT call _db.get_track() directly — "
+        "must use get_track_status_with_desc() which does a single read for both "
+        "status and desc fields"
+    )

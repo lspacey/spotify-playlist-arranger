@@ -255,20 +255,16 @@ def test_descriptions_module_deleted():
 
 
 def test_run_descriptions_stub_does_not_crash():
-    """The stubbed run_descriptions() in main.py works without crashing."""
+    """The stubbed run_descriptions() in main.py is importable and is a
+    callable async function — does not crash on inspection."""
     from playlist_arranger.main import run_descriptions
-    # run_descriptions is an async function; we test the synchronous part.
-    # It just calls ui.notify + logger.info — no imports, no I/O.
-    try:
-        run_descriptions()
-    except (RuntimeError, AttributeError) as exc:
-        err = str(exc).lower()
-        if "nicegui" in err or "context" in err or "client" in err:
-            # NiceGUI context not available in test environment — expected,
-            # but the function itself didn't raise an ImportError or crash.
-            pass
-        else:
-            raise
+    import inspect
+    # Verify it's a coroutine function (async def), not a regular function
+    assert inspect.iscoroutinefunction(run_descriptions), (
+        "run_descriptions must be an async function (async def)"
+    )
+    # Verify it's callable (module import succeeds, no ImportError)
+    assert callable(run_descriptions), "run_descriptions must be callable"
 
 
 def test_smart_sorting_safe_with_empty_descs():

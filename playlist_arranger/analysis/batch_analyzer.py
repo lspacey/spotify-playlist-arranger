@@ -184,7 +184,51 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
                             next_track.get("name", "?")[:40], tid[:8] if tid else "?",
                             len(queue_snapshot))
             except Exception as e:
-                logger.exception("Batch: failed to start playback: %s", e)
+                err_msg = str(e)
+                is_404 = "404" in err_msg or "device not found" in err_msg.lower()
+                is_network = False
+                try:
+                    import requests
+                    if isinstance(e, requests.exceptions.RequestException):
+                        is_network = True
+                except ImportError:
+                    pass
+                if is_404:
+                    logger.error(
+                        "Batch: playback device not found (404) for track '%s' (id=%s) — "
+                        "device may have gone offline. Stopping batch analysis.",
+                        next_track.get("name", "?")[:40], tid[:8] if tid else "?",
+                    )
+                    with _ui_pending_lock:
+                        _ui_pending_queue.append({
+                            "type": "notify",
+                            "msg": "Spotify playback device not found — batch analysis stopped. Select a device and restart manually.",
+                            "color": "negative",
+                        })
+                elif is_network:
+                    logger.error(
+                        "Batch: network error during start_playback for '%s' (id=%s): %s. "
+                        "Stopping batch analysis.",
+                        next_track.get("name", "?")[:40], tid[:8] if tid else "?", e,
+                    )
+                    with _ui_pending_lock:
+                        _ui_pending_queue.append({
+                            "type": "notify",
+                            "msg": "Spotify connection lost — batch analysis stopped. Reconnect and restart manually.",
+                            "color": "negative",
+                        })
+                else:
+                    logger.error(
+                        "Batch: failed to start playback for '%s' (id=%s): %s. "
+                        "Stopping batch analysis.",
+                        next_track.get("name", "?")[:40], tid[:8] if tid else "?", e,
+                    )
+                    with _ui_pending_lock:
+                        _ui_pending_queue.append({
+                            "type": "notify",
+                            "msg": "Batch analysis stopped due to playback error. Check logs and restart manually.",
+                            "color": "negative",
+                        })
                 _stop_batch_analysis()
                 return
 

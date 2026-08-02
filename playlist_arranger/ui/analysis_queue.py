@@ -85,21 +85,12 @@ def rebuild_queue_ui():
         return
 
     # ── Safety: skip rebuild if client disconnected (background-thread callback) ──
-    # _on_desc_generated() is invoked from a background worker thread
-    # (_desc_worker_loop → cb(track_id) → _on_desc_generated → rebuild_queue_ui).
-    # By the time the callback fires, the user may have navigated away or
-    # disconnected, leaving _queue_container as a stale NiceGUI element whose
-    # client has no active socket connection.  Calling .clear() on a
-    # disconnected element triggers a "deleted but still being used" warning.
-    # We check has_socket_connection before any UI mutation and bail out safely.
     try:
         client = _queue_container.client
         if not client.has_socket_connection:
             logger.debug("Skipping queue UI rebuild — client disconnected")
             return
     except Exception:
-        # Cannot verify connection state (element may be in a bad state) —
-        # bail out safely rather than crash or emit a warning.
         logger.debug("Could not verify client connection — skipping queue UI rebuild")
         return
 
@@ -112,15 +103,101 @@ def rebuild_queue_ui():
         # Controls above the table for immediate access
         _render_queue_controls_fn()
         render_queue_table()
-    # Single source of truth: re-evaluate batch button enabled state AFTER
-    # every queue rebuild, regardless of which code path triggered it.
-    # Must run outside the context-manager-with in case _render_queue_controls_fn()
-    # failed partway through and left _ba._batch_btn stale.
-    #
-    # NOTE: refresh_batch_btn_enabled is called from _render_queue_controls_fn()
-    # at button creation time as well, but calling it again here is harmless
-    # and ensures the button state is always correct after any rebuild trigger
-    # (e.g. _on_analysis_complete callback).
+
+
+def update_queue_row_desc(track_id: str) -> bool:
+    """Targeted in-place desc update for a single track's row in the queue table.
+
+    Finds the row matching *track_id* in ``_queue_rows_cache``, mutates
+    ``desc_icon``/``desc_color``/``desc_caption``/``desc`` fields in-place
+    from a fresh DB read via ``_state.get_track_status_with_desc()``, then
+    calls ``_queue_table_ref.update()``.
+
+    Does NOT call ``.clear()`` or re-render the container — no full
+    table teardown+rebuild cycle.  Preserves pagination state.
+
+    Returns True if a matching row was found and updated, False otherwise.
+    """
+    global _queue_table_ref, _queue_rows_cache
+
+    tid_short = track_id[:8] if track_id else "?"
+    guard_reason = None
+
+    if not track_id:
+        guard_reason = "track_id is empty"
+    elif _queue_table_ref is None:
+        guard_reason = "_queue_table_ref is None (queue table not yet rendered)"
+    elif not _queue_rows_cache:
+        guard_reason = "_queue_rows_cache is empty (0 rows)"
+
+    if guard_reason:
+        logger.warning(
+            "update_queue_row_desc(%s): SKIPPED — %s",
+            tid_short, guard_reason,
+        )
+        return False
+
+    cache_track_ids = [r.get("track_id") for r in _queue_rows_cache]
+    logger.info(
+        "update_queue_row_desc(%s): searching %d cached rows, "
+        "sample ids=%s",
+        tid_short, len(_queue_rows_cache),
+        [t[:8] for t in (cache_track_ids[:5] if cache_track_ids else [])],
+    )
+
+    updated = False
+    for row in _queue_rows_cache:
+        try:
+            if row.get("track_id") == track_id:
+                old_icon = row.get("desc_icon", "?")
+                combined = _state.get_track_status_with_desc(
+                    {"id": track_id, "duration_ms": 0}
+                )
+                new_icon = combined["desc_icon"]
+                row["desc_icon"] = new_icon
+                row["desc_color"] = combined["desc_color"]
+                row["desc_caption"] = combined["desc_caption"]
+                row["desc"] = combined["desc"]
+                logger.info(
+                    "update_queue_row_desc(%s): row FOUND, "
+                    "desc_icon '%s' → '%s', calling table.update()",
+                    tid_short, old_icon, new_icon,
+                )
+                updated = True
+                break
+        except Exception:
+            logger.exception(
+                "update_queue_row_desc(%s): exception while updating row",
+                tid_short,
+            )
+
+    if not updated:
+        logger.debug(
+            "update_queue_row_desc(%s): row NOT FOUND in _queue_rows_cache "
+            "(%d rows checked, sample ids: %s) — this is normal for tracks "
+            "generated from playlist views (not queued for analysis)",
+            tid_short, len(_queue_rows_cache),
+            [t[:8] for t in (cache_track_ids[:10] if cache_track_ids else [])],
+        )
+        return False
+
+    try:
+        # NiceGUI's table.update() only re-renders the DOM template;
+        # it does NOT re-serialize mutated-in-place dict changes to JSON
+        # for the client unless we reassign ._props["rows"] first.
+        _queue_table_ref._props["rows"] = list(_queue_rows_cache)
+        _queue_table_ref.update()
+        logger.info(
+            "update_queue_row_desc(%s): rows reassigned + table.update() OK",
+            tid_short,
+        )
+    except Exception:
+        logger.exception(
+            "update_queue_row_desc(%s): table.update() RAISED",
+            tid_short,
+        )
+
+    return True
 
 
 def add_selected_to_queue(pl_id: str, tracks: list):
@@ -189,25 +266,17 @@ def render_queue_table():
         dur_str = f"{dur_ms // 60000}:{(dur_ms // 1000) % 60:02d}" if dur_ms else "?"
         if _state.analysis_current_track_id and t.get("id") == _state.analysis_current_track_id:
             status = "⏳ Processing"
+            combined = _state.get_track_status_with_desc(t)
+            combined["status"] = status
         else:
-            status = _get_track_status(t)
-        # Look up desc status from DB
-        tid = t.get("id", "")
-        entry = _db.get_track(tid) if tid else None
-        desc_info = _get_desc_age_info(
-            entry.get("desc_text") if entry else None,
-            entry.get("desc_generated_at") if entry else None,
-        )
-        icon_name = "auto_stories" if desc_info.has_desc else "menu_book"
-        icon_color = desc_info.color
-        icon_caption = desc_info.caption
+            combined = _state.get_track_status_with_desc(t)
         rows.append({"idx": i, "name": t.get("name", "")[:42], "artist": t.get("artist", "")[:40],
-                     "duration": dur_str, "status": status,
-                     "desc": "✓" if desc_info.has_desc else "—",
-                     "desc_icon": icon_name,
-                     "desc_color": icon_color,
-                     "desc_caption": icon_caption,
-                     "track_id": tid,
+                     "duration": dur_str, "status": combined["status"],
+                     "desc": combined["desc"],
+                     "desc_icon": combined["desc_icon"],
+                     "desc_color": combined["desc_color"],
+                     "desc_caption": combined["desc_caption"],
+                     "track_id": t.get("id", ""),
                      "track_name_original": t.get("name", "")})
 
     _queue_table_ref = ui.table(

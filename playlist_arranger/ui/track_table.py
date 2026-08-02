@@ -157,24 +157,14 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
     for i, t in enumerate(tracks, 1):
         dur_ms = t.get("duration_ms", 0)
         dur_str = f"{dur_ms // 60000}:{(dur_ms // 1000) % 60:02d}" if dur_ms else "?"
-        status = _get_track_status(t)
-        # Look up desc status from DB
-        tid = t.get("id", "")
-        entry = _db.get_track(tid) if tid else None
-        desc_info = _get_desc_age_info(
-            entry.get("desc_text") if entry else None,
-            entry.get("desc_generated_at") if entry else None,
-        )
-        icon_name = "auto_stories" if desc_info.has_desc else "menu_book"
-        icon_color = desc_info.color
-        icon_caption = desc_info.caption
+        combined = _state.get_track_status_with_desc(t)
         rows.append({"idx": i, "name": t["name"][:42], "artist": t["artist"][:40],
-                     "duration": dur_str, "status": status,
-                     "desc": "✓" if desc_info.has_desc else "—",
-                     "desc_icon": icon_name,
-                     "desc_color": icon_color,
-                     "desc_caption": icon_caption,
-                     "track_id": tid,
+                     "duration": dur_str, "status": combined["status"],
+                     "desc": combined["desc"],
+                     "desc_icon": combined["desc_icon"],
+                     "desc_color": combined["desc_color"],
+                     "desc_caption": combined["desc_caption"],
+                     "track_id": t.get("id", ""),
                      "track_name_original": t.get("name", "")})
 
     # ── Action buttons (above the table — users shouldn't scroll past

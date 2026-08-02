@@ -207,6 +207,99 @@ def get_track_status(track: dict) -> str:
     return STATUS_OK
 
 
+def get_track_status_with_desc(track: dict) -> dict:
+    """Return both track status AND desc fields from a single DB read.
+
+    Returns a dict with keys:
+        status: str        — same result as get_track_status()
+        desc_icon: str     — "auto_stories" or "menu_book"
+        desc_color: str    — "green" / "yellow" / "red" / "gray"
+        desc_caption: str  — e.g. "2mo 14d ago" or "No description"
+        desc: str          — "✓" or "—"
+        entry: dict|None   — raw DB entry (for callers that need more fields)
+
+    Avoids a second _db.get_track() round-trip when both status and desc
+    are needed for the same row (playlist/queue table builds).
+    """
+    from playlist_arranger.database import db as _db
+    from playlist_arranger.analysis.desc_status import get_desc_age_info
+    from playlist_arranger.config import load_settings, DURATION_TOLERANCE
+    import pathlib as _pl
+
+    tid = track.get("id", "")
+    entry = _db.get_track(tid)
+    status = _compute_status(track, entry)
+
+    # Desc fields from the same entry
+    desc_text = entry.get("desc_text") if isinstance(entry, dict) else None
+    desc_generated_at = entry.get("desc_generated_at") if isinstance(entry, dict) else None
+    desc_info = get_desc_age_info(desc_text, desc_generated_at)
+
+    return {
+        "status": status,
+        "desc_icon": "auto_stories" if desc_info.has_desc else "menu_book",
+        "desc_color": desc_info.color,
+        "desc_caption": desc_info.caption,
+        "desc": "✓" if desc_info.has_desc else "—",
+        "entry": entry,
+    }
+
+
+def _compute_status(track: dict, entry: dict | None) -> str:
+    """Core status computation from a pre-fetched DB entry (avoids duplicate read)."""
+    from playlist_arranger.config import load_settings, DURATION_TOLERANCE
+    import pathlib as _pl
+
+    tid = track.get("id", "")
+    if not tid:
+        return STATUS_MISSING_ID
+
+    # 1. Not in DB
+    if entry is None:
+        return STATUS_NOT_IN_DB
+
+    # Edge case: entry is not a dict or is empty
+    if not isinstance(entry, dict) or not entry:
+        return STATUS_CORRUPT
+
+    # 3. No embedding reference
+    emb_file = entry.get("embedding_file")
+    if not emb_file:
+        return STATUS_NO_EMBEDDING
+
+    # 4. Embedding file path set but file missing/corrupt
+    s = load_settings()
+    emb_path = _pl.Path(s.embeds_dir / f"{tid}.npy")
+    if not emb_path.exists():
+        return STATUS_EMBEDDING_MISSING
+
+    # 5. No features dict
+    features = entry.get("features")
+    if not isinstance(features, dict) or not features:
+        return STATUS_INCOMPLETE
+
+    # 6. Check for complete feature key set
+    existing_keys = set(features.keys())
+    if not _EXPECTED_FEATURE_KEYS.issubset(existing_keys):
+        return STATUS_INCOMPLETE
+
+    # 7. Duration mismatch
+    real_dur = track.get("duration_ms", 0)
+    stored_dur = entry.get("duration_ms", 0)
+    if real_dur > 0 and stored_dur > 0:
+        diff = abs(stored_dur - real_dur) / real_dur
+        if diff > DURATION_TOLERANCE:
+            return STATUS_DURATION_MISMATCH
+
+    # 8. Audio level check
+    LOW_SIGNAL_RMS_DB_THRESHOLD = -50.0
+    rms_db = features.get("rms_db")
+    if rms_db is not None and isinstance(rms_db, (int, float)) and rms_db < LOW_SIGNAL_RMS_DB_THRESHOLD:
+        return STATUS_LOW_SIGNAL
+
+    return STATUS_OK
+
+
 # Backward-compatible alias used by components/track_table.py and main.py
 def get_track_needs_analysis(track_id: str, real_duration_ms=None) -> str | None:
     """Legacy wrapper — delegates to get_track_status() with minimal track dict."""

@@ -151,42 +151,91 @@ def _on_desc_generated(track_id: str):
     if _ph._page_client is not None and getattr(_ph._page_client, 'has_socket_connection', False):
         try:
             with _ui_context_lock, _ph._page_client:
-                # Refresh queue table if visible
-                _rebuild_queue_ui()
-                # Refresh currently-displayed playlist table (desc icon + data)
+                tid_short = track_id[:8] if track_id else "?"
+
+                # 1. Queue table targeted update (only relevant if track is
+                #    also in the analysis queue — most playlist-generated
+                #    tracks will not be, which is normal and logged at DEBUG).
+                _aq.update_queue_row_desc(track_id)
+
+                # 2. Playlist table targeted update — iterate ALL currently-
+                #    expanded playlist caches and mutate matching rows in-place.
+                playlist_pids = list(_ph._playlist_rows_cache.keys())
+                logger.info(
+                    "_on_desc_generated(%s): checking %d playlist cache(s): %s",
+                    tid_short, len(playlist_pids),
+                    [p[:8] for p in playlist_pids],
+                )
                 for pid, rows_cache in _ph._playlist_rows_cache.items():
                     try:
                         table_ref = _ph._playlist_tables.get(pid)
                         if table_ref is None:
+                            logger.debug(
+                                "_on_desc_generated(%s): pid=%s has "
+                                "rows_cache but no table_ref — skipping",
+                                tid_short, pid[:8],
+                            )
                             continue
-                        # Update desc_age info for matching row IN PLACE, then
-                        # call .update() (cheaper than full .rows reassignment).
                         updated = False
                         for row in rows_cache:
                             try:
                                 if row.get("track_id") == track_id:
-                                    entry = _db.get_track(track_id)
-                                    desc_info = get_desc_age_info(
-                                        entry.get("desc_text") if entry else None,
-                                        entry.get("desc_generated_at") if entry else None,
+                                    old_icon = row.get("desc_icon", "?")
+                                    combined = _state.get_track_status_with_desc(
+                                        {"id": track_id, "duration_ms": 0}
                                     )
-                                    row["desc_icon"] = "auto_stories" if desc_info.has_desc else "menu_book"
-                                    row["desc_color"] = desc_info.color
-                                    row["desc_caption"] = desc_info.caption
-                                    row["desc"] = "✓" if desc_info.has_desc else "—"
+                                    new_icon = combined["desc_icon"]
+                                    row["desc_icon"] = new_icon
+                                    row["desc_color"] = combined["desc_color"]
+                                    row["desc_caption"] = combined["desc_caption"]
+                                    row["desc"] = combined["desc"]
+                                    logger.info(
+                                        "_on_desc_generated(%s): playlist pid=%s "
+                                        "row FOUND, desc_icon '%s' → '%s'",
+                                        tid_short, pid[:8], old_icon, new_icon,
+                                    )
                                     updated = True
                                     break
                             except Exception:
-                                logger.debug("Failed to update desc row in playlist %s for track %s",
-                                             pid[:8] if pid else "?", track_id[:8] if track_id else "?")
+                                logger.debug(
+                                    "_on_desc_generated(%s): failed to update "
+                                    "desc row in playlist pid=%s",
+                                    tid_short, pid[:8],
+                                )
                         if updated:
                             try:
+                                # NiceGUI's table.update() only re-renders
+                                # the DOM template; it does NOT re-serialize
+                                # mutated-in-place dict changes to JSON for
+                                # the client unless we reassign .rows first.
+                                # Setting .rows = list(rows_cache) forces
+                                # a fresh JSON serialization of the row data.
+                                table_ref._props["rows"] = list(rows_cache)
                                 table_ref.update()
+                                logger.info(
+                                    "_on_desc_generated(%s): playlist pid=%s "
+                                    "rows reassigned + table.update() OK",
+                                    tid_short, pid[:8],
+                                )
                             except Exception:
-                                logger.debug("table_ref.update() failed for playlist %s after desc generation",
-                                             pid[:8] if pid else "?")
+                                logger.exception(
+                                    "_on_desc_generated(%s): playlist pid=%s "
+                                    "table.update() FAILED",
+                                    tid_short, pid[:8],
+                                )
                     except Exception:
-                        logger.debug("Failed to refresh playlist table %s after desc generation", pid[:8] if pid else "?")
+                        logger.exception(
+                            "_on_desc_generated(%s): outer exception while "
+                            "refreshing playlist pid=%s",
+                            tid_short, pid[:8],
+                        )
+                if not playlist_pids:
+                    logger.info(
+                        "_on_desc_generated(%s): no playlist caches — "
+                        "track will update correctly when user next opens "
+                        "the playlist (fresh DB read at build time).",
+                        tid_short,
+                    )
 
                 # ── Live-update: push new description into open dialog ────
                 _push_desc_to_open_dialog(track_id)
@@ -382,6 +431,8 @@ def _card_listen_thread():
     last_playing_time = 0.0
     _last_highlighted_id = None
     _last_highlighted_pl = None
+    _consecutive_poll_failures = 0
+    _MAX_CONSECUTIVE_POLL_FAILURES = 3
 
     while not _listen_stop.is_set():
         try:
@@ -393,12 +444,36 @@ def _card_listen_thread():
                 _current_track = None
                 _current_track_elapsed = 0
                 _current_track_status = ""
+                _consecutive_poll_failures = 0
                 continue
 
             try:
                 cp = _state.sp.current_playback() if _state.sp else None
+                _consecutive_poll_failures = 0
             except Exception as e:
-                logger.warning("Spotify poll failed: %s", e)
+                _consecutive_poll_failures += 1
+                if _consecutive_poll_failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                    logger.error(
+                        "Spotify poll failed %d consecutive times (last: %s) — "
+                        "connection lost, stopping listen/analyze/batch",
+                        _consecutive_poll_failures, e,
+                    )
+                    with _ba._batch_lock:
+                        bp = _ba._batch_processing
+                    if bp:
+                        _stop_batch_analysis()
+                    _stop_listening()
+                    with _ui_pending_lock:
+                        _ui_pending_queue.append({
+                            "type": "notify",
+                            "msg": "Spotify connection lost — batch analysis stopped. Reconnect and restart manually.",
+                            "color": "negative",
+                        })
+                    _consecutive_poll_failures = 0
+                else:
+                    logger.warning("Spotify poll failed (%d/%d consecutive): %s",
+                                   _consecutive_poll_failures,
+                                   _MAX_CONSECUTIVE_POLL_FAILURES, e)
                 time.sleep(POLL_FAST)
                 continue
 
