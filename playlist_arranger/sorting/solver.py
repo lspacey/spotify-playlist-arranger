@@ -42,6 +42,95 @@ def _path_cost(order: list, D) -> float:
     return sum(D[order[i], order[i + 1]] for i in range(len(order) - 1))
 
 
+def _reversal_delta(order: list, i: int, j: int, D) -> float:
+    """Return the cost change if the segment order[i:j+1] is reversed.
+
+    This is O(j-i) — proportional to the span length — and avoids the
+    O(n) full _path_cost() recomputation.
+
+    Handles edge cases: i==0 (no left boundary edge), j==len(order)-1
+    (no right boundary edge).
+    """
+    old_cost = 0.0
+    new_cost = 0.0
+
+    # Boundary edges
+    if i > 0:
+        old_cost += D[order[i - 1], order[i]]
+        new_cost += D[order[i - 1], order[j]]
+    if j < len(order) - 1:
+        old_cost += D[order[j], order[j + 1]]
+        new_cost += D[order[i], order[j + 1]]
+
+    # Internal segment edges
+    for k in range(i, j):
+        old_cost += D[order[k], order[k + 1]]
+        new_cost += D[order[k + 1], order[k]]
+
+    return new_cost - old_cost
+
+
+def _inter_slot_move_delta(
+    si: int, idx: int, sj: int, ins: int, tid,
+    cur_order: list, D,
+    slot_contents: list, anchors: list,
+) -> tuple[float, list]:
+    """Compute the delta cost of moving *tid* from slot si[idx] to slot sj[ins].
+
+    Returns (delta, new_order).  *cur_order* is NOT mutated; a new list
+    is returned.  *slot_contents* is NOT mutated.
+
+    The cost change involves at most 6 edges: removal of tid from its
+    source slot (2 edges lost, 1 new), and insertion at the destination
+    slot (1 edge lost, 2 new).
+    """
+    n_slots = len(anchors) + 1
+
+    def _slot_global_range(si_local: int) -> tuple[int, int]:
+        """Return (start, end_exclusive) global indices for slot *si_local*."""
+        pos = 0
+        for s in range(si_local):
+            pos += len(slot_contents[s]) + (1 if s < len(anchors) else 0)
+        return pos, pos + len(slot_contents[si_local])
+
+    src_start, _ = _slot_global_range(si)
+    src_pos = src_start + idx
+    dst_start, _ = _slot_global_range(sj)
+    dst_pos = dst_start + ins
+
+    old_edges = 0.0
+    new_edges = 0.0
+
+    # ── Source removal ─────────────────────────────────────────────────
+    prev_src = cur_order[src_pos - 1] if src_pos > 0 else None
+    next_src = cur_order[src_pos + 1] if src_pos < len(cur_order) - 1 else None
+    if prev_src is not None:
+        old_edges += D[prev_src, tid]
+    if next_src is not None:
+        old_edges += D[tid, next_src]
+    if prev_src is not None and next_src is not None:
+        new_edges += D[prev_src, next_src]
+
+    # ── Build new order ────────────────────────────────────────────────
+    new_order = list(cur_order)
+    new_order.pop(src_pos)
+    # Adjust dst_pos if the removal shifted the destination
+    actual_dst = dst_pos if dst_pos <= src_pos else dst_pos - 1
+    new_order.insert(actual_dst, tid)
+
+    # ── Destination insertion ──────────────────────────────────────────
+    prev_dst = new_order[actual_dst - 1] if actual_dst > 0 else None
+    next_dst = new_order[actual_dst + 1] if actual_dst < len(new_order) - 1 else None
+    if prev_dst is not None and next_dst is not None:
+        old_edges += D[prev_dst, next_dst]
+    if prev_dst is not None:
+        new_edges += D[prev_dst, tid]
+    if next_dst is not None:
+        new_edges += D[tid, next_dst]
+
+    return new_edges - old_edges, new_order
+
+
 def _nearest_neighbor_init(free_ids: list, start: int, D) -> list:
     if not free_ids:
         return []
@@ -81,21 +170,29 @@ def _solve_atsp_with_anchors(
         best_cost = current_cost
         cooling = (T_end / T_start) ** (1.0 / max(iterations, 1))
         T = T_start
-        for _ in range(iterations):
+        for it in range(iterations):
             if len(order) < 2:
                 break
             i, j = sorted(random.sample(range(len(order)), 2))
-            order[i : j + 1] = order[i : j + 1][::-1]
-            nc = _path_cost(order, D)
-            delta = nc - current_cost
+            # Delta cost: only compute the cost change of the reversal,
+            # not the entire path.  O(j-i) instead of O(n).
+            delta = _reversal_delta(order, i, j, D)
             if delta < 0 or random.random() < math.exp(-delta / T):
-                current_cost = nc
-                if nc < best_cost:
-                    best_order = list(order)
-                    best_cost = nc
-            else:
                 order[i : j + 1] = order[i : j + 1][::-1]
+                current_cost += delta
+                if current_cost < best_cost:
+                    best_order = list(order)
+                    best_cost = current_cost
+            # If rejected, do nothing (order is unchanged)
             T *= cooling
+            # Periodic full-cost recomputation to prevent float drift
+            if it > 0 and it % 1000 == 0:
+                full = _path_cost(order, D)
+                if abs(full - current_cost) > 1e-6 * (abs(full) + 1.0):
+                    current_cost = full
+                    if full < best_cost:
+                        best_order = list(order)
+                        best_cost = full
         return best_order
 
     n_slots = len(anchors) + 1
@@ -132,13 +229,22 @@ def _solve_atsp_with_anchors(
                 result.append(anchors[si])
         return result
 
-    current_cost = _path_cost(build_order(), D)
+    order = build_order()
+    current_cost = _path_cost(order, D)
     best_slots = copy.deepcopy(slot_contents)
     best_cost = current_cost
     cooling = (T_end / T_start) ** (1.0 / max(iterations, 1))
     T = T_start
 
-    for _ in range(iterations):
+    # Pre-compute slot → global position ranges
+    def _slot_global_range(si: int) -> tuple[int, int]:
+        """Return (start, end_exclusive) global indices for slot *si*."""
+        pos = 0
+        for s in range(si):
+            pos += len(slot_contents[s]) + (1 if s < len(anchors) else 0)
+        return pos, pos + len(slot_contents[si])
+
+    for it in range(iterations):
         if random.random() < 0.6 and open_slots:
             si = random.choice(open_slots)
             sl = slot_contents[si]
@@ -146,16 +252,18 @@ def _solve_atsp_with_anchors(
                 T *= cooling
                 continue
             i, j = sorted(random.sample(range(len(sl)), 2))
-            sl[i : j + 1] = sl[i : j + 1][::-1]
-            nc = _path_cost(build_order(), D)
-            delta = nc - current_cost
+            # Compute delta using global-order reversal_delta
+            g_start, _ = _slot_global_range(si)
+            gi, gj = g_start + i, g_start + j
+            delta = _reversal_delta(order, gi, gj, D)
             if delta < 0 or random.random() < math.exp(-delta / T):
-                current_cost = nc
-                if nc < best_cost:
-                    best_slots = copy.deepcopy(slot_contents)
-                    best_cost = nc
-            else:
                 sl[i : j + 1] = sl[i : j + 1][::-1]
+                order[gi : gj + 1] = order[gi : gj + 1][::-1]
+                current_cost += delta
+                if current_cost < best_cost:
+                    best_slots = copy.deepcopy(slot_contents)
+                    best_cost = current_cost
+            # rejected: nothing changed
         elif len(open_slots) >= 2 and free_ids:
             si = random.choice(open_slots)
             sj = random.choice([s for s in open_slots if s != si])
@@ -163,20 +271,31 @@ def _solve_atsp_with_anchors(
                 T *= cooling
                 continue
             idx = random.randrange(len(slot_contents[si]))
-            tid = slot_contents[si].pop(idx)
+            tid = slot_contents[si][idx]
             ins = random.randrange(len(slot_contents[sj]) + 1)
-            slot_contents[sj].insert(ins, tid)
-            nc = _path_cost(build_order(), D)
-            delta = nc - current_cost
+            delta, new_order = _inter_slot_move_delta(
+                si, idx, sj, ins, tid, order, D, slot_contents, anchors,
+            )
             if delta < 0 or random.random() < math.exp(-delta / T):
-                current_cost = nc
-                if nc < best_cost:
+                slot_contents[si].pop(idx)
+                slot_contents[sj].insert(ins, tid)
+                order = new_order
+                current_cost += delta
+                if current_cost < best_cost:
                     best_slots = copy.deepcopy(slot_contents)
-                    best_cost = nc
-            else:
-                slot_contents[sj].pop(ins)
-                slot_contents[si].insert(idx, tid)
+                    best_cost = current_cost
+            # rejected: nothing changed (delta was computed on copies)
         T *= cooling
+
+        # Periodic full-cost recomputation to prevent float drift
+        if it > 0 and it % 1000 == 0:
+            full = _path_cost(build_order(), D)
+            if abs(full - current_cost) > 1e-6 * (abs(full) + 1.0):
+                order = build_order()
+                current_cost = full
+                if full < best_cost:
+                    best_slots = copy.deepcopy(slot_contents)
+                    best_cost = full
 
     slot_contents[:] = best_slots
     return build_order()

@@ -26,6 +26,8 @@ _remove_btn = None
 _add_placeholder_btn = None
 _add_selected_track_btn = None
 _generate_anchors_btn = None
+_set_anchors_input = None
+_set_anchors_btn = None
 _clear_btn = None
 _save_btn = None
 _anchors_select = None
@@ -369,6 +371,40 @@ def _resolve_model_name(backend: str | None = None) -> str:
     return f"(unknown backend: {backend})"
 
 
+# ── Track description block / file helpers ─────────────────────────────────────
+
+CHUNK_THRESHOLD = 300  # trigger chunked batching above this many tracks
+CHUNK_SIZE = 300       # tracks per batch when chunking
+
+
+def _build_single_track_line(i: int, t: dict) -> str:
+    """Build a single track's description line (same format as before)."""
+    tid = t.get("id", "")
+    name = t.get("name", "?")[:60]
+    artist = t.get("artist", "?")[:40]
+
+    entry = _db.get_track(tid) if tid else None
+    desc = ""
+    if entry and entry.get("desc_text"):
+        desc = entry["desc_text"][:150]
+
+    from playlist_arranger.analysis.desc_generator import _feat_summary
+
+    feat = _feat_summary(entry) if entry else ""
+    desc_display = desc if desc else "(no description available)"
+
+    return f'  {i:4d}. "{name}" — {artist}\n        {desc_display}\n        [{feat}]'
+
+
+def _build_track_descriptions_list() -> list[str]:
+    """Return a list of per-track description strings (one per track, 1-indexed).
+
+    Same content as ``_build_track_descriptions_block`` but returned as a
+    list of individual strings instead of one concatenated block.
+    """
+    return [_build_single_track_line(i, t) for i, t in enumerate(_playlist_tracks, 1)]
+
+
 def _build_track_descriptions_block() -> str:
     """Build a position-numbered list of tracks with descriptions for the LLM prompt.
 
@@ -376,27 +412,45 @@ def _build_track_descriptions_block() -> str:
     numbers contiguous 1..N) with "(no description available)" as placeholder.
     Reads descriptions from the database via _db.get_track().
     """
-    lines = []
-    for i, t in enumerate(_playlist_tracks, 1):
-        tid = t.get("id", "")
-        name = t.get("name", "?")[:60]
-        artist = t.get("artist", "?")[:40]
+    return "\n".join(_build_track_descriptions_list())
 
-        # Try to get description from DB
-        entry = _db.get_track(tid) if tid else None
-        desc = ""
-        if entry and entry.get("desc_text"):
-            desc = entry["desc_text"][:150]
 
-        # Build feature summary (reuse _feat_summary from desc_generator)
-        from playlist_arranger.analysis.desc_generator import _feat_summary
+def _track_descriptions_file_path(plid: str) -> pathlib.Path:
+    """Return the path for the anchor context file for a given playlist ID."""
+    return config.ANCHORS_DIR_DEFAULT / f"anchor_context_{plid}.txt"
 
-        feat = _feat_summary(entry) if entry else ""
-        desc_display = desc if desc else "(no description available)"
 
-        lines.append(f'  {i:4d}. "{name}" — {artist}\n        {desc_display}\n        [{feat}]')
+def write_track_descriptions_file(descs: list[str], plid: str) -> pathlib.Path:
+    """Write track descriptions to a plain text file atomically.
 
-    return "\n".join(lines)
+    Each element in *descs* is one track's formatted description line
+    (the same content ``_build_track_descriptions_block`` produces).
+    Writes to ``ANCHORS_DIR / anchor_context_{plid}.txt`` using the
+    atomic write pattern (``.tmp`` then rename).
+
+    Returns the path of the written file.
+    """
+    file_path = _track_descriptions_file_path(plid)
+    content = "\n".join(descs).encode("utf-8")
+
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    tmp_path.write_bytes(content)
+    tmp_path.replace(file_path)
+
+    logger.debug("Wrote %d track descriptions to %s", len(descs), file_path)
+    return file_path
+
+
+def _read_track_descriptions_file(plid: str) -> str | None:
+    """Read the anchor context file for a playlist, or None if not found."""
+    file_path = _track_descriptions_file_path(plid)
+    try:
+        return file_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.warning("Failed to read track descriptions file %s", file_path, exc_info=True)
+        return None
 
 
 def _parse_anchor_positions(raw_text: str, expected_n: int, track_count: int) -> list[int] | None:
@@ -532,95 +586,381 @@ async def _on_run_generate():
         s.custom_anchor_prompt = desc_text or ""
         config.save_settings(s)
 
-    # Build track descriptions block
-    track_block = _build_track_descriptions_block()
+    # Build track descriptions (as list + file)
+    pl_id = getattr(_state, "selected_playlist_id", None)
+    all_descs = _build_track_descriptions_list()
+    total_tracks = len(all_descs)
 
-    # Build user message
+    # Write descriptions to file (single source of truth)
+    if pl_id:
+        write_track_descriptions_file(all_descs, pl_id)
+
+    # Build user message WITHOUT the full descriptions block
     struct = next((s for s in PLAYLIST_STRUCTURES if s["id"] == structure_id), PLAYLIST_STRUCTURES[0])
-    user_msg = (
-        f'Playlist name: "{_playlist_name}"\n'
-        f"Total tracks: {len(_playlist_tracks)}\n\n"
-        f'Requested structure: {struct["name"]}\n'
-        f"{desc_text}\n\n"
-        f"Select exactly {n_anchors} anchor tracks and arrange them "
-        f"to create this structure. Below is the full track list "
-        f"with positions, descriptions and technical features:\n\n"
-        f"{track_block}\n\n"
-        f"Now select {n_anchors} anchor positions and return them as position numbers."
-    )
 
-    # Save debug prompt BEFORE LLM call
-    debug_path = config.CACHE_DIR_DEFAULT / "anchors_prompts_for_debug.txt"
-    full_prompt = (
-        f"=== SYSTEM PROMPT ===\n{ANCHOR_SYSTEM_PROMPT}\n\n"
-        f"=== USER MESSAGE ===\n{user_msg}\n"
-    )
-    try:
-        debug_path.write_text(full_prompt, encoding="utf-8")
-    except Exception:
-        pass  # best-effort, don't block on debug file write failure
+    def _build_user_msg(desc_content: str) -> str:
+        """Build a user_msg with the given descriptions content appended."""
+        return (
+            f'Playlist name: "{_playlist_name}"\n'
+            f"Total tracks: {len(_playlist_tracks)}\n\n"
+            f'Requested structure: {struct["name"]}\n'
+            f"{desc_text}\n\n"
+            f"Select exactly {n_anchors} anchor tracks and arrange them "
+            f"to create this structure. Below is the full track list "
+            f"with positions, descriptions and technical features:\n\n"
+            f"{desc_content}\n\n"
+            f"Now select {n_anchors} anchor positions and return them as position numbers."
+        )
 
-    # ── Show loading state: disable buttons, show spinner ─────────────────
-    if _gen_run_btn is not None:
-        _gen_run_btn.set_enabled(False)
-    if _gen_cancel_btn is not None:
-        _gen_cancel_btn.set_enabled(False)
-    if _gen_spinner is not None:
-        _gen_spinner.set_visibility(True)
+    # Decide: chunked batching or single call
+    use_chunked = total_tracks > CHUNK_THRESHOLD
 
-    # ── Call LLM in a thread to avoid freezing the event loop ────────────
-    from playlist_arranger.llm.client import llm_chat, _init_llm_client
+    if use_chunked:
+        # ── Chunked batching ──────────────────────────────────────────────
+        logger.info(
+            "Anchor generation: %d tracks exceeds threshold (%d) — "
+            "using chunked batching (chunk size %d)",
+            total_tracks, CHUNK_THRESHOLD, CHUNK_SIZE,
+        )
+        # Build per-chunk info
+        chunks: list[list[str]] = []
+        chunk_ranges: list[tuple[int, int]] = []  # (start_pct, end_pct) for positional context
+        chunk_n_anchors_list: list[int] = []
+        for start in range(0, total_tracks, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, total_tracks)
+            chunk_descs = all_descs[start:end]
+            chunks.append(chunk_descs)
+            # Positional context: what portion of the playlist this chunk covers
+            start_pct = int(start * 100 / total_tracks)
+            end_pct = int(end * 100 / total_tracks)
+            chunk_ranges.append((start_pct, end_pct))
+            # Proportional share of anchors for this chunk
+            chunk_n = max(0, round(n_anchors * len(chunk_descs) / total_tracks))
+            chunk_n_anchors_list.append(chunk_n)
 
-    raw_resp = ""
-    try:
-        # Offload the blocking init + chat to a thread so other
-        # clients/tabs can still interact with the app during the request.
-        # Pass the user-selected backend + model so _init_llm_client
-        # constructs the correct client (llm/client.py supports
-        # backend= and model_override= parameters on _init_llm_client).
-        def _blocking_llm_call():
-            _init_llm_client(backend=selected_backend, model_override=selected_model)
-            return llm_chat(ANCHOR_SYSTEM_PROMPT, user_msg, temperature=0.4, max_tokens=6000)
+        # Ensure total anchors across chunks doesn't exceed requested
+        # Adjust largest chunks first if there's a rounding discrepancy
+        total_allocated = sum(chunk_n_anchors_list)
+        while total_allocated > n_anchors:
+            max_idx = chunk_n_anchors_list.index(max(chunk_n_anchors_list))
+            if chunk_n_anchors_list[max_idx] > 0:
+                chunk_n_anchors_list[max_idx] -= 1
+                total_allocated -= 1
+            else:
+                break
+        while total_allocated < n_anchors:
+            min_idx = chunk_n_anchors_list.index(min(chunk_n_anchors_list))
+            chunk_n_anchors_list[min_idx] += 1
+            total_allocated += 1
 
-        raw_resp = await asyncio.to_thread(_blocking_llm_call)
-    except Exception as exc:
-        # ── Restore UI before showing error (notify before any .clear()) ──
+        logger.debug(
+            "Chunk plan: %d chunks, anchors per chunk: %s, ranges: %s",
+            len(chunks), chunk_n_anchors_list, chunk_ranges,
+        )
+
+        # ── Show loading state ─────────────────────────────────────────────
+        if _gen_run_btn is not None:
+            _gen_run_btn.set_enabled(False)
+        if _gen_cancel_btn is not None:
+            _gen_cancel_btn.set_enabled(False)
+        if _gen_spinner is not None:
+            _gen_spinner.set_visibility(True)
+
+        from playlist_arranger.llm.client import llm_chat, _init_llm_client
+
+        all_positions: list[int] = []
+        raw_resp = ""
+
+        def _build_chunk_user_msg(chunk_descs: list[str], chunk_idx: int, chunk_n: int) -> str:
+            """Build a chunk-aware user message with positional context.
+
+            Tells the LLM which portion of the playlist this chunk covers
+            (e.g. "tracks ~0% to ~33% — the opening/rising segment")
+            and what energy/mood target is expected for this portion of
+            the requested structure arc.
+            """
+            start_pct, end_pct = chunk_ranges[chunk_idx]
+            n_chunks = len(chunks)
+
+            # Describe the arc position qualitatively
+            if n_chunks == 1:
+                position_hint = "This covers the entire playlist."
+            elif chunk_idx == 0:
+                position_hint = (
+                    f"This chunk covers tracks ~{start_pct}%–{end_pct}% — "
+                    f"the BEGINNING/OPENING portion of the playlist. "
+                    f"Select tracks appropriate for the START of a "
+                    f"\"{struct['name']}\" arc ({struct.get('desc', desc_text)})."
+                )
+            elif chunk_idx == n_chunks - 1:
+                position_hint = (
+                    f"This chunk covers tracks ~{start_pct}%–{end_pct}% — "
+                    f"the ENDING/CLOSING portion of the playlist. "
+                    f"Select tracks appropriate for the END of a "
+                    f"\"{struct['name']}\" arc ({struct.get('desc', desc_text)})."
+                )
+            else:
+                position_hint = (
+                    f"This chunk covers tracks ~{start_pct}%–{end_pct}% — "
+                    f"the MIDDLE/TRANSITION portion of the playlist (chunk "
+                    f"{chunk_idx + 1} of {n_chunks}). "
+                    f"Select tracks that fit this intermediate position "
+                    f"within a \"{struct['name']}\" arc "
+                    f"({struct.get('desc', desc_text)})."
+                )
+
+            chunk_content = "\n".join(chunk_descs)
+            return (
+                f'Playlist name: "{_playlist_name}"\n'
+                f"Total tracks in full playlist: {len(_playlist_tracks)}\n"
+                f"Tracks in this chunk: {len(chunk_descs)}\n\n"
+                f'Requested full-playlist structure: {struct["name"]}\n'
+                f"{desc_text}\n\n"
+                f"ARC POSITION: {position_hint}\n\n"
+                f"From this chunk, select exactly {chunk_n} anchor tracks "
+                f"that best serve this portion of the arc. "
+                f"Below are the tracks with positions, descriptions and "
+                f"technical features:\n\n"
+                f"{chunk_content}\n\n"
+                f"Return exactly {chunk_n} anchor positions as position numbers."
+            )
+
+        _progress_notify = None  # handle for the active "Processing chunk" notification
+
+        def _dismiss_progress():
+            """Dismiss the current 'Processing chunk...' notification if any."""
+            nonlocal _progress_notify
+            if _progress_notify is not None:
+                try:
+                    _progress_notify.dismiss()
+                except Exception:
+                    pass
+                _progress_notify = None
+
         try:
-            ui.notify(f"LLM error: {exc}", type="negative")
-        except Exception:
-            logger.exception("Failed to show LLM error notification")
+            for ci, (chunk_descs, chunk_n) in enumerate(zip(chunks, chunk_n_anchors_list)):
+                if chunk_n <= 0:
+                    logger.debug("Chunk %d: %d anchors → skipping", ci + 1, chunk_n)
+                    continue
+                logger.info(
+                    "Chunk %d/%d: %d tracks (~%d%%–%d%%), %d anchors requested",
+                    ci + 1, len(chunks), len(chunk_descs),
+                    chunk_ranges[ci][0], chunk_ranges[ci][1], chunk_n,
+                )
+
+                # ── Per-chunk progress notification ──────────────────────────
+                _dismiss_progress()  # dismiss previous "Processing..." handle
+                try:
+                    _progress_notify = ui.notify(
+                        f"Processing chunk {ci + 1} of {len(chunks)} "
+                        f"({len(chunk_descs)} tracks, ~{chunk_ranges[ci][0]}%–"
+                        f"{chunk_ranges[ci][1]}% of playlist)…",
+                        timeout=0,  # stays until manually dismissed
+                        type="ongoing",
+                    )
+                except Exception:
+                    _progress_notify = None
+
+                def _blocking_chunk_call(chunk_idx: int, chunk_descs: list[str], chunk_n: int) -> str:
+                    _init_llm_client(backend=selected_backend, model_override=selected_model)
+                    chunk_user_msg = _build_chunk_user_msg(chunk_descs, chunk_idx, chunk_n)
+                    return llm_chat(ANCHOR_SYSTEM_PROMPT, chunk_user_msg, temperature=0.4, max_tokens=6000)
+
+                # Save chunk prompt to debug file BEFORE the LLM call
+                chunk_user_msg = _build_chunk_user_msg(chunk_descs, ci, chunk_n)
+                chunk_prompt_path = config.CACHE_DIR_DEFAULT / f"anchors_chunk_{ci + 1}_prompt.txt"
+                full_chunk_prompt = (
+                    f"=== CHUNK {ci + 1} of {len(chunks)} ===\n"
+                    f"=== SYSTEM PROMPT ===\n{ANCHOR_SYSTEM_PROMPT}\n\n"
+                    f"=== USER MESSAGE ===\n{chunk_user_msg}\n"
+                )
+                try:
+                    chunk_prompt_path.write_text(full_chunk_prompt, encoding="utf-8")
+                    logger.debug("Saved chunk %d/%d prompt to %s", ci + 1, len(chunks), chunk_prompt_path)
+                except Exception:
+                    logger.warning("Failed to save chunk %d/%d prompt", ci + 1, len(chunks), exc_info=True)
+
+                raw_resp = await asyncio.to_thread(_blocking_chunk_call, ci, chunk_descs, chunk_n)
+                _dismiss_progress()  # dismiss "Processing..." after LLM returns
+                if not raw_resp:
+                    logger.warning("Chunk %d/%d: LLM returned empty response", ci + 1, len(chunks))
+                    try:
+                        ui.notify(
+                            f"Chunk {ci + 1}/{len(chunks)}: no response — stopping anchor generation",
+                            timeout=5000,
+                            type="negative",
+                        )
+                    except Exception:
+                        pass
+                    break
+
+                chunk_positions = _parse_anchor_positions(raw_resp, chunk_n, total_tracks)
+                if chunk_positions is None:
+                    logger.warning(
+                        "Chunk %d/%d: failed to parse %d positions — stopping anchor generation",
+                        ci + 1, len(chunks), chunk_n,
+                    )
+                    try:
+                        ui.notify(
+                            f"Chunk {ci + 1}/{len(chunks)}: could not parse response — "
+                            f"stopping anchor generation",
+                            timeout=5000,
+                            type="negative",
+                        )
+                    except Exception:
+                        pass
+                    break
+                all_positions.extend(chunk_positions)
+                logger.info(
+                    "Chunk %d/%d: parsed %d positions, total so far: %d",
+                    ci + 1, len(chunks), len(chunk_positions), len(all_positions),
+                )
+                try:
+                    ui.notify(
+                        f"Chunk {ci + 1}/{len(chunks)}: {len(chunk_positions)} "
+                        f"anchors selected ✓",
+                        timeout=3000,
+                        type="positive",
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            _dismiss_progress()  # safety net: dismiss any lingering progress notification
+            try:
+                ui.notify(f"LLM error: {exc}", type="negative")
+            except Exception:
+                logger.exception("Failed to show LLM error notification")
+            finally:
+                if _gen_run_btn is not None:
+                    _gen_run_btn.set_enabled(True)
+                if _gen_cancel_btn is not None:
+                    _gen_cancel_btn.set_enabled(True)
+                if _gen_spinner is not None:
+                    _gen_spinner.set_visibility(False)
+            logger.exception("Anchor generation chunked LLM call failed")
+            return
         finally:
+            _dismiss_progress()  # belt-and-suspenders: dismiss any lingering "Processing..." notification
+
+        if not all_positions:
             if _gen_run_btn is not None:
                 _gen_run_btn.set_enabled(True)
             if _gen_cancel_btn is not None:
                 _gen_cancel_btn.set_enabled(True)
             if _gen_spinner is not None:
                 _gen_spinner.set_visibility(False)
-        logger.exception("Anchor generation LLM call failed")
-        return
+            ui.notify("All LLM chunks returned empty or unparseable responses", type="negative")
+            return
 
-    # ── Restore UI (LLM call completed) ──────────────────────────────────
-    if _gen_run_btn is not None:
-        _gen_run_btn.set_enabled(True)
-    if _gen_cancel_btn is not None:
-        _gen_cancel_btn.set_enabled(True)
-    if _gen_spinner is not None:
-        _gen_spinner.set_visibility(False)
+        # Deduplicate positions (different chunks may pick the same track)
+        seen = set()
+        deduped_positions = []
+        for pos in all_positions:
+            if pos not in seen:
+                seen.add(pos)
+                deduped_positions.append(pos)
 
-    if not raw_resp:
-        ui.notify("LLM returned empty response", type="negative")
-        return
+        # If we have more than requested (unlikely after dedup), truncate
+        if len(deduped_positions) > n_anchors:
+            deduped_positions = deduped_positions[:n_anchors]
 
-    # Parse response
-    positions = _parse_anchor_positions(raw_resp, n_anchors, len(_playlist_tracks))
-    if positions is None:
-        ui.notify(
-            f"Failed to parse {n_anchors} valid position numbers from LLM response. "
-            f"Check debug output in cache/anchors_prompts_for_debug.txt",
-            type="negative",
+        actual_n = len(deduped_positions)
+
+        if actual_n < n_anchors:
+            logger.warning(
+                "Chunked batching produced %d anchors vs %d requested",
+                actual_n, n_anchors,
+            )
+
+        # ── Option B: Lightweight re-order pass ───────────────────────────
+        deduped_positions = _try_reorder_anchor_positions(
+            deduped_positions, struct, desc_text, total_tracks,
+            selected_backend, selected_model,
         )
-        # Panel stays open for retry
-        return
+
+        # Restore UI after all chunks + re-order
+        if _gen_run_btn is not None:
+            _gen_run_btn.set_enabled(True)
+        if _gen_cancel_btn is not None:
+            _gen_cancel_btn.set_enabled(True)
+        if _gen_spinner is not None:
+            _gen_spinner.set_visibility(False)
+
+        positions = deduped_positions
+
+    else:
+        # ── Single call (within threshold) ─────────────────────────────────
+        # Read back the file for debug/logging consistency
+        desc_content = "\n".join(all_descs)
+        user_msg = _build_user_msg(desc_content)
+
+        # Save debug prompt BEFORE LLM call
+        debug_path = config.ANCHORS_DIR_DEFAULT / "anchors_prompts_for_debug.txt"
+        full_prompt = (
+            f"=== SYSTEM PROMPT ===\n{ANCHOR_SYSTEM_PROMPT}\n\n"
+            f"=== USER MESSAGE ===\n{user_msg}\n"
+        )
+        try:
+            debug_path.write_text(full_prompt, encoding="utf-8")
+        except Exception:
+            pass
+
+        # ── Show loading state ─────────────────────────────────────────────
+        if _gen_run_btn is not None:
+            _gen_run_btn.set_enabled(False)
+        if _gen_cancel_btn is not None:
+            _gen_cancel_btn.set_enabled(False)
+        if _gen_spinner is not None:
+            _gen_spinner.set_visibility(True)
+
+        from playlist_arranger.llm.client import llm_chat, _init_llm_client
+
+        raw_resp = ""
+        try:
+            def _blocking_llm_call():
+                _init_llm_client(backend=selected_backend, model_override=selected_model)
+                return llm_chat(ANCHOR_SYSTEM_PROMPT, user_msg, temperature=0.4, max_tokens=6000)
+
+            raw_resp = await asyncio.to_thread(_blocking_llm_call)
+        except Exception as exc:
+            try:
+                ui.notify(f"LLM error: {exc}", type="negative")
+            except Exception:
+                logger.exception("Failed to show LLM error notification")
+            finally:
+                if _gen_run_btn is not None:
+                    _gen_run_btn.set_enabled(True)
+                if _gen_cancel_btn is not None:
+                    _gen_cancel_btn.set_enabled(True)
+                if _gen_spinner is not None:
+                    _gen_spinner.set_visibility(False)
+            logger.exception("Anchor generation LLM call failed")
+            return
+
+        # Restore UI
+        if _gen_run_btn is not None:
+            _gen_run_btn.set_enabled(True)
+        if _gen_cancel_btn is not None:
+            _gen_cancel_btn.set_enabled(True)
+        if _gen_spinner is not None:
+            _gen_spinner.set_visibility(False)
+
+        if not raw_resp:
+            ui.notify("LLM returned empty response", type="negative")
+            return
+
+        # Parse response
+        positions = _parse_anchor_positions(raw_resp, n_anchors, len(_playlist_tracks))
+        if positions is None:
+            ui.notify(
+                f"Failed to parse {n_anchors} valid position numbers from LLM response. "
+                f"Check debug output in cache/anchors_prompts_for_debug.txt",
+                type="negative",
+            )
+            return
+
+    # ── Common post-processing (both single and chunked paths) ─────────────
+    # 'positions' is already set from either the chunked or single-call path above
 
     # Convert 1-based positions to 0-based indices, look up track IDs
     anchor_items = []
@@ -666,6 +1006,108 @@ async def _on_run_generate():
             ui.notify(f"Generated {len(anchor_items)} anchors (notification delayed)", type="positive")
         except Exception:
             pass  # truly can't notify — anchors are still applied
+
+
+def _try_reorder_anchor_positions(
+    deduped_positions: list[int],
+    struct: dict,
+    desc_text: str,
+    total_tracks: int,
+    backend: str,
+    model: str,
+) -> list[int]:
+    """Attempt to re-order anchor positions into the requested structure arc.
+
+    Sends a lightweight LLM prompt with only anchor names + BPM/key/loudness
+    (no full descriptions), then validates the response preserves the same
+    set of positions.
+
+    Returns:
+        The reordered list if the LLM returns a valid same-set permutation.
+        The original *deduped_positions* unchanged if the reorder fails
+        (empty response, parse failure, LLM exception, or mismatched set).
+    """
+    from playlist_arranger.llm.client import llm_chat, _init_llm_client
+
+    actual_n = len(deduped_positions)
+    if actual_n < 3 or actual_n < 2:
+        return list(deduped_positions)
+
+    # Build name-only anchor list with key features
+    anchor_summaries: list[str] = []
+    for pos in deduped_positions:
+        t = _playlist_tracks[pos - 1]
+        name = t.get("name", "?")[:50]
+        artist = t.get("artist", "?")[:30]
+        tid = t.get("id", "")
+        entry = _db.get_track(tid) if tid else None
+        features = entry.get("features", {}) if entry else {}
+        bpm = features.get("bpm", "?")
+        key = features.get("camelot", features.get("chroma_key", "?"))
+        rms = features.get("rms_db", "?")
+        summary = f'  {pos}. "{name}" — {artist}  [BPM: {bpm}, Key: {key}, Loudness: {rms} dBFS]'
+        anchor_summaries.append(summary)
+
+    reorder_msg = (
+        f'Playlist: "{_playlist_name}" ({total_tracks} tracks)\n'
+        f'Requested structure: {struct["name"]}\n'
+        f"{desc_text}\n\n"
+        f"Below are {actual_n} anchor tracks already selected "
+        f"from the playlist.  Each has a position number (the "
+        f"track's original position in the playlist).\n\n"
+        f"Your task: re-order these {actual_n} anchors into the "
+        f"correct sequence that realises the \"{struct['name']}\" "
+        f"structure arc.  Return ONLY the position numbers in "
+        f"the desired order — one per line, using the SAME "
+        f"position numbers shown below.  Do not add commentary.\n\n"
+        f"--- ANCHOR TRACKS ---\n"
+        f"{chr(10).join(anchor_summaries)}\n\n"
+        f"Re-order the {actual_n} positions above into the "
+        f"correct \"{struct['name']}\" arc sequence and return "
+        f"them in ANCHORS: format."
+    )
+
+    reorder_system = (
+        "You are a playlist re-ordering assistant. "
+        "You receive a list of anchor tracks (name, artist, BPM, "
+        "key, loudness) and a target structure type. "
+        "Output ONLY the position numbers in the requested order, "
+        "one per line, in ANCHORS: format.  No commentary."
+    )
+
+    try:
+        _init_llm_client(backend=backend, model_override=model)
+        reorder_raw = llm_chat(reorder_system, reorder_msg, temperature=0.2, max_tokens=6000)
+        if reorder_raw:
+            reordered = _parse_anchor_positions(reorder_raw, actual_n, total_tracks)
+            if reordered is not None:
+                if set(reordered) == set(deduped_positions):
+                    logger.info(
+                        "Re-order pass succeeded: %d anchors reordered",
+                        actual_n,
+                    )
+                    return reordered
+                else:
+                    logger.warning(
+                        "Re-order pass produced different position set — "
+                        "keeping original chunk order. "
+                        "Expected %s, got %s",
+                        sorted(deduped_positions), sorted(reordered),
+                    )
+            else:
+                logger.warning(
+                    "Re-order pass parse failed — keeping chunk order"
+                )
+        else:
+            logger.warning(
+                "Re-order pass returned empty — keeping chunk order"
+            )
+    except Exception:
+        logger.exception(
+            "Re-order pass LLM call failed — keeping chunk order"
+        )
+
+    return list(deduped_positions)
 
 
 def _on_cancel_generate():
@@ -799,12 +1241,105 @@ def _render_generate_panel():
         _gen_spinner.set_visibility(False)
 
 
+def _on_set_anchors():
+    """Validate comma-separated track numbers and add them to the anchor plan.
+
+    Validation is STRICT and all-or-nothing — if ANY token fails validation
+    the entire operation is aborted and the plan is NOT modified.
+    """
+    global _anchor_plan, _set_anchors_input
+
+    if _set_anchors_input is None:
+        return
+
+    raw = (_set_anchors_input.value or "").strip()
+    if not raw:
+        ui.notify("Enter comma-separated track numbers", type="warning")
+        return
+
+    # ── Tokenize ───────────────────────────────────────────────────────────
+    tokens = [t.strip() for t in raw.split(",")]
+    # Reject trailing/double commas (empty tokens)
+    if any(t == "" for t in tokens):
+        ui.notify("Input contains empty entries (double or trailing comma)", type="warning")
+        return
+
+    # ── Validate each token is a positive integer ─────────────────────────
+    int_re = re.compile(r"^\d+$")
+    numbers: list[int] = []
+    for token in tokens:
+        if not int_re.match(token):
+            ui.notify(f"Invalid entry: '{token}' is not a valid integer", type="negative")
+            return
+        numbers.append(int(token))
+
+    # ── Range check ────────────────────────────────────────────────────────
+    n_tracks = len(_playlist_tracks)
+    for n in numbers:
+        if n < 1 or n > n_tracks:
+            ui.notify(
+                f"Track number {n} is out of range (1-{n_tracks})",
+                type="negative",
+            )
+            return
+
+    # ── Duplicate check in input ──────────────────────────────────────────
+    if len(set(numbers)) != len(numbers):
+        ui.notify("Duplicate track numbers in input", type="negative")
+        return
+
+    # ── Already-anchored check ────────────────────────────────────────────
+    already = _anchored_track_ids()
+    for n in numbers:
+        idx = n - 1
+        tid = _playlist_tracks[idx].get("id", "")
+        if tid in already:
+            ui.notify(
+                f"Track {n} is already anchored",
+                type="negative",
+            )
+            return
+
+    # ── All validation passed — apply ─────────────────────────────────────
+    # Insert a separator placeholder between existing plan and new anchors
+    # if the plan is non-empty and the last entry is NOT already a placeholder.
+    if _anchor_plan and _anchor_plan[-1].get("type") != "placeholder":
+        _anchor_plan.append({"type": "placeholder"})
+
+    for i, n in enumerate(numbers):
+        # Precede every anchor except the very first one with a placeholder
+        if i > 0:
+            _anchor_plan.append({"type": "placeholder"})
+        idx = n - 1
+        tid = _playlist_tracks[idx].get("id", "")
+        _anchor_plan.append({"type": "anchor", "track_id": tid})
+
+    # Collapse adjacent placeholders (existing helper) — handles the case
+    # where the old plan already ended with a placeholder.
+    _anchor_plan[:] = _collapse_adjacent_placeholders(_anchor_plan)
+
+    # Clear input, refresh UI
+    _set_anchors_input.value = ""
+    _rebuild_anchors_list()
+    _rebuild_track_list()
+    _refresh_control_buttons()
+
+    pl_id = getattr(_state, "selected_playlist_id", None)
+    if pl_id:
+        try:
+            _save_anchors_file(pl_id, _playlist_name, _anchor_plan)
+        except Exception:
+            logger.exception("Failed to auto-save after Set Anchors")
+    ui.notify(f"Added {len(numbers)} anchors", type="positive")
+
+
 # ── UI rendering ───────────────────────────────────────────────────────────
 
 def _render_controls():
     """Render the anchor control buttons row."""
     global _controls_row, _move_up_btn, _move_down_btn, _remove_btn
     global _add_placeholder_btn, _add_selected_track_btn, _generate_anchors_btn
+    global _set_anchors_input, _set_anchors_btn
     global _clear_btn, _save_btn
 
     with ui.row().classes("w-full gap-1 items-center mt-2") as _controls_row:
@@ -816,6 +1351,18 @@ def _render_controls():
         _generate_anchors_btn = ui.button("Generate Anchors", on_click=_on_generate_anchors_clicked).classes("text-sm").props("size=sm color=teal")
         _clear_btn = ui.button("Clear Anchors", on_click=_clear_anchors).classes("text-sm").props("size=sm color=orange")
         _save_btn = ui.button("Save Anchors", on_click=_save_anchors).classes("text-sm").props("size=sm color=green")
+
+    with ui.row().classes("w-full gap-2 items-center mt-2"):
+        _set_anchors_input = (
+            ui.input(
+                label="Track numbers (comma-separated)",
+                placeholder="e.g. 3, 17, 42, 108",
+            )
+            .classes("grow")
+        )
+        _set_anchors_btn = ui.button(
+            "Set These Anchors", on_click=_on_set_anchors,
+        ).props("size=sm color=blue-6")
 
     _refresh_control_buttons()
 

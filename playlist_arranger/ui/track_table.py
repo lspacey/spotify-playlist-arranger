@@ -35,6 +35,16 @@ _recover_from_backup_fn = None    # playlist_source._recover_from_backup
 _backup_exists_fn = None          # playlist_arranger.cache.store.backup_exists
 _show_desc_dialog_fn = None       # playlist_arranger.ui.desc_dialog.show_desc_dialog
 
+# ── Per-playlist timer handles (prevents accumulation across rebuilds) ─────────
+# NiceGUI ``ui.timer()`` is an Element whose ``_handle_delete()`` does NOT
+# cancel the backing asyncio coroutine — so when a parent container is
+# ``.clear()``'d, the timer's DOM element is removed but the background
+# loop keeps ticking on stale closures.  We track handles explicitly so
+# each rebuild cancels the previous timer first.
+_status_refresh_timers: dict[str, ui.timer] = {}
+_add_queue_btn_timers: dict[str, ui.timer] = {}
+_desc_sel_btn_timers: dict[str, ui.timer] = {}
+
 
 def configure(state_module, db_module, ph_module, desc_gen_module,
               get_desc_age_info_fn, get_track_status_fn, play_track_fn,
@@ -128,14 +138,24 @@ def inject_desc_tooltip_css():
 
 # ─── Selected rows helper ─────────────────────────────────────────────────────
 
-def get_selected_rows(pl_id: str):
+def get_selected_rows(pl_id: str, *, exclude_now_playing: bool = True):
+    """Return user-selected rows for playlist *pl_id*.
+
+    By default, the now-playing highlight row is excluded from the result
+    because ``table.selected`` tracks BOTH explicit user checkbox-selections
+    AND the programmatic NP highlight.  Callers that want to honor ALL
+    selected rows (including any that happen to be the NP row) should pass
+    ``exclude_now_playing=False`` (e.g. the description-generation path,
+    where a just-analyzed track is likely still flagged as NP).
+    """
     table = _ph._playlist_tables.get(pl_id)
     if table is None:
         return []
     selected = list(table.selected) if hasattr(table, 'selected') else []
-    np_key = _ph._now_playing_row_keys.get(pl_id)
-    if np_key is not None:
-        selected = [r for r in selected if r.get("idx") != np_key]
+    if exclude_now_playing:
+        np_key = _ph._now_playing_row_keys.get(pl_id)
+        if np_key is not None:
+            selected = [r for r in selected if r.get("idx") != np_key]
     return selected
 
 
@@ -177,10 +197,14 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
                 on_click=lambda: _add_selected_to_queue_fn(pl_id, tracks),
                 color="yellow",
             ).classes("text-sm")
-            btn.set_enabled(len(get_selected_rows(pl_id)) > 0)
+            btn.set_enabled(len(get_selected_rows(pl_id, exclude_now_playing=True)) > 0)
             def _refresh_btn_enabled():
-                btn.set_enabled(len(get_selected_rows(pl_id)) > 0)
-            ui.timer(0.5, _refresh_btn_enabled)
+                btn.set_enabled(len(get_selected_rows(pl_id, exclude_now_playing=True)) > 0)
+            # Cancel any previous timer for this pl_id (avoid accumulation)
+            old_timer = _add_queue_btn_timers.get(pl_id)
+            if old_timer is not None:
+                old_timer.cancel()
+            _add_queue_btn_timers[pl_id] = ui.timer(0.5, _refresh_btn_enabled)
             return btn
 
         _build_add_to_queue_btn()
@@ -222,7 +246,7 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
 
         # ── Description generation buttons (playlist table) ──────────────────
         def _desc_gen_selected():
-            selected_rows = get_selected_rows(pl_id)
+            selected_rows = get_selected_rows(pl_id, exclude_now_playing=False)
             if not selected_rows:
                 ui.notify("No tracks selected", type="warning")
                 return
@@ -238,10 +262,14 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
             on_click=_desc_gen_selected,
             color="blue",
         ).classes("text-sm")
-        desc_selected_btn.set_enabled(len(get_selected_rows(pl_id)) > 0)
+        desc_selected_btn.set_enabled(len(get_selected_rows(pl_id, exclude_now_playing=False)) > 0)
         def _refresh_desc_sel_btn():
-            desc_selected_btn.set_enabled(len(get_selected_rows(pl_id)) > 0)
-        ui.timer(0.5, _refresh_desc_sel_btn)
+            desc_selected_btn.set_enabled(len(get_selected_rows(pl_id, exclude_now_playing=False)) > 0)
+        # Cancel any previous timer for this pl_id (avoid accumulation)
+        old_timer = _desc_sel_btn_timers.get(pl_id)
+        if old_timer is not None:
+            old_timer.cancel()
+        _desc_sel_btn_timers[pl_id] = ui.timer(0.5, _refresh_desc_sel_btn)
 
         def _desc_gen_all():
             track_ids = [t.get("id", "") for t in tracks if t.get("id")]
@@ -299,8 +327,30 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
 
     def _refresh_status_cells():
         nonlocal rows, track_table
+        # Guard against tracks being mutated in-place (e.g. _state.current_tracks[:]
+        # reassignment from another code path) while our old `rows` list still has
+        # the old length.  When they drift apart, refresh rows from the written
+        # cache so we stay in sync without blowing up.
+        if len(tracks) != len(rows):
+            cached_rows = _ph._playlist_rows_cache.get(pl_id)
+            cached_table = _ph._playlist_tables.get(pl_id)
+            if cached_rows is not None and cached_table is not None:
+                rows = cached_rows
+                track_table = cached_table
+                logger.debug("_refresh_status_cells(%s): tracks/rows length mismatch "
+                             "(%d vs %d) — refreshed from playlist cache",
+                             pl_id[:8] if pl_id else "?", len(tracks), len(rows))
+            else:
+                logger.debug("_refresh_status_cells(%s): tracks/rows length mismatch "
+                             "(%d vs %d) and no cache fallback — skipping tick",
+                             pl_id[:8] if pl_id else "?", len(tracks), len(rows))
+                return
+
         updated = False
         for i, t in enumerate(tracks):
+            # Secondary safety net — never index past rows length
+            if i >= len(rows):
+                break
             new_status = _get_track_status(t)
             if rows[i].get("status") != new_status:
                 rows[i]["status"] = new_status
@@ -312,4 +362,10 @@ def show_track_compact_table(tracks, pl_id, pl_name, set_page_cb):
                 logger.debug("track_table.update() failed during status cell refresh for playlist %s",
                              pl_id[:8] if pl_id else "?")
 
-    ui.timer(2.0, _refresh_status_cells)
+    # Cancel any previous status-refresh timer for this pl_id (avoid
+    # accumulation across expand/collapse rebuilds — NiceGUI timer
+    # coroutines survive container.clear() when parent is deleted).
+    old_status_timer = _status_refresh_timers.get(pl_id)
+    if old_status_timer is not None:
+        old_status_timer.cancel()
+    _status_refresh_timers[pl_id] = ui.timer(2.0, _refresh_status_cells)

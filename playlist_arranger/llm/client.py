@@ -214,7 +214,7 @@ def llm_chat(system_msg, user_msg, temperature=0.7, max_tokens=300) -> str:
             if not raw:
                 return ""
             raw = raw.strip()
-            # strip if present
+            # strip think tags if present
             text = re.sub(
                 r"", "", raw, flags=re.DOTALL
             ).strip()
@@ -240,7 +240,33 @@ def llm_chat(system_msg, user_msg, temperature=0.7, max_tokens=300) -> str:
                 raise RuntimeError(
                     f"{backend.title()} API error: {e}"
                 ) from e
-            return resp.choices[0].message.content.strip()
+
+            # Handle None content safely — OpenAI-compatible SDKs type
+            # message.content as Optional[str]; some providers return None
+            # for content-filtered responses or reasoning-only models.
+            choice = resp.choices[0]
+            finish_reason = getattr(choice, "finish_reason", "unknown")
+            raw_content = choice.message.content
+            if raw_content is None:
+                logger.warning(
+                    "LLM returned None content (finish_reason=%s). "
+                    "Response object: %s",
+                    finish_reason,
+                    choice.message,
+                )
+                return ""
+            result = raw_content.strip()
+            if not result:
+                logger.warning(
+                    "LLM returned empty content after strip "
+                    "(finish_reason=%s, raw length=%d). "
+                    "Raw content: %r",
+                    finish_reason,
+                    len(raw_content),
+                    raw_content[:200],
+                )
+            return result
+
     except Exception as e:
         raise RuntimeError(f"LLM error ({backend}): {e}") from e
 

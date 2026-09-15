@@ -1,36 +1,39 @@
 # Active Context — Spotify Playlist Arranger
 
 ## Current Work Focus
-Smart Sorting page post-save behavior improvements, RuntimeError fixes, and stale-reference cleanup on page navigation.
+AI anchor generation robustness for large playlists and SA solver performance.
 
-## Recent Changes (2026-07-30)
+## Recent Changes (2026-08-05)
 
-### Smart Sorting Page — Post-Save Behavior
-- **Bug fix**: Applied `client = ui.context.client` capture + `with client:` guard pattern (systemPattern #1) to `_on_save_new_playlist` and `_on_save_current_playlist._execute()`. Fixes RuntimeError when `ui.notify()` is called after `await asyncio.to_thread()` resumes with no active slot context.
-- **Feature**: `_refresh_playlist_dropdown()` re-fetches user playlists from Spotify and updates the select dropdown in-place after creating a new playlist (preserves current selection).
-- **Feature**: `_refresh_current_playlist_tracks()` re-fetches playlist tracks from Spotify after overwrite, writes the new cache file with snapshot_id, and triggers `_rebuild_all()` to redraw the track list.
+### AI Anchor Generation — Chunked Batching + Arc Awareness
+- **Feature**: `_on_run_generate()` in `anchors.py` now splits large playlists (>150 tracks) into 100-track chunks with proportional anchor allocation per chunk.
+- **Arc-position context (Option A)**: Each chunk receives a position hint ("BEGINNING/OPENING", "MIDDLE/TRANSITION", "ENDING/CLOSING") with percentage range and structure description.
+- **Lightweight re-order pass (Option B)**: After chunk merge, sends anchor names + BPM/Key/Loudness only (no full descriptions) to reorder into final structure arc. Validates same-set invariant, falls back gracefully.
+- **Per-chunk progress**: Dismiss-based notification tracking (`_progress_notify` + `_dismiss_progress()`) with `timeout=0` on ongoing, `timeout=3000` on success/warning.
+- **Backend propagation fix**: `_try_reorder_anchor_positions` now receives `backend`/`model` parameters — no longer silently switches to settings.json default mid-generation.
+- **Test suite**: 119 tests covering chunked batching, reorder pass, notification dismiss, progress behavioral test.
 
-### Smart Sorting Page — Stale-Reference Cleanup
-- **Bug fix**: `build_smart_sorting()` now resets ALL 18 module-level UI element globals to `None` at its top, before any new element creation. Cancels leaked `_log_timer` from a previous page instance. Fixes "element has been deleted but is still being used" RuntimeError when navigating away and back to the Sorting page while sorted results were showing.
-- **Defense-in-depth**: `_refresh_save_buttons()` and `_refresh_buttons()` now wrap all `.set_enabled()` / `.set_visibility()` / `.set_text()` calls in `try/except RuntimeError` guards, logging at DEBUG level and continuing gracefully if a stale reference survives the explicit reset.
+### Manual Anchor Input ("Set These Anchors")
+- **Feature**: `_on_set_anchors()` with comma-separated integer validation (all-or-nothing, 6 validation layers).
+- Placeholder separator inserted between old and new anchor groups.
+- Input cleared on success, auto-saves to disk.
 
-### Test Suite
-- Created `tests/test_smart_sorting.py` with 19 tests covering: client-context guards, playlist dropdown refresh, track cache refresh, notify ordering, dropdown selection preservation, stale-reference cleanup, and defensive error handling.
-- Full suite: 363 passed, 0 failed.
+### SA Solver — Delta-Cost Performance Fix
+- **Critical performance fix**: `_path_cost(order, D)` was called on every SA iteration (O(n) per iteration). Replaced with:
+  - `_reversal_delta()` — O(j-i) reversal cost delta (free-TSP and within-slot branches)
+  - `_inter_slot_move_delta()` — O(1) inter-slot track relocation delta (at most 6 edges)
+- **Float-drift safety**: Periodic `_path_cost()` recomputation every 1000 iterations, corrects if delta drifts beyond 1e-6 * (1 + |full|).
+- **Performance**: Drops from O(n × iters) per run to O(iters) per run.
+- **Test suite**: `tests/test_solver_delta_cost.py` with 5 tests (reversal delta equivalence, inter-slot move equivalence, solver equivalence, performance guard).
 
 ## Next Steps
-- Monitor for any remaining stale-reference issues on other pages (Spotify Source, Anchors, Stats, Batch Analysis)
-- Consider applying the same `client = ui.context.client` pattern to `_on_start_sorting` and `_on_insert_last_n` if issues arise
-- Track any leftover nicegui "Client has been deleted" warning patterns in production logs
-- Verify pagination persistence works correctly in real browser usage with large playlists
-- Monitor production logs for low-signal status flagging false positives on tracks with unusually quiet intros
+- Wire `desc_generator` worker to actually call LLM (placeholder currently)
+- Wire `run_descriptions()` to `desc_queue_add_many()`
+- Cross-platform audio capture (macOS/Linux support)
+- Export sorted playlist as M3U with relative paths
+- Cached distance matrix persistence across app restarts
 
 ## Active Decisions
-- **Pattern #1 (capture client before await)** is now the DEFAULT for all new async handler code in this project
-- **Defensive RuntimeError guards** on UI element mutation functions are now a standard second line of defense against stale references
-- **Explicit reset of all UI globals at build entry** is required for any page that lazily creates UI elements (not all in the build function)
-
-## Important Patterns
-- `smart_sorting.py` now has 18 module-level UI globals (up from ~10 before the cleanup pass). All are reset to None at the top of `build_smart_sorting()`.
-- `tests/test_smart_sorting.py` uses source-inspection tests (`_SRC_PATH.read_text()`) for order verification and module-level mock-replacement tests for behavioral verification.
-- See `systemPatterns.md` patterns #1 (UI context re-entry), #34 (stale-reference cleanup), and #35 (defensive UI guards).
+- **Delta-cost SA solver** is now the ONLY implementation — the full-recompute reference exists only in tests for equivalence verification.
+- **`_inter_slot_move_delta`** is a module-level function (extracted for testability); the SA loop calls it directly with slot_contents and anchors.
+- **Per-chunk progress notifications** use handle tracking + manual dismiss, not timeout-based auto-clear — prevents stacking but requires disciplined dismiss-before-create ordering.

@@ -391,6 +391,24 @@ Navigation state is managed via global `_current_page` string and `set_page()` +
 `descriptions.py` sends per-track feature summaries to the LLM with system prompt `DESCRIPTION_SYSTEM_PROMPT`. Tracks are batched (by default 10 per request) to reduce API calls.
 
 ## File Organization Conventions
+### 39. Delta-Cost SA Solver with Periodic Drift Check (2026-08-05)
+The simulated annealing inner loop replaces O(n) full `_path_cost()` recomputation with O(j-i) `_reversal_delta()` (2-opt reversal) and O(1) `_inter_slot_move_delta()` (cross-slot track relocation). Both functions compute only the edge changes affected by the proposed move — at most 6 edges for inter-slot moves. Periodic full-cost recomputation every 1000 iterations catches accumulated floating-point drift, correcting `current_cost` if `abs(full - current_cost) > 1e-6 * (1 + |full|)`.
+
+```python
+# Before: O(n) every iteration
+nc = _path_cost(order, D)
+delta = nc - current_cost
+
+# After: O(j-i) for reversal, O(1) for inter-slot move
+delta = _reversal_delta(order, i, j, D)
+if delta < 0 or random.random() < math.exp(-delta / T):
+    order[i : j + 1] = order[i : j + 1][::-1]
+    current_cost += delta
+```
+
+### 40. Anchor Generation Chunked Batching with Arc Awareness (2026-08-05)
+Large playlists (>150 tracks) split into 100-track chunks. Each chunk's LLM call receives arc-position context ("BEGINNING/OPENING", "MIDDLE/TRANSITION", "ENDING/CLOSING" with percentage range). After all chunks complete, a lightweight re-order pass sends only anchor names + BPM/Key/Loudness (no full descriptions) to re-sequence into the requested structure arc. The re-order result is validated (`set(reordered) == set(deduped_positions)`) and the original order is kept on failure.
+
 - Underscore-prefixed module-level functions are internal to the module
 - `HAS_*` module-level booleans check optional dependency availability
 - Progress callbacks (`progress_cb(msg)`) are passed through the call chain for UI feedback
