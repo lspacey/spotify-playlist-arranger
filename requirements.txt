@@ -1,50 +1,93 @@
-#    python -m venv venv
-#    venv\Scripts\activate
-#    pip install -r requirements.txt
-#    pip list
+# Playlist Arranger — dependency requirements
+# All versions pinned exactly (==) for reproducible builds.
+#
+#   python -m venv venv
+#   venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# ---------------------------------------------------------------------------
+# MERT constraint: transformers MUST stay below 4.44.0.
+# transformers >= 4.44.0 removed `conv_pos_batch_norm` from Wav2Vec2Config
+# (renamed internally), causing MERT-v1-95M to fail with:
+#   AttributeError: 'MERTConfig' object has no attribute 'conv_pos_batch_norm'
+# See: https://huggingface.co/m-a-p/MERT-v1-95M/discussions/4
+# ---------------------------------------------------------------------------
 
-# Spotify Web API
-spotipy>=2.23.0
+# ── Core framework ─────────────────────────────────────────────────────────
+nicegui==3.13.0        # web UI framework
 
-# Capture audio – WASAPI loopback (Windows)
+# ── Spotify Web API ────────────────────────────────────────────────────────
+spotipy==2.26.0        # 2.26.0 is the first release that moved playlist endpoints
+                       # from /tracks to /items for the February 2026 Web API
+                       # changes; older versions hit the removed /tracks endpoint
+                       # and get 403.
+requests==2.34.2       # direct HTTP calls with retry/rate-limit handling
+
+# ── Audio capture (Windows only) ───────────────────────────────────────────
 # If `pip install pyaudiowpatch` fails, you need Visual C++ Build Tools:
 # https://visualstudio.microsoft.com/visual-cpp-build-tools/
-pyaudiowpatch>=0.2.12
+pyaudiowpatch==0.2.12.8
 
-# Audio analysis
-librosa>=0.10.0
-numpy>=1.24.0
-soundfile>=0.12.0
+# ── Audio analysis ─────────────────────────────────────────────────────────
+librosa==0.11.0        # feature extraction (BPM, key, spectral, MFCC, chroma)
+numpy==2.4.6
+soundfile==0.14.0      # audio file I/O
+mutagen==1.48.1        # MP3/FLAC metadata (for local file support)
 
-# Terminal UI
-rich>=13.0.0
-
-# Environment-variable loader
-python-dotenv>=1.0.0
-
-# MERT neural embeddings (for audio vector analysis)
-# ─── CPU-only (default) ────────────────────────────────────────────────────────
-torch>=2.0.0
-torchaudio>=2.0.0
-transformers>=4.30.0,<4.49
-accelerate>=0.20.0
-
-# ─── CUDA acceleration (Windows / Linux) ───────────────────────────────────────
-#   Check your CUDA version:  nvidia-smi
-#   Visit https://pytorch.org/get-started/locally/ for the correct index URL.
+# ── MERT neural embeddings (audio vector analysis) ─────────────────────────
+# ─── CPU-only (default) — torch + torchaudio as matched pair ───────────────
+#   These versions must be upgraded together. Check PyTorch's compatibility
+#   matrix at: https://github.com/pytorch/pytorch/wiki/PyTorch-Versions
 #
-#   Example – CUDA 12.1:
-#     pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
-#     pip install transformers>=4.30.0,<4.49 accelerate>=0.20.0
-#
-#   Example – CUDA 11.8:
-#     pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
-#     pip install transformers>=4.30.0,<4.49 accelerate>=0.20.0
-#
-#   Verify:  python -c "import torch; print(torch.cuda.is_available())"
-#   If False →  pip uninstall torch torchvision
-#               pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   On machines WITHOUT an NVIDIA GPU, install the CPU builds:
+#     pip install torch==2.12.1 torchaudio==2.11.0
+torch==2.12.1
+torchaudio==2.11.0      # matched-pair dependency — installed alongside torch,
+                        # used internally by torch for audio backend (sox_io)
 
-# LLM backends (pick at least one)
-ollama>=0.1.0        # local LLM  (free, offline)
-openai>=1.0.0        # for DeepSeek / Mistral APIs
+#   Note: torchvision is NOT required for this project and should not be installed.
+
+# ─── HuggingFace transformers pinned for MERT compatibility ────────────────
+transformers==4.38.0
+accelerate==1.14.0      # required by transformers pipeline (auto-detected)
+
+# ─── CUDA acceleration (Windows / Linux) — OPTIONAL ────────────────────────
+#   RTX 5080 / 50-series Blackwell GPUs (sm_120) require CUDA >= 12.8.
+#   PyTorch >= 2.7.0 + cu128/cu130 wheels include sm_120 kernels.
+#   This project is confirmed working with torch 2.12.1+cu130 (CUDA 13.0).
+#
+#   To switch from CPU to CUDA on RTX 5080:
+#
+#     1. Uninstall CPU torch:
+#        pip uninstall torch torchaudio accelerate -y
+#
+#     2. Install CUDA-enabled matched pair from the OFFICIAL PyTorch index:
+#        pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+#        → This installs torch 2.12.1+cu130 + torchaudio 2.11.0+cu130
+#
+#     3. Re-install accelerate (CPU-only, safe to mix):
+#        pip install accelerate==1.14.0
+#
+#     4. Verify (expect: True, RTX 5080, sm_120 in arch list):
+#        python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_arch_list())"
+#
+#   For OLDER GPUs (RTX 20/30/40 series) use CUDA 12.1 wheels:
+#     pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+#   IMPORTANT: Only install PyTorch from the OFFICIAL index at download.pytorch.org.
+#   Do NOT install any third-party packages claiming to "fix" RTX 5080 compatibility.
+#
+#   The mert.py module auto-detects GPU availability and moves the model
+#   to CUDA when available. No config changes needed.
+
+# ── LLM backends (pick at least one) ───────────────────────────────────────
+ollama==0.6.2          # local LLM  (free, offline)
+openai==2.44.0         # for DeepSeek / Mistral APIs
+
+# ── Web search (optional, for enriched track descriptions) ──────────────────
+tavily-python==0.7.17  # Tavily search API client (https://tavily.com)
+
+# ── Utilities ──────────────────────────────────────────────────────────────
+matplotlib==3.10.8     # distance histogram PNG rendering
+rich==15.0.0           # terminal output formatting
+python-dotenv==1.2.2   # .env file loading

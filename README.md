@@ -1,4 +1,4 @@
-# 🎧 Spotify Playlist Arranger
+# 🎧 Playlist Arranger
 
 > **Analyze your Spotify playlists, generate AI-powered track descriptions, and reorder tracks with a smart sorting algorithm to create the perfect listening journey.**
 
@@ -16,8 +16,8 @@
 - 📐 **AI Anchor Selection** — An LLM‑based playlist architect picks anchor tracks and arranges them into a mood curve (Wave, Rise & Fall, Story Arc, and more)
 - 🧮 **Smart Sorting** — Simulated‑annealing ATSP solver respects harmonic key mixing (Camelot wheel), tempo drift, and artist/album separation
 - 🎚️ **Interactive Anchor Editor** — Manually add, delete, reorder anchors with placeholders; regenerate anchors with AI at any time
-- 💾 **Full Backup & Recovery** — Backs up existing playlists before reordering; recoverable at any time via the main menu
-- 🖥️ **Rich Terminal UI** — Beautiful tables, panels, and prompts powered by [Rich](https://github.com/Textualize/rich)
+- 💾 **Full Backup & Recovery** — Backs up existing playlists before reordering; recoverable at any time
+- 🖥️ **NiceGUI Web Interface** — Modern web UI with sidebar navigation, tables, and dialogs
 
 ---
 
@@ -41,12 +41,20 @@ git clone https://github.com/lspacey/spotify-playlist-arranger.git
 cd spotify-playlist-arranger
 ```
 
-### 2. Create a virtual environment
+### 2. Create a virtual environment (recommended)
 
 ```bash
 python -m venv venv
-venv\Scripts\activate
 ```
+
+Activate it:
+- **Windows (Command Prompt):** `venv\Scripts\activate.bat`
+- **Windows (PowerShell):** `venv\Scripts\Activate.ps1`
+- **macOS / Linux:** `source venv/bin/activate`
+
+> Your terminal prompt should now show `(venv)` at the beginning, indicating you are inside the virtual environment. All `pip install` and `python` commands from this point should be run inside the venv.
+
+To deactivate when done: `deactivate`
 
 ### 3. Install dependencies
 
@@ -54,7 +62,21 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> ⚠️ If you have an NVIDIA GPU and want CUDA acceleration, install PyTorch with the appropriate CUDA index. See the comments in `requirements.txt` for examples.
+> ⚠️ If `pyaudiowpatch` fails to install, you need [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+
+For machines with an NVIDIA GPU (especially RTX 50-series / Blackwell), replace the CPU PyTorch with the CUDA-enabled build **after** running the command above:
+
+| GPU Series | PyTorch Install Command |
+|---|---|
+| **RTX 5080 / 50-series (Blackwell)** | `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130` |
+| RTX 20/30/40 series | `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121` |
+
+Verify CUDA is active with:
+```bash
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_arch_list())"
+```
+> Should show `True`, `NVIDIA GeForce RTX 5080`, and `sm_120` in the arch list.
+> See `requirements.txt` for complete GPU setup details.
 
 ### 4. Set up your Spotify credentials
 
@@ -90,45 +112,66 @@ MISTRAL_MODEL=mistral-large-latest
 
 ### Quick start (Windows)
 
-Double‑click **`run_playlist_analyzer.cmd`**, or run from the terminal:
+Double‑click **`start.bat`**, or run from the terminal:
 
 ```bash
-venv\Scripts\activate
-python playlist_analyzer.py
+python -m playlist_arranger.main
 ```
 
-### Step‑by‑step guide
+The web app opens at `http://127.0.0.1:8082`.
 
-1. **Authenticate** — A browser window will open asking you to log into Spotify and grant permissions
-2. **Select audio device** — Choose a WASAPI loopback device to capture system audio
-3. **Select playback device** — Pick the Spotify device that will play tracks during analysis
-4. **Choose a playlist** — Browse your owned playlists and select one
-5. **Analyze missing tracks** — Tracks not in the local database are marked. Play them (Spotify will stream them automatically) while the analyzer captures the audio
-6. **Choose anchors and reorder** — Once all tracks are analyzed:
-   - LLM generates text descriptions of each track
-   - Open the **Anchor Editor** to manually select waypoints, add placeholders, or let AI pick anchors
-   - AI can arrange anchors into a mood curve (Wave, Rise & Fall, Story Arc, etc.)
-7. **Run smart sorting** (`go` in the editor) — The SA‑ATSP solver arranges all non‑anchor tracks between the anchors
-8. **Save to Spotify** — Update the existing playlist (with automatic backup), or create a new one
+### Workflow
+
+1. **Connect to Spotify** (sidebar → Spotify) or browse **Local Files** — select a playlist
+2. **Analyze missing tracks** — tracks not in the database are marked; use the Analyze button
+3. **Generate descriptions** — LLM creates text descriptions of each track
+4. **Create anchors** — manually add anchor tracks and placeholders, or use AI generation
+5. **Run smart sorting** — SA-ATSP solver arranges all tracks between the anchors
+6. **Save to Spotify** (new playlist or update existing) or **Export as M3U** for local files
 
 ---
 
-## 📁 File Structure
+## 📁 Project Structure
 
 ```
-spotify-playlist-arranger/
-├── playlist_analyzer.py          # Main application
-├── run_playlist_analyzer.cmd     # Windows launcher
-├── requirements.txt              # Python dependencies
-├── .env                          # Environment variables (not committed)
-├── README.md                     # This file
-├── tracks_db.json                # Local track feature database
-├── anchors/                      # Anchor plans & descriptions
-│   ├── descriptions_<id>.json
-│   ├── anchors_<id>.json
-│   ├── result_<id>.json
-│   └── backup_<id>.json
-└── embeds/                       # MERT embedding vectors (.npy)
+playlist_arranger/
+├── main.py                     # NiceGUI app entry point
+├── config.py                   # All constants and Settings dataclass
+├── database/
+│   ├── db.py                   # SQLite backend (replaces tracks_db.json)
+│   └── migrate.py              # JSON to SQLite migration
+├── audio/
+│   ├── capture.py              # WASAPI loopback audio capture
+│   ├── features.py             # Librosa feature extraction
+│   └── mert.py                 # MERT neural embedding model
+├── sources/
+│   ├── spotify_source.py       # Spotify API integration
+│   └── local_source.py         # Local file scanning and M3U handling
+├── analysis/
+│   ├── worker.py               # Save track worker (features + embedding)
+│   └── session.py              # Analysis session (playback + capture loop)
+├── llm/
+│   ├── client.py               # LLM client (Ollama / DeepSeek / Mistral)
+│   ├── descriptions.py         # Track description generation
+│   └── prompts.py              # System prompts and playlist structures
+├── sorting/
+│   ├── distance.py             # Track distance metrics
+│   ├── solver.py               # Simulated annealing ATSP solver
+│   └── anchors.py              # Anchor plan management and AI generation
+├── cache/
+│   └── store.py                # Atomic JSON writes, descriptions, results
+└── ui/
+    ├── state.py                # Global reactive state
+    ├── pages/
+    │   ├── welcome.py          # Landing page
+    │   ├── playlist_source.py  # Spotify / Local source selection
+    │   ├── anchor_editor.py    # Interactive anchor editor
+    │   ├── smart_sorting.py    # SA sorting controls and results
+    │   ├── database_panel.py   # Database browser and maintenance
+    │   └── settings_panel.py   # Application settings
+    └── components/
+        ├── track_table.py      # Reusable track table
+        └── progress.py         # Progress panel with log
 ```
 
 ---
@@ -149,12 +192,25 @@ spotify-playlist-arranger/
 
 ---
 
+## 🔄 February 2026 Spotify API migration
+
+This project is migrated to Spotify's **February 2026 Web API changes**:
+
+- **Playlist endpoints renamed** — `GET|POST|PUT|DELETE /playlists/{id}/tracks` were removed and replaced by `.../playlists/{id}/items`. `spotipy>=2.26.0` is required (older versions get 403).
+- **Playlist item page limit is now 50** (was 100).
+- **Removed track fields** — `available_markets`, `popularity` and `linked_from` are gone from the track object (`external_ids` was removed in February and restored in March 2026).
+- **`market=from_token` removed** — the app now resolves and caches the account country at auth time instead.
+- **Development Mode Premium requirement** — the app owner must hold an active Spotify Premium subscription and each Client ID is limited to 5 authorized users; some write endpoints return bare 403 Forbidden.
+- **Playback fallback ladder** — `PUT /me/player/play` may return 403 on restricted devices, so playback now falls back through `transfer_playback` → `add_to_queue` + `next_track` (the reliable Development Mode path).
+
+---
+
 ## ❓ FAQ
 
 <details>
 <summary><b>Why does it need Spotify Premium?</b></summary>
 
-The script uses Spotify's playback control API to queue and play specific tracks for audio capture. This functionality is only available to Premium subscribers.
+The app uses Spotify's playback control API to queue and play specific tracks for audio capture. This functionality is only available to Premium subscribers.
 </details>
 
 <details>
@@ -166,19 +222,19 @@ Yes. PyTorch installs in CPU‑only mode by default with `pip install torch`. ME
 <details>
 <summary><b>What if a track isn't being captured?</b></summary>
 
-Make sure the selected audio device is a **loopback** device (WASAPI). The script only captures audio that your system is playing — not audio from a different device.
+Make sure the selected audio device is a **loopback** device (WASAPI). The app only captures audio that your system is playing — not audio from a different device.
 </details>
 
 <details>
 <summary><b>How long does the sorting take?</b></summary>
 
-The SA solver runs 100 iterations. For small playlists (~12 tracks) it takes seconds; for large playlists (200+ tracks) building the distance matrix may take a minute or two.
+The SA solver runs 100 iterations by default. For small playlists (~12 tracks) it takes seconds; for large playlists (200+ tracks) building the distance matrix may take a minute or two.
 </details>
 
 <details>
 <summary><b>Can I edit AI‑generated anchors?</b></summary>
 
-Absolutely. Use the Anchor Editor commands (`a`, `del`, `u`, `dn`) to add, remove, or reorder anchors manually. You can also add placeholders (`ph`) to leave gaps where the solver will fill in tracks.
+Absolutely. Use the Anchor Editor to add, remove, or reorder anchors manually. You can also add placeholders to leave gaps where the solver will fill in tracks.
 </details>
 
 ---

@@ -1,0 +1,272 @@
+"""Settings panel — paths, algorithm parameters, audio device, LLM config, env vars."""
+
+import os
+import pathlib
+
+from nicegui import ui
+
+from playlist_arranger.ui.state import get_settings
+from playlist_arranger.config import (
+    save_settings,
+    Settings,
+    HOME_DIR,
+    DB_PATH_DEFAULT,
+    EMBEDS_DIR_DEFAULT,
+    CACHE_DIR_DEFAULT,
+    LLM_BACKEND,
+    OLLAMA_MODEL,
+    DEEPSEEK_MODEL,
+    MISTRAL_MODEL,
+    _to_portable,
+    _resolve_path,
+    LOCAL_MUSIC_DEFAULT,
+)
+from playlist_arranger.audio.capture import list_loopback_devices
+from playlist_arranger.database.db import reload_db as _reload_db
+
+
+def _mask_value(val: str, show_len: int = 4) -> str:
+    """Mask a secret value showing only first and last N chars."""
+    if not val or val in ("...", "ollama"):
+        return val if val else "(not set)"
+    if len(val) <= show_len * 2:
+        return val[:show_len] + "..."
+    return val[:show_len] + "..." + val[-show_len:]
+
+
+def build_settings_dialog():
+    """Build settings panel as a dialog content."""
+    s = get_settings()
+    container = ui.column().classes("w-full gap-4")
+
+    with container:
+        ui.label("Settings").classes("text-2xl font-bold mb-2")
+
+        # ─── Environment variables ──────────────────────────────────────────
+        with ui.card().classes("w-full"):
+            ui.label("Environment Variables (.env)").classes("text-lg font-bold mb-2")
+            env_vars = [
+                ("SPOTIPY_CLIENT_ID", os.getenv("SPOTIPY_CLIENT_ID", "")),
+                ("SPOTIPY_CLIENT_SECRET", os.getenv("SPOTIPY_CLIENT_SECRET", "")),
+                ("SPOTIPY_REDIRECT_URI", os.getenv("SPOTIPY_REDIRECT_URI", "")),
+                ("DEEPSEEK_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")),
+                ("MISTRAL_API_KEY", os.getenv("MISTRAL_API_KEY", "")),
+            ]
+            for name, val in env_vars:
+                display = val if name == "SPOTIPY_REDIRECT_URI" else _mask_value(val)
+                with ui.row().classes("w-full gap-2 items-center"):
+                    ui.label(name).classes("text-sm font-mono w-48")
+                    ui.label(display).classes("text-sm font-mono text-gray-600 dark:text-gray-400")
+
+        # ─── Path settings ──────────────────────────────────────────────────
+        with ui.card().classes("w-full"):
+            ui.label("Paths").classes("text-lg font-bold mb-2")
+            ui.label(f"Working directory: {HOME_DIR}").classes("text-xs text-gray-500 dark:text-gray-400 mb-2")
+            db_input = ui.input(
+                label="Database file path",
+                value=_to_portable(s.db_path),
+            ).classes("w-full max-w-md")
+            embeds_input = ui.input(
+                label="Embeddings folder",
+                value=_to_portable(s.embeds_dir),
+            ).classes("w-full max-w-md")
+            cache_input = ui.input(
+                label="Cache folder",
+                value=_to_portable(s.cache_dir),
+            ).classes("w-full max-w-md")
+            local_music_input = ui.input(
+                label="Local music folder",
+                value=_to_portable(pathlib.Path(s.local_music_dir)) if s.local_music_dir else LOCAL_MUSIC_DEFAULT,
+            ).classes("w-full max-w-md")
+            ui.button("Reset to Defaults", on_click=lambda: (
+                db_input.set_value(_to_portable(DB_PATH_DEFAULT)),
+                embeds_input.set_value(_to_portable(EMBEDS_DIR_DEFAULT)),
+                cache_input.set_value(_to_portable(CACHE_DIR_DEFAULT)),
+                local_music_input.set_value(LOCAL_MUSIC_DEFAULT),
+            )).classes("text-sm")
+
+        # ─── SA algorithm parameters ────────────────────────────────────────
+        with ui.card().classes("w-full"):
+            ui.label("SA Algorithm Parameters").classes("text-lg font-bold mb-2")
+            with ui.row().classes("w-full gap-4"):
+                sa_iter = ui.number(
+                    label="Iterations multiplier",
+                    value=s.sa_iterations_multiplier, min=100, max=2000,
+                ).classes("w-32")
+                sa_runs = ui.number(
+                    label="N_RUNS", value=s.sa_n_runs, min=10, max=500,
+                ).classes("w-32")
+                sa_T_start = ui.number(
+                    label="T_start", value=s.sa_T_start, min=0.1, max=10.0, step=0.1,
+                ).classes("w-32")
+                sa_T_end = ui.number(
+                    label="T_end", value=s.sa_T_end, min=1e-8, max=1e-2, step=1e-4,
+                    format="%.0e",
+                ).classes("w-40")
+
+            ui.label("Weights (relative — NOT auto-normalized)").classes("text-md font-bold mt-4 mb-2")
+            with ui.row().classes("w-full gap-4"):
+                w_mood = ui.number(
+                    label="Mood", value=s.w_mood, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+                w_bpm = ui.number(
+                    label="BPM", value=s.w_bpm, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+                w_transition = ui.number(
+                    label="Transition", value=s.w_transition, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+                w_key = ui.number(
+                    label="Key", value=s.w_key, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+                w_energy = ui.number(
+                    label="Energy", value=s.w_energy, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+            with ui.row().classes("w-full gap-4 mt-2"):
+                w_texture = ui.number(
+                    label="Texture", value=s.w_texture, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+                w_freq_balance = ui.number(
+                    label="Freq Bal", value=s.w_freq_balance, min=0.0, max=1.0, step=0.05,
+                ).classes("w-24")
+            with ui.row().classes("w-full gap-4 mt-2"):
+                artist_penalty = ui.number(
+                    label="Artist Penalty", value=s.artist_penalty, min=0.0, max=2.0, step=0.05,
+                ).classes("w-32")
+                album_penalty = ui.number(
+                    label="Album Penalty", value=s.album_penalty, min=0.0, max=2.0, step=0.05,
+                ).classes("w-32")
+                duration_tolerance = ui.number(
+                    label="Duration Tol", value=s.duration_tolerance, min=0.0, max=1.0, step=0.01,
+                ).classes("w-32")
+
+        # ─── Page size ──────────────────────────────────────────────────────
+        with ui.card().classes("w-full"):
+            ui.label("Table Pagination").classes("text-lg font-bold mb-2")
+            ui.label("Default number of rows per page for playlist and queue tables.").classes("text-xs text-gray-500 mb-2")
+            page_size_options = {5: "5", 10: "10", 15: "15", 20: "20", 25: "25", 50: "50", 0: "All (no pagination)"}
+            page_size_select = ui.select(
+                label="Default page size",
+                options=page_size_options,
+                value=s.default_page_size if s.default_page_size in page_size_options else 15,
+            ).classes("w-full max-w-md")
+
+        # ─── Audio device ───────────────────────────────────────────────────
+        with ui.card().classes("w-full"):
+            ui.label("Audio Device").classes("text-lg font-bold mb-2")
+            devices = list_loopback_devices()
+            device_options = {}
+            for d in devices:
+                label = f"[{'LOOP' if d['loopback'] else 'IN'}] {d['name'][:50]} ({d['channels']}ch @ {d['sr']}Hz)"
+                device_options[str(d["index"])] = label
+            saved_idx = str(s.selected_audio_device_index) if s.selected_audio_device_index is not None else None
+            if saved_idx is not None and saved_idx in device_options:
+                value = saved_idx
+            else:
+                value = None
+                if saved_idx is not None:
+                    ui.label("⚠ Audio device changed — please reselect").classes("text-xs text-orange-500 mb-1")
+            device_select = ui.select(
+                label="Audio input device",
+                options=device_options,
+                value=value,
+            ).classes("w-full max-w-md")
+
+        # ─── LLM settings ───────────────────────────────────────────────────
+        with ui.card().classes("w-full"):
+            ui.label("LLM Settings").classes("text-lg font-bold mb-2")
+            backend_options = {
+                "ollama": "Ollama (local)",
+                "deepseek": "DeepSeek API",
+                "mistral": "Mistral API",
+            }
+            llm_backend_select = ui.select(
+                label="LLM Backend",
+                options=backend_options,
+                value=s.llm_backend,
+            ).classes("w-full max-w-md")
+            ollama_model_input = ui.input(
+                label="Ollama Model", value=s.ollama_model,
+            ).classes("w-full max-w-md")
+            deepseek_model_input = ui.input(
+                label="DeepSeek Model", value=s.deepseek_model,
+            ).classes("w-full max-w-md")
+            mistral_model_input = ui.input(
+                label="Mistral Model", value=s.mistral_model,
+            ).classes("w-full max-w-md")
+
+        # ─── Save button ────────────────────────────────────────────────────
+        async def do_save():
+            s_new = Settings()
+            s_new.db_path = _resolve_path(db_input.value)
+            s_new.embeds_dir = _resolve_path(embeds_input.value)
+            s_new.cache_dir = _resolve_path(cache_input.value)
+            s_new.local_music_dir = str(_resolve_path(local_music_input.value))
+            s_new.sa_iterations_multiplier = int(sa_iter.value)
+            s_new.sa_n_runs = int(sa_runs.value)
+            s_new.sa_T_start = float(sa_T_start.value)
+            s_new.sa_T_end = float(sa_T_end.value)
+
+            # Weights — store raw values, NOT normalized (relative multipliers)
+            s_new.w_mood = float(w_mood.value)
+            s_new.w_bpm = float(w_bpm.value)
+            s_new.w_transition = float(w_transition.value)
+            s_new.w_key = float(w_key.value)
+            s_new.w_energy = float(w_energy.value)
+            s_new.w_texture = float(w_texture.value)
+            s_new.w_freq_balance = float(w_freq_balance.value)
+            s_new.artist_penalty = float(artist_penalty.value)
+            s_new.album_penalty = float(album_penalty.value)
+            s_new.duration_tolerance = float(duration_tolerance.value)
+
+            s_new.llm_backend = llm_backend_select.value
+            s_new.ollama_model = ollama_model_input.value
+            s_new.deepseek_model = deepseek_model_input.value
+            s_new.mistral_model = mistral_model_input.value
+            s_new.default_page_size = int(page_size_select.value)
+            if device_select.value:
+                s_new.selected_audio_device_index = int(device_select.value)
+
+            # Ensure dirs exist
+            s_new.embeds_dir.mkdir(exist_ok=True)
+            s_new.cache_dir.mkdir(exist_ok=True)
+            s_new.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            save_settings(s_new)
+
+            # Update runtime
+            from playlist_arranger.ui import state
+            state.settings = s_new
+
+            # Reload DB connection with new path
+            _reload_db()
+
+            # Check whether sorting weights changed → invalidate cached distance matrices
+            import playlist_arranger.config as _cfg
+            _weight_fields = [
+                "w_mood", "w_bpm", "w_transition", "w_key", "w_energy",
+                "w_texture", "w_freq_balance",
+            ]
+            _weights_changed = any(
+                getattr(s_new, f) != getattr(_cfg, f.upper() if f.startswith("w_") else f, getattr(_cfg, f, None))
+                for f in _weight_fields
+            )
+            _weights_changed = _weights_changed or (
+                s_new.artist_penalty != _cfg.ARTIST_PENALTY
+                or s_new.album_penalty != _cfg.ALBUM_PENALTY
+            )
+
+            # Sync weights & penalties into config module (single source of truth)
+            _cfg.sync_weights_from_settings(s_new)
+
+            if _weights_changed:
+                # Weights changed — cached distance matrices are now stale
+                # and must be rebuilt on next playlist selection.
+                from playlist_arranger.sorting.distance import _SORTING_CACHE
+                _SORTING_CACHE.clear()
+                ui.notify("Settings saved! (distance cache cleared)", type="positive")
+            else:
+                ui.notify("Settings saved!", type="positive")
+
+        ui.button("Save Settings", on_click=do_save, color="green").classes("mt-4")
+
+    return container

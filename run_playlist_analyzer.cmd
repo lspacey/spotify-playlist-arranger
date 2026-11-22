@@ -1,5 +1,10 @@
 @echo off
+cd /d "%~dp0"
 chcp 65001 >nul
+
+REM Activate virtual environment
+if exist "venv\Scripts\activate.bat" call venv\Scripts\activate.bat
+if exist ".venv\Scripts\activate.bat" call .venv\Scripts\activate.bat
 
 REM Load .env variables into current shell
 echo Loading environment variables from .env ...
