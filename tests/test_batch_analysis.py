@@ -8,6 +8,7 @@ import threading
 import time
 import pathlib
 import json
+from unittest.mock import patch
 logger = logging.getLogger(__name__)
 
 # ── Production-data isolation ─────────────────────────────────────────────────
@@ -39,6 +40,7 @@ def _setup():
     _ba._batch_current_track_duration_ms = 0
     _ba._batch_track_start_time = 0.0
     _ba._batch_expected_track_id = None
+    _ba._batch_play_issued_at = 0.0
     _ba._batch_watchdog_fired_by_track_id = None
     _ba._batch_btn = None
     _state.analysis_queue[:] = []
@@ -793,8 +795,8 @@ def test_stop_analyzing_flushes_buffer_before_stopping_poll():
         track_info={"id": "data-loss-test", "name": "Data Loss Test", "duration_ms": 300000},
         sample_rate=22050,
     )
-    # Simulate 270s of audio (90% coverage for 300s track → passes MIN_COVERAGE_PCT=0.90)
-    samples = np.zeros(22050 * 270, dtype=np.float32)
+    # Simulate 270s of audio (90% coverage, non-silent so the RMS gate accepts it)
+    samples = np.full(22050 * 270, 0.1, dtype=np.float32)
     buf.chunks = [samples]
     buf.samples_count = len(samples)
 
@@ -1131,8 +1133,8 @@ def test_flush_before_stop_handles_unsubmitted_buffer():
         track_info={"id": "unsubmitted-track", "name": "Unsubmitted", "duration_ms": 300000},
         sample_rate=22050,
     )
-    # Simulate 270s of audio (90% coverage for 300s track → passes MIN_COVERAGE_PCT=0.90)
-    samples = np.zeros(22050 * 270, dtype=np.float32)
+    # Simulate 270s of audio (90% coverage, non-silent so the RMS gate accepts it)
+    samples = np.full(22050 * 270, 0.1, dtype=np.float32)
     buf.chunks = [samples]
     buf.samples_count = len(samples)
 
@@ -1310,77 +1312,81 @@ def test_batch_live_queue_growth():
     is processing, append 9 more tracks → assert batch does NOT stop after
     the original 2, and continues processing the newly added 9."""
     _setup()
-    
+
     # Step 1: Start batch with 2 tracks
     _state.analysis_queue[:] = [_make_track("track-1"), _make_track("track-2")]
-    
-    mock_playback_calls = []
+
+    play_calls = []
     saved_start_playback = _ps._state.sp
+
     class MockSP:
-        call_count = 0
         @staticmethod
         def current_playback():
             return None
         @staticmethod
-        def start_playback(device_id=None, uris=None):
-            mock_playback_calls.append(("start_playback", uris))
-        @staticmethod
         def pause_playback(device_id=None):
-            mock_playback_calls.append(("pause_playback", device_id))
+            pass
         @staticmethod
         def devices():
-            return {"devices": []}
+            return {"devices": [{"id": "test-device", "is_restricted": False}]}
+
     _ps._state.sp = MockSP()
     _ps._state.spotify_device_id = "test-device"
-    
+
     saved_listen = _ps._start_listening
     saved_analyze = _ps._start_analyzing
     _ps._start_listening = lambda: None
     _ps._start_analyzing = lambda: None
-    
+
+    def _fake_play(sp, uri, device_id=None, confirm=True):
+        play_calls.append((uri, device_id))
+        return "play", {}
+
     try:
-        # Start batch — should begin playing track-1
-        _ps._on_start_batch()
-        assert _ba._batch_processing == True
-        assert _ba._batch_current_track_id == "track-1"
-        assert _ba._batch_expected_track_id == "track-1"
-        
-        # Step 2: Simulate track-1 confirmed playing
-        # (batch interference detection would set _batch_expected_track_id = None)
-        with _ba._batch_lock:
-            _ba._batch_expected_track_id = None
-        
-        # Step 3: Append 9 MORE tracks to live queue while batch is running
-        for i in range(3, 12):
-            _state.analysis_queue.append(_make_track(f"track-{i}", f"Track {i}"))
-        
-        # Must have 10 tracks total: track-1, track-2, plus 9 new ones
-        assert len(_state.analysis_queue) == 11, f"Expected 11 tracks, got {len(_state.analysis_queue)}"
-        
-        # Step 4: Simulate track-1 completes analysis (removed by _on_analysis_complete)
-        _ps._on_analysis_complete({"id": "track-1", "name": "Track 1"})
-        
-        # Now queue has: track-2 through track-11 (10 tracks)
-        assert len(_state.analysis_queue) == 10
-        assert _state.analysis_queue[0]["id"] == "track-2"
-        assert _state.analysis_queue[9]["id"] == "track-11"
-        
-        # Step 5: Simulate track-1 stops playing → advance to next
-        _ps._batch_advance_to_next("track-1")
-        
-        # Batch should NOT have stopped — it should advance to track-2
-        assert _ba._batch_processing == True, (
-            "Batch must NOT stop — live queue still has 10 unprocessed tracks"
-        )
-        assert _ba._batch_current_track_id == "track-2", (
-            f"Expected advance to track-2, got {_ba._batch_current_track_id}"
-        )
-        
-        # Verify track-2 was played
-        assert any("track-2" in str(c) for c in mock_playback_calls if c[0] == "start_playback"), (
-            "track-2 should have been played"
-        )
-        
+        with patch("playlist_arranger.sources.spotify_source.play_track_on_device",
+                   side_effect=_fake_play):
+            # Start batch — should begin playing track-1
+            _ps._on_start_batch()
+            assert _ba._batch_processing == True
+            assert _ba._batch_current_track_id == "track-1"
+            assert _ba._batch_expected_track_id == "track-1"
+
+            # Step 2: Simulate track-1 confirmed playing
+            # (batch interference detection would set _batch_expected_track_id = None)
+            with _ba._batch_lock:
+                _ba._batch_expected_track_id = None
+
+            # Step 3: Append 9 MORE tracks to live queue while batch is running
+            for i in range(3, 12):
+                _state.analysis_queue.append(_make_track(f"track-{i}", f"Track {i}"))
+
+            # Must have 11 tracks total: track-1, track-2, plus 9 new ones
+            assert len(_state.analysis_queue) == 11, f"Expected 11 tracks, got {len(_state.analysis_queue)}"
+
+            # Step 4: Simulate track-1 completes analysis (removed by _on_analysis_complete)
+            _ps._on_analysis_complete({"id": "track-1", "name": "Track 1"})
+
+            # Now queue has: track-2 through track-11 (10 tracks)
+            assert len(_state.analysis_queue) == 10
+            assert _state.analysis_queue[0]["id"] == "track-2"
+            assert _state.analysis_queue[9]["id"] == "track-11"
+
+            # Step 5: Simulate track-1 stops playing → advance to next
+            _ps._batch_advance_to_next("track-1")
+
+            # Batch should NOT have stopped — it should advance to track-2
+            assert _ba._batch_processing == True, (
+                "Batch must NOT stop — live queue still has 10 unprocessed tracks"
+            )
+            assert _ba._batch_current_track_id == "track-2", (
+                f"Expected advance to track-2, got {_ba._batch_current_track_id}"
+            )
+
+            # Verify track-2 was played
+            assert any("track-2" in str(u) for u, _ in play_calls), (
+                "track-2 should have been played"
+            )
+
     finally:
         _ps._state.sp = saved_start_playback
         _ps._start_listening = saved_listen
@@ -1388,6 +1394,7 @@ def test_batch_live_queue_growth():
         _ba._batch_processing = False
         _ba._batch_current_track_id = None
         _ba._batch_expected_track_id = None
+        _ba._batch_play_issued_at = 0.0
         _ba._batch_watchdog_fired_by_track_id = None
         _ba._batch_track_start_time = 0.0
 
@@ -1853,7 +1860,7 @@ def test_consecutive_poll_failure_log_warning_format():
 
 
 def test_start_playback_404_stops_batch_and_pushes_notify():
-    """When _batch_advance_to_next()'s start_playback() raises a 404 error,
+    """When _batch_advance_to_next()'s play_track_on_device() raises a 404,
     _stop_batch_analysis() must be called, _batch_processing must become False,
     and a 'notify' item pushed to _ui_pending_queue."""
     _setup()
@@ -1864,37 +1871,15 @@ def test_start_playback_404_stops_batch_and_pushes_notify():
         _ui_pending_queue.clear()
 
     import spotipy
-    import playlist_arranger.ui.pages.playlist_source as _src_mod
 
     saved_sp = _ps._state.sp
-    saved_start_playback = None
-
-    class MockSP404:
-        @staticmethod
-        def current_playback():
-            return None
-        @staticmethod
-        def start_playback(device_id=None, uris=None):
-            raise spotipy.exceptions.SpotifyException(
-                404, "not found", "Device not found"
-            )
-        @staticmethod
-        def pause_playback(device_id=None):
-            pass
-        @staticmethod
-        def devices():
-            return {"devices": []}
-
-    _ps._state.sp = MockSP404()
+    saved_device = _ps._state.spotify_device_id
+    _ps._state.sp = object()
     _ps._state.spotify_device_id = "missing-device"
 
     # Mock _stop_batch_analysis in batch_analyzer (not playlist_source delegate!)
     # because _batch_advance_to_next delegates to _ba._batch_advance_to_next()
     # which calls _ba._stop_batch_analysis() directly.
-    # The mock records the call AND clears _batch_processing (the real
-    # _stop_batch_analysis would do this, but its sub-operations like
-    # _safe_pause_playback_fn / _stop_analyzing_fn are DI-injected from
-    # playlist_source and would crash if called without a real ui module).
     stop_calls = []
     saved_stop = _ba._stop_batch_analysis
 
@@ -1905,7 +1890,10 @@ def test_start_playback_404_stops_batch_and_pushes_notify():
     _ba._stop_batch_analysis = fake_stop_batch
 
     try:
-        _ps._batch_advance_to_next()
+        err = spotipy.exceptions.SpotifyException(404, "not found", "Device not found")
+        with patch("playlist_arranger.sources.spotify_source.play_track_on_device",
+                   side_effect=err):
+            _ps._batch_advance_to_next()
 
         assert len(stop_calls) == 1, (
             f"_stop_batch_analysis must be called on 404, got {len(stop_calls)}"
@@ -1923,15 +1911,16 @@ def test_start_playback_404_stops_batch_and_pushes_notify():
 
     finally:
         _ps._state.sp = saved_sp
+        _ps._state.spotify_device_id = saved_device
         _ba._stop_batch_analysis = saved_stop
-        _ps._state.spotify_device_id = None
         _ba._batch_processing = False
         _ba._batch_current_track_id = None
         _ba._batch_expected_track_id = None
+        _ba._batch_play_issued_at = 0.0
 
 
 def test_start_playback_network_error_stops_batch():
-    """When _batch_advance_to_next()'s start_playback() raises a
+    """When _batch_advance_to_next()'s play_track_on_device() raises a
     requests.exceptions.RequestException (timeout, DNS), batch must stop."""
     _setup()
 
@@ -1941,25 +1930,10 @@ def test_start_playback_network_error_stops_batch():
         _ui_pending_queue.clear()
 
     import requests
-    import playlist_arranger.ui.pages.playlist_source as _src_mod
 
     saved_sp = _ps._state.sp
-
-    class MockSPNetwork:
-        @staticmethod
-        def current_playback():
-            return None
-        @staticmethod
-        def start_playback(device_id=None, uris=None):
-            raise requests.exceptions.ConnectionError("network unreachable")
-        @staticmethod
-        def pause_playback(device_id=None):
-            pass
-        @staticmethod
-        def devices():
-            return {"devices": []}
-
-    _ps._state.sp = MockSPNetwork()
+    saved_device = _ps._state.spotify_device_id
+    _ps._state.sp = object()
     _ps._state.spotify_device_id = "test-device"
 
     stop_calls = []
@@ -1972,7 +1946,9 @@ def test_start_playback_network_error_stops_batch():
     _ba._stop_batch_analysis = fake_stop_batch
 
     try:
-        _ps._batch_advance_to_next()
+        with patch("playlist_arranger.sources.spotify_source.play_track_on_device",
+                   side_effect=requests.exceptions.ConnectionError("network unreachable")):
+            _ps._batch_advance_to_next()
 
         assert len(stop_calls) == 1
         assert _ba._batch_processing == False
@@ -1986,16 +1962,17 @@ def test_start_playback_network_error_stops_batch():
 
     finally:
         _ps._state.sp = saved_sp
+        _ps._state.spotify_device_id = saved_device
         _ba._stop_batch_analysis = saved_stop
-        _ps._state.spotify_device_id = None
         _ba._batch_processing = False
         _ba._batch_current_track_id = None
         _ba._batch_expected_track_id = None
+        _ba._batch_play_issued_at = 0.0
 
 
 def test_start_playback_generic_exception_stops_batch():
-    """When _batch_advance_to_next()'s start_playback() raises a generic
-    exception (not 404, not requests), batch must still stop with a generic message."""
+    """When _batch_advance_to_next()'s play_track_on_device() raises an
+    unclassified HTTP error (e.g. 400), batch must still stop with a generic message."""
     _setup()
 
     _state.analysis_queue[:] = [_make_track("unknown-error-track", "Unknown Error")]
@@ -2003,25 +1980,11 @@ def test_start_playback_generic_exception_stops_batch():
     with _ui_pending_lock:
         _ui_pending_queue.clear()
 
-    import playlist_arranger.ui.pages.playlist_source as _src_mod
+    import spotipy
 
     saved_sp = _ps._state.sp
-
-    class MockSPGeneric:
-        @staticmethod
-        def current_playback():
-            return None
-        @staticmethod
-        def start_playback(device_id=None, uris=None):
-            raise RuntimeError("something unexpected happened")
-        @staticmethod
-        def pause_playback(device_id=None):
-            pass
-        @staticmethod
-        def devices():
-            return {"devices": []}
-
-    _ps._state.sp = MockSPGeneric()
+    saved_device = _ps._state.spotify_device_id
+    _ps._state.sp = object()
     _ps._state.spotify_device_id = "test-device"
 
     stop_calls = []
@@ -2034,7 +1997,10 @@ def test_start_playback_generic_exception_stops_batch():
     _ba._stop_batch_analysis = fake_stop_batch
 
     try:
-        _ps._batch_advance_to_next()
+        err = spotipy.exceptions.SpotifyException(400, -1, "Bad request", None)
+        with patch("playlist_arranger.sources.spotify_source.play_track_on_device",
+                   side_effect=err):
+            _ps._batch_advance_to_next()
 
         assert len(stop_calls) == 1, (
             f"Generic exception must still trigger _stop_batch_analysis, got {len(stop_calls)}"
@@ -2052,11 +2018,12 @@ def test_start_playback_generic_exception_stops_batch():
 
     finally:
         _ps._state.sp = saved_sp
+        _ps._state.spotify_device_id = saved_device
         _ba._stop_batch_analysis = saved_stop
-        _ps._state.spotify_device_id = None
         _ba._batch_processing = False
         _ba._batch_current_track_id = None
         _ba._batch_expected_track_id = None
+        _ba._batch_play_issued_at = 0.0
 
 
 def test_consecutive_poll_failure_below_threshold_no_stop():
@@ -2130,12 +2097,12 @@ def test_error_log_is_single_error_not_repeated_per_poll():
     not repeated per poll cycle. Verify source uses logger.error() once."""
     import inspect
     src = inspect.getsource(_ps._card_listen_thread)
-    # The error-level log should appear exactly once, in the threshold block
+    # Three single-shot ERROR log sites: session-expired (401), 403/permission,
+    # and the connection-lost threshold block. Each logs once, not per poll cycle.
     error_log_count = src.count("logger.error(")
-    assert error_log_count == 1, (
-        f"Expected exactly 1 ERROR-level logger call in _card_listen_thread, "
-        f"found {error_log_count} — error must be logged ONCE at threshold, "
-        f"not per poll cycle"
+    assert error_log_count == 3, (
+        f"Expected exactly 3 ERROR-level logger call sites in _card_listen_thread, "
+        f"found {error_log_count}"
     )
     # The warning-level log (per-failure below threshold) uses logger.warning
     assert "logger.warning" in src, (

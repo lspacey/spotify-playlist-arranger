@@ -16,7 +16,7 @@ from nicegui import ui, app
 from playlist_arranger.ui import state as _state
 from playlist_arranger.cache.store import backup_exists as _backup_exists
 from playlist_arranger.database import db as _db
-from playlist_arranger.config import load_settings, CACHE_DIR_DEFAULT
+from playlist_arranger.config import load_settings, CACHE_DIR_DEFAULT, SPOTIFY_TRACE, SEEK_BACK_MIN_DELTA_MS
 
 from playlist_arranger.analysis import batch_analyzer as _ba
 from playlist_arranger.analysis.desc_status import get_desc_age_info
@@ -31,6 +31,13 @@ from playlist_arranger.ui import analysis_queue as _aq
 from playlist_arranger.ui import track_table as _tt
 # ---- Wire dependency injection (circular-import avoidance) ----
 logger = logging.getLogger(__name__)
+
+
+def _short_id(value, n=8):
+    """Return *value* truncated to *n* chars for logs, or full when tracing."""
+    if SPOTIFY_TRACE:
+        return value
+    return value[:n] if value else value
 
 # ─── Description icon click handler (wired per-table via $parent.$emit) ───────
 
@@ -350,16 +357,58 @@ def _stop_listening():
 
 
 def _start_analyzing():
-    """Start the analyze poll thread. Idempotent."""
+    """Start the analyze poll thread. Idempotent.
+
+    Returns True when analysis is running (or already was), False only when
+    listen mode is not active (analysis cannot start).
+    """
     global _analyze_mode
     with _mode_lock:
         if _listen_mode != 1:
-            return
+            logger.warning("Analyze requested but listen mode is not active — analysis not started")
+            return False
         if _analyze_mode == 1:
-            return
+            return True
         _analyze_mode = 1
         _live_ctx.start_poll_thread()
-        logger.info("Now Playing: analysis started")
+
+    _log_analyze_started()
+    return True
+
+
+def _log_analyze_started():
+    """Log the capture device + current level once on a successful analyze start."""
+    import numpy as np
+    from playlist_arranger.audio.features import _to_mono
+
+    index = _state.audio_capture_device_index
+    name = getattr(_cap, "current_device_name", None) or "?"
+
+    rms_db = None
+    try:
+        if _cap.audio_deque is not None and len(_cap.audio_deque) >= 64:
+            with _cap.audio_lock:
+                window = np.array(list(_cap.audio_deque)[-4096:], dtype=np.float32)
+            if len(window) >= 64:
+                mono = (
+                    _to_mono(window, _cap.actual_channels)
+                    if _cap.actual_channels > 1 else window
+                )
+                rms = float(np.sqrt(np.mean(np.square(mono))) + 1e-12)
+                rms_db = float(20.0 * np.log10(rms))
+    except Exception:
+        rms_db = None
+
+    if rms_db is not None:
+        logger.info(
+            "Now Playing: analysis started (capture device index=%s name='%s', rms_db=%.1f)",
+            index, name, rms_db,
+        )
+    else:
+        logger.info(
+            "Now Playing: analysis started (capture device index=%s name='%s')",
+            index, name,
+        )
 
 
 def _stop_analyzing():
@@ -418,6 +467,75 @@ _api_counter_label = None
 # _ph._notify_playing_track() moved to playlist_arranger/ui/playlist_highlight.py.
 # Use _ph._notify_playing_track(...).
 
+def _classify_seek_back_step(state, tid, last_track_id, progress_ms, current_type, current_timestamp):
+    """Advance the seek-back state machine for one playback sample.
+
+    A seek-back is only declared after *two consecutive* qualifying regressions,
+    and never on a degenerate (track_id None / type 'unknown') or stale
+    (unchanged timestamp) snapshot.
+
+    ``state`` is a mutable dict with keys: ``last_progress_ms`` (int),
+    ``last_timestamp`` (raw timestamp or None), ``pending_seek_back_from_ms``
+    (int or None).  It is mutated in place.
+
+    Returns one of:
+        None        — nothing to do (forward/small step, or degenerate sample).
+        "possible"  — first qualifying regression (pending recorded).
+        "stale"     — unchanged timestamp (do not compare).
+        "drain"     — second consecutive regression (seek-back confirmed).
+    """
+    degenerate = (current_type != "track") or (tid is None)
+    stale = (
+        current_timestamp is not None
+        and state["last_timestamp"] is not None
+        and current_timestamp == state["last_timestamp"]
+    )
+
+    state["last_timestamp"] = current_timestamp
+
+    if stale:
+        state["pending_seek_back_from_ms"] = None
+        return "stale"
+
+    if degenerate:
+        state["pending_seek_back_from_ms"] = None
+        return None
+
+    if (
+        tid == last_track_id
+        and state["last_progress_ms"] > 0
+        and progress_ms < state["last_progress_ms"] - SEEK_BACK_MIN_DELTA_MS
+    ):
+        if state["pending_seek_back_from_ms"] is None:
+            state["pending_seek_back_from_ms"] = state["last_progress_ms"]
+            state["last_progress_ms"] = progress_ms
+            return "possible"
+        state["pending_seek_back_from_ms"] = None
+        state["last_progress_ms"] = progress_ms
+        return "drain"
+
+    state["pending_seek_back_from_ms"] = None
+    state["last_progress_ms"] = progress_ms
+    return None
+
+
+def _log_stale_snapshot(timestamp, last_log_time):
+    """Log a rate-limited (once per 30 s) frozen-playback-state warning.
+
+    Returns the updated ``last_log_time`` (so callers can keep their local
+    rate-limit tracker in sync).
+    """
+    if time.time() - last_log_time >= 30.0:
+        logger.info(
+            "playback state frozen since timestamp=%s — target device is "
+            "registered but not updating; restart the Spotify client and "
+            "refresh the device list",
+            timestamp,
+        )
+        return time.time()
+    return last_log_time
+
+
 # ─── Card logic: background polling thread (+ batch interference detection) ───
 def _card_listen_thread():
     """Background thread: polls Spotify API for track info + highlight only."""
@@ -427,12 +545,18 @@ def _card_listen_thread():
     from playlist_arranger.config import POLL_FAST, POLL_NORMAL
 
     last_track_id = None
-    last_progress_ms = 0
+    _seek_state = {
+        "last_progress_ms": 0,
+        "last_timestamp": None,
+        "pending_seek_back_from_ms": None,
+    }
     last_playing_time = 0.0
     _last_highlighted_id = None
     _last_highlighted_pl = None
     _consecutive_poll_failures = 0
     _MAX_CONSECUTIVE_POLL_FAILURES = 3
+    _last_waiting_log = 0.0
+    _last_stale_log = 0.0
 
     while not _listen_stop.is_set():
         try:
@@ -451,6 +575,79 @@ def _card_listen_thread():
                 cp = _state.sp.current_playback() if _state.sp else None
                 _consecutive_poll_failures = 0
             except Exception as e:
+                from playlist_arranger.sources.spotify_source import (
+                    spotify_error_details,
+                    classify_spotify_error,
+                )
+
+                status, reason, msg = spotify_error_details(e)
+                category = classify_spotify_error(status, msg, reason=reason)
+
+                # 401 — session expired: stop immediately, don't wait for 3 strikes.
+                if category == "auth_expired":
+                    logger.error(
+                        "Spotify poll failed: session expired (status=%s, reason=%s, msg=%s) — "
+                        "stopping listen/analyze/batch",
+                        status, reason, msg,
+                    )
+                    with _ba._batch_lock:
+                        bp = _ba._batch_processing
+                    if bp:
+                        _stop_batch_analysis()
+                    _stop_listening()
+                    with _ui_pending_lock:
+                        _ui_pending_queue.append({
+                            "type": "notify",
+                            "msg": "Spotify session expired — reconnect.",
+                            "color": "negative",
+                        })
+                    _consecutive_poll_failures = 0
+                    time.sleep(POLL_FAST)
+                    continue
+
+                # 403 — premium / forbidden / device restricted: stop immediately.
+                if category in ("premium_required", "forbidden", "device_restricted"):
+                    logger.error(
+                        "Spotify poll failed: %s (status=%s, reason=%s, msg=%s) — "
+                        "stopping batch",
+                        category, status, reason, msg,
+                    )
+                    with _ba._batch_lock:
+                        bp = _ba._batch_processing
+                    if bp:
+                        _stop_batch_analysis()
+                    _stop_listening()
+                    _notify_msgs = {
+                        "premium_required": "Spotify Premium is required to drive playback — batch analysis stopped.",
+                        "forbidden": "Spotify returned 403 for the playback request — batch analysis stopped. See log for details.",
+                        "device_restricted": "The selected Spotify device rejects remote playback — choose another device and restart batch analysis.",
+                    }
+                    with _ui_pending_lock:
+                        _ui_pending_queue.append({
+                            "type": "notify",
+                            "msg": _notify_msgs[category],
+                            "color": "negative",
+                        })
+                    _consecutive_poll_failures = 0
+                    time.sleep(POLL_FAST)
+                    continue
+
+                # 429 — rate limited: don't count as failure; honor Retry-After.
+                if category == "rate_limited":
+                    retry_after = None
+                    try:
+                        headers = getattr(e, "headers", None)
+                        raw = headers.get("Retry-After") if headers else None
+                        if raw is not None:
+                            retry_after = float(raw)
+                    except Exception:
+                        retry_after = None
+                    wait = retry_after if retry_after is not None else 5.0
+                    logger.warning("Spotify poll rate-limited (429) — sleeping %.1fs before retry", wait)
+                    time.sleep(wait)
+                    continue
+
+                # network / server / unknown — keep the existing 3-strike behaviour.
                 _consecutive_poll_failures += 1
                 if _consecutive_poll_failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
                     logger.error(
@@ -481,18 +678,34 @@ def _card_listen_thread():
                 _live_ctx.set_playing(False)
                 _live_ctx.sync_analyze_buffer(None)
 
+                # ── Batch start-confirmation timeout (never-started track) ──
+                if _ba.batch_check_start_timeout():
+                    continue
+
                 # ── Batch sequencer: track stopped → advance to next ─────
                 with _ba._batch_lock:
                     bp = _ba._batch_processing
                     ctid = _ba._batch_current_track_id
                     bexpected = _ba._batch_expected_track_id
+                    issued_at = _ba._batch_play_issued_at
                 # Only advance if current track was confirmed playing
                 # (bexpected=None means track started and was confirmed).
                 # If bexpected is still set, Spotify hasn't started yet — don't skip.
                 if bp and ctid is not None and bexpected is None:
                     logger.debug("Batch sequencer: track stopped, advancing (id=%s)",
-                                 ctid[:8] if ctid else "?")
+                                 _short_id(ctid))
                     _batch_advance_to_next(ctid)
+
+                # Rate-limited diagnostic so the log is never silent while waiting.
+                _now = time.time()
+                if bp and bexpected is not None and (_now - _last_waiting_log) >= 10.0:
+                    outstanding = (_now - issued_at) if issued_at > 0 else 0.0
+                    logger.info(
+                        "Batch waiting for track to start: processing=%s expected_track=%s "
+                        "current_track=%s play_outstanding=%.1fs",
+                        bp, bexpected, ctid, outstanding,
+                    )
+                    _last_waiting_log = _now
 
                 _current_track = None
                 _current_track_elapsed = 0
@@ -574,23 +787,26 @@ def _card_listen_thread():
                     if expected is not None and tid == expected:
                         with _ba._batch_lock:
                             _ba._batch_expected_track_id = None
-                        logger.info("Batch: expected track %s confirmed playing", tid[:8] if tid else "?")
+                            _ba._batch_play_issued_at = 0.0
+                        logger.info("Batch: expected track %s confirmed playing", _short_id(tid))
                     elif expected is not None and tid != expected:
                         with _ba._batch_lock:
                             _ba._batch_processing = False
                             _ba._batch_expected_track_id = None
+                            _ba._batch_play_issued_at = 0.0
                             _ba._batch_current_track_id = None
                         logger.warning("Batch stopped: user changed track manually (expected=%s, got=%s)",
-                                       expected[:8] if expected else "?", tid[:8] if tid else "?")
+                                       _short_id(expected), _short_id(tid))
                         with _ui_pending_lock:
                             _ui_pending_queue.append({"type": "batch_stopped_interference"})
                     elif expected is None:
                         with _ba._batch_lock:
                             _ba._batch_processing = False
                             _ba._batch_expected_track_id = None
+                            _ba._batch_play_issued_at = 0.0
                             _ba._batch_current_track_id = None
                         logger.warning("Batch stopped: external track change detected during active batch (track=%s)",
-                                       tid[:8] if tid else "?")
+                                       _short_id(tid))
                         with _ui_pending_lock:
                             _ui_pending_queue.append({"type": "batch_stopped_external"})
 
@@ -602,9 +818,26 @@ def _card_listen_thread():
                     except Exception:
                         logger.exception("_on_track_changed_cb crashed")
                 last_track_id = tid
-                last_progress_ms = 0
+                _seek_state["last_progress_ms"] = 0
+                _seek_state["pending_seek_back_from_ms"] = None
 
-            if tid == last_track_id and last_progress_ms > 0 and progress_ms < (last_progress_ms - 3000):
+            # ── Seek-back detection (guarded against stale/degenerate snapshots) ──
+            action = _classify_seek_back_step(
+                _seek_state,
+                tid,
+                last_track_id,
+                progress_ms,
+                cp.get("currently_playing_type"),
+                cp.get("timestamp"),
+            )
+            if action == "stale":
+                _last_stale_log = _log_stale_snapshot(cp.get("timestamp"), _last_stale_log)
+            elif action == "possible":
+                logger.debug(
+                    "Possible seek-back for track %s: %d ms -> %d ms — awaiting confirmation",
+                    _short_id(tid), _seek_state["pending_seek_back_from_ms"], progress_ms,
+                )
+            elif action == "drain":
                 with _mode_lock:
                     buf = _live_ctx.analyze_buf
                     already_submitted = (
@@ -615,18 +848,15 @@ def _card_listen_thread():
                 if already_submitted:
                     logger.debug(
                         "Seek-back/loop detected for already-submitted track %s — ignoring, no re-collection",
-                        tid[:8] if tid else "?",
+                        _short_id(tid),
                     )
                 else:
                     logger.info(
                         "Seek-back/loop detected for track %s (not yet submitted) — draining partial buffer and restarting",
-                        tid[:8] if tid else "?",
+                        _short_id(tid),
                     )
                     _live_ctx.sync_analyze_buffer(None)
                     _live_ctx.sync_analyze_buffer(new_track_info)
-                last_progress_ms = progress_ms
-
-            last_progress_ms = progress_ms
 
             dm, ds = divmod(dur_ms // 1000, 60)
             em, es = divmod(progress_ms // 1000, 60)
@@ -883,7 +1113,14 @@ def _render_np_inner():
             # those functions internally acquire _mode_lock themselves (non-reentrant
             # threading.Lock), so holding it here would self-deadlock.
             if _analyze_mode == 0:
-                _start_analyzing()
+                started = _start_analyzing()
+                if not started:
+                    with _ui_pending_lock:
+                        _ui_pending_queue.append({
+                            "type": "notify",
+                            "msg": "Analysis could not start — listen mode is not active.",
+                            "color": "warning",
+                        })
             else:
                 _stop_analyzing()
 
@@ -1046,8 +1283,17 @@ def build_spotify_section(set_page_cb):
                 try:
                     logger.info("Refreshing Spotify devices...")
                     devs = _state.sp.devices().get("devices", [])
+                    for d in devs:
+                        logger.info(
+                            "Spotify device '%s' (id=%s): is_active=%s, is_restricted=%s",
+                            d.get("name"), d.get("id"), d.get("is_active"), d.get("is_restricted"),
+                        )
                     logger.info("Found %d Spotify devices", len(devs))
-                    opts = {d["id"]: d["name"] for d in devs}
+                    opts = {
+                        d["id"]: (d["name"] + " (restricted — no remote control)")
+                        if d.get("is_restricted") else d["name"]
+                        for d in devs
+                    }
                     device_select.set_options(opts)
                     if _state.spotify_device_id is not None:
                         did = str(_state.spotify_device_id)
@@ -1238,7 +1484,7 @@ def _safe_pause_active_playback():
     if _is_actively_playing_on_device(_state.spotify_device_id):
         try:
             _state.sp.pause_playback(device_id=_state.spotify_device_id)
-            logger.debug("Paused active playback on device %s", _state.spotify_device_id[:8] if _state.spotify_device_id else "?")
+            logger.debug("Paused active playback on device %s", _short_id(_state.spotify_device_id))
         except Exception as e:
             err_msg = str(e)
             if "403" in err_msg:
@@ -1247,7 +1493,7 @@ def _safe_pause_active_playback():
                 logger.info("Could not pause playback: %s", err_msg)
     else:
         logger.debug("No active playback on device %s — skipping pause",
-                     _state.spotify_device_id[:8] if _state.spotify_device_id else "?")
+                     _short_id(_state.spotify_device_id))
 # ---- Wire batch_analyzer's dependency injection (Step 2) ----
 
 
@@ -1283,6 +1529,29 @@ def _on_start_batch():
         ui.notify("Connect Spotify and select a device first", type="warning")
         return
 
+    # Preflight: programmatic playback requires a Premium account and a device
+    # that accepts remote control (a restricted device is a common 403 source).
+    if getattr(_state, "spotify_product", None) is not None and _state.spotify_product != "premium":
+        ui.notify("Spotify Premium is required for programmatic playback.", type="warning")
+        return
+
+    if _state.sp and _state.spotify_device_id:
+        from playlist_arranger.sources.spotify_source import check_device
+
+        ok, reason = check_device(_state.sp, _state.spotify_device_id)
+        if not ok:
+            ui.notify(reason, type="warning")
+            return
+
+    # Baseline playback snapshot for comparison with post-command snapshots.
+    try:
+        from playlist_arranger.sources.spotify_source import playback_snapshot
+
+        baseline = playback_snapshot(_state.sp)
+        logger.info("Batch start: baseline playback snapshot=%r", baseline)
+    except Exception:
+        logger.exception("Batch start: failed to take baseline playback snapshot")
+
     with _ba._batch_lock:
         _ba._batch_processing = True
         if _ba._batch_btn is not None:
@@ -1292,7 +1561,15 @@ def _on_start_batch():
     _safe_pause_active_playback()
 
     _start_listening()
-    _start_analyzing()
+    started = _start_analyzing()
+    if not started:
+        logger.warning("Batch: analyze mode failed to start — listen mode is not active")
+        with _ui_pending_lock:
+            _ui_pending_queue.append({
+                "type": "notify",
+                "msg": "Analysis could not start — listen mode is not active.",
+                "color": "warning",
+            })
     _batch_advance_to_next()
     logger.info("Batch analysis started — %d tracks in queue", len(_state.analysis_queue))
 

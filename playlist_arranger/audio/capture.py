@@ -29,6 +29,8 @@ except ImportError:
 # ─── Module-level state ──────────────────────────────────────────────────────
 actual_channels = 2
 actual_sr = SAMPLE_RATE
+current_device_index: int | None = None
+current_device_name: str | None = None
 audio_deque: collections.deque = collections.deque(
     maxlen=SAMPLE_RATE * BUFFER_SECONDS * 2
 )
@@ -99,6 +101,9 @@ def start_audio_capture(device_index=None):
     """Start audio capture on given device (or first loopback)."""
     global actual_channels, actual_sr, audio_deque, FULL_BUF_MAX
     global full_buf, start_buf, start_buf_done
+    global current_device_index, current_device_name
+    current_device_index = None
+    current_device_name = None
     full_buf = None
     start_buf = None
     start_buf_done = False
@@ -156,6 +161,8 @@ def start_audio_capture(device_index=None):
         )
         device_name = "Default input (no loopback)"
 
+    current_device_index = device_index
+    current_device_name = device_name
     stream.start_stream()
     return pa, stream, device_name
 

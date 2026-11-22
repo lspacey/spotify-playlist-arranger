@@ -1,4 +1,4 @@
-"""Batch analysis sequencer: state globals, sequencing logic, watchdog, and UI drain.
+"""Batch analysis sequencer: state globals and sequencing logic.
 
 Extracted from playlist_source.py -- pure move, no behavior changes.
 
@@ -23,6 +23,7 @@ _batch_current_track_id: str | None = None  # track ID currently being played in
 _batch_current_track_duration_ms = 0     # expected duration of current batch track
 _batch_track_start_time = 0.0            # time.time() when batch started current track
 _batch_expected_track_id: str | None = None  # track ID we told Spotify to play (interference detection)
+_batch_play_issued_at: float = 0.0       # time.time() when the play command was issued (0.0 = not pending)
 _batch_watchdog_fired_by_track_id: str | None = None  # prevents duplicate watchdog fires
 _batch_btn = None                        # reference to the Start/Stop Batch Analysis button
 # NOTE: No frozen snapshot -- batch sequencer operates on the LIVE
@@ -67,7 +68,7 @@ def _stop_batch_analysis():
     Sets _batch_processing=False only if it was True (prevents double button reset
     when called from user click AND drain simultaneously)."""
     global _batch_processing, _batch_current_track_id, _batch_expected_track_id
-    global _batch_watchdog_fired_by_track_id, _batch_btn
+    global _batch_play_issued_at, _batch_watchdog_fired_by_track_id, _batch_btn
 
     was_processing = False
     with _batch_lock:
@@ -76,6 +77,7 @@ def _stop_batch_analysis():
             _batch_processing = False
         _batch_current_track_id = None
         _batch_expected_track_id = None
+        _batch_play_issued_at = 0.0
         _batch_watchdog_fired_by_track_id = None
 
     if _safe_pause_playback_fn:
@@ -109,7 +111,8 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
     that the current batch track has stopped playing (natural end via
     Spotify stopping playback after a single-track queue)."""
     global _batch_processing, _batch_current_track_id, _batch_current_track_duration_ms
-    global _batch_track_start_time, _batch_expected_track_id, _batch_watchdog_fired_by_track_id
+    global _batch_track_start_time, _batch_expected_track_id, _batch_play_issued_at
+    global _batch_watchdog_fired_by_track_id
 
     with _batch_lock:
         if not _batch_processing:
@@ -130,6 +133,7 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
             _batch_processing = False
             _batch_current_track_id = None
             _batch_expected_track_id = None
+            _batch_play_issued_at = 0.0
             _batch_watchdog_fired_by_track_id = None
             # Push to pending queue -- _update_np_ui() drain runs on main thread
             # and calls _stop_batch_analysis() safely (never ui.timer from bg thread).
@@ -157,6 +161,7 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
             _batch_processing = False
             _batch_current_track_id = None
             _batch_expected_track_id = None
+            _batch_play_issued_at = 0.0
             _batch_watchdog_fired_by_track_id = None
             # Push to pending queue -- _update_np_ui() drain runs on main thread
             # and calls _stop_batch_analysis() safely (never ui.timer from bg thread).
@@ -171,70 +176,112 @@ def _batch_advance_to_next(expected_track_id: str | None = None):
             return
 
         _batch_current_track_id = tid
-        _batch_current_track_duration_ms = next_track.get("duration_ms", 0)
-        _batch_track_start_time = time.time()
-        _batch_watchdog_fired_by_track_id = None
         _batch_expected_track_id = tid
+        _batch_play_issued_at = time.time()
 
         if _state.sp and _state.spotify_device_id:
             try:
+                from playlist_arranger.sources.spotify_source import play_track_on_device
+
                 uri = f"spotify:track:{tid}"
-                _state.sp.start_playback(device_id=_state.spotify_device_id, uris=[uri])
-                logger.info("Batch: started playback of '%s' (id=%s, %d tracks remaining)",
-                            next_track.get("name", "?")[:40], tid[:8] if tid else "?",
-                            len(queue_snapshot))
+                path, snapshot = play_track_on_device(_state.sp, uri, _state.spotify_device_id)
+                logger.info(
+                    "Batch: started playback of '%s' (id=%s, %d tracks remaining, path=%s, snapshot=%r)",
+                    next_track.get("name", "?")[:40], tid[:8] if tid else "?",
+                    len(queue_snapshot), path, snapshot,
+                )
             except Exception as e:
-                err_msg = str(e)
-                is_404 = "404" in err_msg or "device not found" in err_msg.lower()
-                is_network = False
-                try:
-                    import requests
-                    if isinstance(e, requests.exceptions.RequestException):
-                        is_network = True
-                except ImportError:
-                    pass
-                if is_404:
-                    logger.error(
-                        "Batch: playback device not found (404) for track '%s' (id=%s) — "
-                        "device may have gone offline. Stopping batch analysis.",
-                        next_track.get("name", "?")[:40], tid[:8] if tid else "?",
-                    )
-                    with _ui_pending_lock:
-                        _ui_pending_queue.append({
-                            "type": "notify",
-                            "msg": "Spotify playback device not found — batch analysis stopped. Select a device and restart manually.",
-                            "color": "negative",
-                        })
-                elif is_network:
-                    logger.error(
-                        "Batch: network error during start_playback for '%s' (id=%s): %s. "
-                        "Stopping batch analysis.",
-                        next_track.get("name", "?")[:40], tid[:8] if tid else "?", e,
-                    )
-                    with _ui_pending_lock:
-                        _ui_pending_queue.append({
-                            "type": "notify",
-                            "msg": "Spotify connection lost — batch analysis stopped. Reconnect and restart manually.",
-                            "color": "negative",
-                        })
-                else:
-                    logger.error(
-                        "Batch: failed to start playback for '%s' (id=%s): %s. "
-                        "Stopping batch analysis.",
-                        next_track.get("name", "?")[:40], tid[:8] if tid else "?", e,
-                    )
-                    with _ui_pending_lock:
-                        _ui_pending_queue.append({
-                            "type": "notify",
-                            "msg": "Batch analysis stopped due to playback error. Check logs and restart manually.",
-                            "color": "negative",
-                        })
+                from playlist_arranger.sources.spotify_source import (
+                    spotify_error_details,
+                    classify_spotify_error,
+                )
+
+                status, reason, msg = spotify_error_details(e)
+                category = classify_spotify_error(status, msg, reason=reason)
+                logger.error(
+                    "Batch: playback failed for '%s' (id=%s) — status=%s, reason=%s, msg=%s. "
+                    "Stopping batch analysis.",
+                    next_track.get("name", "?")[:40], tid[:8] if tid else "?",
+                    status, reason, msg,
+                )
+
+                notify_msgs = {
+                    "premium_required": "Spotify Premium is required to drive playback — batch analysis stopped.",
+                    "device_restricted": "The selected Spotify device rejects remote playback — choose another device and restart batch analysis.",
+                    "forbidden": "Spotify returned 403 for the playback request — batch analysis stopped. See log for details.",
+                    "not_found": "Spotify playback device not found — batch analysis stopped. Select a device and restart manually.",
+                    "network_error": "Spotify connection lost — batch analysis stopped. Reconnect and restart manually.",
+                }
+                notify_msg = notify_msgs.get(
+                    category,
+                    "Batch analysis stopped due to playback error. Check logs and restart manually.",
+                )
+                with _ui_pending_lock:
+                    _ui_pending_queue.append({
+                        "type": "notify",
+                        "msg": notify_msg,
+                        "color": "negative",
+                    })
                 _stop_batch_analysis()
                 return
+
+        # Playback command accepted and confirmed — start the per-track clock now.
+        _batch_current_track_duration_ms = next_track.get("duration_ms", 0)
+        _batch_track_start_time = time.time()
+        _batch_watchdog_fired_by_track_id = None
 
     # Queue UI refresh for main asyncio drain (don't touch UI from background thread)
     with _ui_pending_lock:
         _ui_pending_queue.append({"type": "batch_advance_ui_sync"})
+
+
+def batch_check_start_timeout() -> bool:
+    """Give up if Spotify accepted the play command but never started playing.
+
+    Returns True when the batch was stopped due to a start-confirmation timeout,
+    False otherwise.  Safe to call from the polling thread; all UI mutation goes
+    through the pending-queue drain.
+    """
+    from playlist_arranger import config as _cfg
+
+    with _batch_lock:
+        if not _batch_processing:
+            return False
+        if _batch_expected_track_id is None:
+            return False
+        if _batch_play_issued_at <= 0:
+            return False
+
+        elapsed = time.time() - _batch_play_issued_at
+        if elapsed <= _cfg.BATCH_START_CONFIRM_TIMEOUT_S:
+            return False
+        expected = _batch_expected_track_id
+
+    # Cheap best-effort snapshot for the log (never blocks the poll thread long).
+    latest_snapshot = None
+    try:
+        if _state.sp is not None:
+            from playlist_arranger.sources.spotify_source import playback_snapshot
+
+            latest_snapshot = playback_snapshot(_state.sp)
+    except Exception:
+        latest_snapshot = None
+
+    logger.error(
+        "Batch: Spotify accepted the play command for track '%s' but never started "
+        "playing it after %.1fs — giving up. latest_snapshot=%r",
+        expected, elapsed, latest_snapshot,
+    )
+
+    with _ui_pending_lock:
+        _ui_pending_queue.append({
+            "type": "notify",
+            "msg": "Spotify accepted the play command but never started playing — batch analysis stopped. Make the Spotify desktop client the active device (press Play in it once) and try again.",
+            "color": "negative",
+        })
+
+    _stop_batch_analysis()
+    return True
 
 
 __all__ = [
@@ -244,9 +291,11 @@ __all__ = [
     "_batch_current_track_duration_ms",
     "_batch_track_start_time",
     "_batch_expected_track_id",
+    "_batch_play_issued_at",
     "_batch_watchdog_fired_by_track_id",
     "_batch_btn",
     "configure",
     "_batch_advance_to_next",
     "_stop_batch_analysis",
+    "batch_check_start_timeout",
 ]

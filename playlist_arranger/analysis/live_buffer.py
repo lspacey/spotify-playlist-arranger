@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 from playlist_arranger.config import (
     MIN_COVERAGE_PCT,
     MAX_ANALYZE_BUFFER_S,
+    LOW_SIGNAL_RMS_DB_THRESHOLD,
+    WARN_SIGNAL_RMS_DB_THRESHOLD,
 )
 
 
@@ -117,6 +119,36 @@ class LiveAnalyzeContext:
                      buf.track_info.get("name", "")[:30] if buf.track_info else "?",
                      coverage_pct * 100, duration_s)
         if coverage_pct >= MIN_COVERAGE_PCT:
+            # Pre-submit RMS gate: reject near-silent captures before handing the
+            # buffer to MERT.  A wrong capture endpoint records the noise floor
+            # (~-48 dB) instead of real music (-20 to -12 dB).
+            rms = float(np.sqrt(np.mean(np.square(y_full)) + 1e-12))
+            rms_db = float(20.0 * np.log10(rms))
+            name = buf.track_info.get("name", "?")[:50] if buf.track_info else "?"
+
+            if rms_db < LOW_SIGNAL_RMS_DB_THRESHOLD:
+                logger.warning(
+                    "Buffer for track %s rejected: rms_db=%.1f below %.1f — "
+                    "capture device is probably not the endpoint Spotify plays to",
+                    name, rms_db, LOW_SIGNAL_RMS_DB_THRESHOLD,
+                )
+                # Reuse the existing discard path (same as insufficient coverage).
+                cb = self.on_buffer_discarded_cb
+                if cb:
+                    try:
+                        cb(buf.track_info)
+                    except Exception:
+                        logger.exception("on_buffer_discarded_cb crashed for %s",
+                                         buf.track_info.get("name", "?")[:30] if buf.track_info else "?")
+                return False
+
+            if rms_db < WARN_SIGNAL_RMS_DB_THRESHOLD:
+                logger.warning(
+                    "Buffer for track %s has low level: rms_db=%.1f — verify the "
+                    "capture device matches the Spotify output endpoint",
+                    name, rms_db,
+                )
+
             self._submit_analyze_task(buf.track_info, y_full)
             logger.info("Track complete: coverage=%.1f%%, submitting for analysis: %s",
                         coverage_pct * 100, buf.track_info.get("name", "")[:50] if buf.track_info else "?")
@@ -369,7 +401,13 @@ class LiveAnalyzeContext:
         self._analyze_poll_stop.clear()
         self._analyze_poll_thread = threading.Thread(target=self._poll_thread_fn, daemon=True)
         self._analyze_poll_thread.start()
-        logger.info("Analyze poll thread started")
+        logger.info(
+            "Analyze poll thread started (capture device index=%s name='%s', channels=%s, sample_rate=%s)",
+            getattr(self.capture, "current_device_index", None),
+            getattr(self.capture, "current_device_name", "?"),
+            getattr(self.capture, "actual_channels", "?"),
+            getattr(self.capture, "actual_sr", "?"),
+        )
 
     def stop_poll_thread(self):
         """Stop the WASAPI → buffer feeding thread.

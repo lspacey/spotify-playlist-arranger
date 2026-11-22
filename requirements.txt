@@ -17,7 +17,10 @@
 nicegui==3.13.0        # web UI framework
 
 # ── Spotify Web API ────────────────────────────────────────────────────────
-spotipy==2.26.0
+spotipy==2.26.0        # 2.26.0 is the first release that moved playlist endpoints
+                       # from /tracks to /items for the February 2026 Web API
+                       # changes; older versions hit the removed /tracks endpoint
+                       # and get 403.
 requests==2.34.2       # direct HTTP calls with retry/rate-limit handling
 
 # ── Audio capture (Windows only) ───────────────────────────────────────────

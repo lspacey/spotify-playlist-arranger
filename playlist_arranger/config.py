@@ -76,10 +76,13 @@ BUFFER_SECONDS = 30
 SILENCE_RMS_THRESHOLD = 0.001  # RMS below this → silence (chosen via empirical testing: typical music RMS ~0.01-0.3, pure silence near 0.0001)
 MIN_COVERAGE_PCT = 0.90        # Track must be >= 90% captured to submit for analysis
 MAX_ANALYZE_BUFFER_S = 900      # Safety cap: max audio buffer duration (15 min, ~400 MB at 22050 Hz mono float32)
+LOW_SIGNAL_RMS_DB_THRESHOLD = -50.0  # RMS below this → reject buffer (wrong capture device / noise floor)
+WARN_SIGNAL_RMS_DB_THRESHOLD = -35.0  # RMS below this → submit but log a low-level warning
 
 POLL_NORMAL = 5.0
 POLL_FAST = 2.0
 POLL_SCROBBLE = 15.0
+SEEK_BACK_MIN_DELTA_MS = 3000   # progress regression larger than this may be a seek-back
 
 CHUNK = 16384
 SEG_SECONDS = 10
@@ -89,7 +92,7 @@ FULL_BUF_MAX = SAMPLE_RATE * 10 * 60
 
 # ─── Spotify constants ────────────────────────────────────────────────────────
 SPOTIFY_SCOPE = (
-    "user-read-private "                 # required for market="from_token" to resolve user country
+    "user-read-private "                 # required to read the account country/product fields (market="from_token" is no longer a documented value)
     "user-read-currently-playing "
     "user-read-playback-state "
     "user-modify-playback-state "
@@ -99,6 +102,20 @@ SPOTIFY_SCOPE = (
     "playlist-modify-private"
 )
 REDIRECT_URI = os.getenv("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+
+# Enables verbose raw player-command tracing (request/response status + bodies).
+# Set to 0 once the playback problem is resolved.
+SPOTIFY_TRACE = os.getenv("SPOTIFY_TRACE", "1").strip() not in ("", "0", "false", "False")
+
+# Playback start-confirmation polling (GET /me/player after a player command).
+PLAYBACK_CONFIRM_TIMEOUT_S = 10.0
+PLAYBACK_CONFIRM_INTERVAL_S = 1.0
+# Hard ceiling after which the batch sequencer gives up waiting for a track it
+# asked Spotify to play.
+BATCH_START_CONFIRM_TIMEOUT_S = 20.0
+# A confirmed playback start beyond this offset is suspicious (play with uris
+# should start at 0 ms) and will warn about potential coverage loss.
+PLAYBACK_START_OFFSET_WARN_MS = 5000
 
 # ─── Music theory ─────────────────────────────────────────────────────────────
 KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]

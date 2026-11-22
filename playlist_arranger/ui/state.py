@@ -4,6 +4,8 @@ import logging
 import pathlib
 import threading
 
+from playlist_arranger.config import LOW_SIGNAL_RMS_DB_THRESHOLD
+
 logger = logging.getLogger(__name__)
 
 # ─── Playlist state ──────────────────────────────────────────────────────────
@@ -22,6 +24,8 @@ selected_playlist_id: str | None = None
 sp = None  # spotipy.Spotify instance
 spotify_device_id: str | None = None
 spotify_user_id: str | None = None
+spotify_market: str | None = None  # user account country (ISO-3166-1 alpha-2)
+spotify_product: str | None = None  # "premium" / "free" / "open" / None
 
 # ─── Audio capture state ────────────────────────────────────────────────────
 audio_capture_active: bool = False
@@ -199,7 +203,6 @@ def get_track_status(track: dict) -> str:
     # linear → -60 dB).  We use -50 dB as the validation threshold:
     # real music typically sits at -20 to -3 dB; room noise / wrong-device
     # silence is much lower.
-    LOW_SIGNAL_RMS_DB_THRESHOLD = -50.0
     rms_db = features.get("rms_db")
     if rms_db is not None and isinstance(rms_db, (int, float)) and rms_db < LOW_SIGNAL_RMS_DB_THRESHOLD:
         return STATUS_LOW_SIGNAL
@@ -292,7 +295,6 @@ def _compute_status(track: dict, entry: dict | None) -> str:
             return STATUS_DURATION_MISMATCH
 
     # 8. Audio level check
-    LOW_SIGNAL_RMS_DB_THRESHOLD = -50.0
     rms_db = features.get("rms_db")
     if rms_db is not None and isinstance(rms_db, (int, float)) and rms_db < LOW_SIGNAL_RMS_DB_THRESHOLD:
         return STATUS_LOW_SIGNAL

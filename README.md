@@ -192,6 +192,19 @@ playlist_arranger/
 
 ---
 
+## 🔄 February 2026 Spotify API migration
+
+This project is migrated to Spotify's **February 2026 Web API changes**:
+
+- **Playlist endpoints renamed** — `GET|POST|PUT|DELETE /playlists/{id}/tracks` were removed and replaced by `.../playlists/{id}/items`. `spotipy>=2.26.0` is required (older versions get 403).
+- **Playlist item page limit is now 50** (was 100).
+- **Removed track fields** — `available_markets`, `popularity` and `linked_from` are gone from the track object (`external_ids` was removed in February and restored in March 2026).
+- **`market=from_token` removed** — the app now resolves and caches the account country at auth time instead.
+- **Development Mode Premium requirement** — the app owner must hold an active Spotify Premium subscription and each Client ID is limited to 5 authorized users; some write endpoints return bare 403 Forbidden.
+- **Playback fallback ladder** — `PUT /me/player/play` may return 403 on restricted devices, so playback now falls back through `transfer_playback` → `add_to_queue` + `next_track` (the reliable Development Mode path).
+
+---
+
 ## ❓ FAQ
 
 <details>
