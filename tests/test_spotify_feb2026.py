@@ -7,8 +7,10 @@ parsing, ``_is_track_playable()`` field-removal handling, the
 mocks and no real network calls.
 """
 
+import os
 import pathlib
 import sys
+import unittest
 
 _repo_root = pathlib.Path(__file__).resolve().parents[1]
 if str(_repo_root) not in sys.path:
@@ -19,9 +21,12 @@ from unittest.mock import MagicMock, patch
 from playlist_arranger.sources.spotify_source import (
     classify_spotify_error,
     get_playlist_tracks,
+    init_spotify,
     _is_track_playable,
+    _market,
     check_device,
 )
+from playlist_arranger.ui import state as _ui_state
 
 
 # ── classify_spotify_error() ─────────────────────────────────────────────────
@@ -143,3 +148,88 @@ def test_check_device_ok():
     ok, reason = check_device(fake_sp, "d1")
     assert ok
     assert reason == "ok"
+
+
+# ── init_spotify(): GET /me field removal (country / product / email) ───────
+
+def _run_init_spotify(user_payload):
+    """Run init_spotify() with mocked OAuth/Spotify; return (result, log lines)."""
+    fake_sp = MagicMock()
+    fake_sp.current_user.return_value = user_payload
+    with patch.dict(os.environ, {
+             "SPOTIPY_CLIENT_ID": "test-client-id",
+             "SPOTIPY_CLIENT_SECRET": "test-client-secret",
+         }), \
+         patch("playlist_arranger.sources.spotify_source.SpotifyOAuth"), \
+         patch("playlist_arranger.sources.spotify_source.spotipy.Spotify",
+               return_value=fake_sp):
+        with unittest.TestCase().assertLogs(
+            "playlist_arranger.sources.spotify_source", level="INFO"
+        ) as logs:
+            result = init_spotify()
+    return result, logs.output
+
+
+def _restore_spotify_state(saved):
+    _ui_state.spotify_market, _ui_state.spotify_product = saved
+
+
+def test_init_spotify_missing_product_and_country_is_logged_not_warned():
+    """GET /me no longer returns country/product — init must not warn but must
+    not silently drop the Premium preflight info either."""
+    saved = (_ui_state.spotify_market, _ui_state.spotify_product)
+    try:
+        (proxy, user_id), output = _run_init_spotify({"id": "user1"})
+        assert user_id == "user1"
+        assert proxy is not None
+        assert _ui_state.spotify_market is None
+        assert _ui_state.spotify_product is None
+        assert any("did not return 'product'" in line for line in output)
+        assert not any(line.startswith("WARNING") for line in output)
+        assert not any("Authorization" in line or "Bearer " in line for line in output)
+    finally:
+        _restore_spotify_state(saved)
+
+
+def test_init_spotify_warns_for_non_premium_product():
+    saved = (_ui_state.spotify_market, _ui_state.spotify_product)
+    try:
+        (_, user_id), output = _run_init_spotify(
+            {"id": "user2", "country": "HK", "product": "free"}
+        )
+        assert user_id == "user2"
+        assert _ui_state.spotify_market == "HK"
+        assert _ui_state.spotify_product == "free"
+        assert any("not 'premium'" in line for line in output)
+        assert not any("did not return 'product'" in line for line in output)
+    finally:
+        _restore_spotify_state(saved)
+
+
+def test_init_spotify_premium_product_does_not_warn():
+    saved = (_ui_state.spotify_market, _ui_state.spotify_product)
+    try:
+        (_, _), output = _run_init_spotify({"id": "user3", "product": "premium"})
+        assert _ui_state.spotify_product == "premium"
+        assert not any("not 'premium'" in line for line in output)
+        assert not any("did not return 'product'" in line for line in output)
+    finally:
+        _restore_spotify_state(saved)
+
+
+# ── _market(): never falls back to the removed "from_token" literal ─────────
+
+def test_market_uses_cached_country_and_never_from_token():
+    saved = _ui_state.spotify_market
+    try:
+        _ui_state.spotify_market = None
+        assert _market() is None
+        assert _market("US") == "US"  # explicit caller default is allowed
+
+        _ui_state.spotify_market = "HK"
+        assert _market() == "HK"
+        assert _market("US") == "HK"  # cached value wins
+        assert _market() != "from_token"
+    finally:
+        _ui_state.spotify_market = saved
+

@@ -35,11 +35,11 @@ def test_is_track_playable_is_playable_false():
     """is_playable=False should be unplayable."""
     playable, reason = _is_track_playable(
         {"track": {"id": "x", "type": "track", "is_playable": False}},
-        market="from_token",
+        market="US",
     )
     assert not playable
     assert "is_playable=False" in reason
-    assert "from_token" in reason
+    assert "US" in reason
 
 
 def test_is_track_playable_restricted():
@@ -58,10 +58,10 @@ def test_is_track_playable_empty_markets_no_is_playable_field():
     This is the KEY regression test for the bug being fixed."""
     playable, reason = _is_track_playable(
         {"track": {"id": "x", "type": "track", "available_markets": []}},
-        market="from_token",
+        market="US",
     )
     assert playable, (
-        f"is_playable absent with market=from_token must NOT be skipped; "
+        f"is_playable absent with a market supplied must NOT be skipped; "
         f"got reason={reason!r}"
     )
     assert reason == "ok"

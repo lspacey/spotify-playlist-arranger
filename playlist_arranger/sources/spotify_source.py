@@ -298,7 +298,17 @@ def init_spotify(progress_cb=None):
         logger.exception("Failed to cache Spotify user market/product on state module")
 
     logger.info("Spotify user: id=%s, country=%s, product=%s", user_id, country, product)
-    if product and product != "premium":
+    if product is None:
+        # February 2026 Web API change: GET /me no longer returns `country`,
+        # `product` or `email`.  Keep this explicit rather than silently
+        # dropping the Premium warning — the playback path still detects a
+        # non-Premium account via 403 PREMIUM_REQUIRED.
+        logger.info(
+            "Spotify GET /me did not return 'product' (removed in the February 2026 "
+            "Web API changes) — Premium preflight skipped; a non-Premium account is "
+            "reported as 403 PREMIUM_REQUIRED on the first playback command."
+        )
+    elif product != "premium":
         logger.warning(
             "Spotify product is '%s' (not 'premium') — PUT /me/player/play will "
             "always fail with 403 PREMIUM_REQUIRED and batch analysis cannot work.",
