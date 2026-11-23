@@ -16,7 +16,14 @@ from nicegui import ui, app
 from playlist_arranger.ui import state as _state
 from playlist_arranger.cache.store import backup_exists as _backup_exists
 from playlist_arranger.database import db as _db
-from playlist_arranger.config import load_settings, CACHE_DIR_DEFAULT, SPOTIFY_TRACE, SEEK_BACK_MIN_DELTA_MS
+from playlist_arranger.config import (
+    load_settings,
+    CACHE_DIR_DEFAULT,
+    SPOTIFY_TRACE,
+    SEEK_BACK_MIN_DELTA_MS,
+    FREEZE_STALL_POLLS,
+    FREEZE_MIN_STALL_SECONDS,
+)
 
 from playlist_arranger.analysis import batch_analyzer as _ba
 from playlist_arranger.analysis.desc_status import get_desc_age_info
@@ -467,60 +474,106 @@ _api_counter_label = None
 # _ph._notify_playing_track() moved to playlist_arranger/ui/playlist_highlight.py.
 # Use _ph._notify_playing_track(...).
 
-def _classify_seek_back_step(state, tid, last_track_id, progress_ms, current_type, current_timestamp):
-    """Advance the seek-back state machine for one playback sample.
+def _new_seek_state():
+    """Return a fresh seek-back / freeze-tracking state dict."""
+    return {
+        "last_progress_ms": 0,
+        "pending_seek_back_from_ms": None,
+        "no_progress_steps": 0,
+        "last_progress_change_at": 0.0,
+    }
 
-    A seek-back is only declared after *two consecutive* qualifying regressions,
-    and never on a degenerate (track_id None / type 'unknown') or stale
-    (unchanged timestamp) snapshot.
 
-    ``state`` is a mutable dict with keys: ``last_progress_ms`` (int),
-    ``last_timestamp`` (raw timestamp or None), ``pending_seek_back_from_ms``
-    (int or None).  It is mutated in place.
+def _classify_seek_back_step(state, tid, last_track_id, progress_ms, current_type,
+                             is_playing, now=None):
+    """Advance the seek-back / freeze state machine for one playback sample.
+
+    A seek-back is only declared after *two consecutive* qualifying regressions
+    on the same track, and never on a degenerate snapshot (track_id None or
+    ``currently_playing_type`` other than ``"track"``).
+
+    A "stale" (genuinely frozen) snapshot is declared only when playback is
+    reported as active, the track id is unchanged, and ``progress_ms`` has not
+    moved for ``FREEZE_STALL_POLLS`` consecutive polls spanning at least
+    ``FREEZE_MIN_STALL_SECONDS``.  The Spotify ``timestamp`` field is NOT used:
+    it only changes when the playback STATE changes (play/pause/seek/track
+    change), so it remains constant during ordinary playback while
+    ``progress_ms`` keeps increasing.
+
+    ``state`` is a mutable dict as returned by ``_new_seek_state()``.  It is
+    mutated in place on every call — progress tracking is never skipped.
+
+    ``now`` is injectable for tests (defaults to ``time.monotonic()``).
 
     Returns one of:
         None        — nothing to do (forward/small step, or degenerate sample).
         "possible"  — first qualifying regression (pending recorded).
-        "stale"     — unchanged timestamp (do not compare).
+        "stale"     — genuine freeze: playing, same track, progress unchanged.
         "drain"     — second consecutive regression (seek-back confirmed).
     """
+    if now is None:
+        now = time.monotonic()
+
+    progress_ms = progress_ms or 0
+    prev_progress_ms = state["last_progress_ms"]
     degenerate = (current_type != "track") or (tid is None)
-    stale = (
-        current_timestamp is not None
-        and state["last_timestamp"] is not None
-        and current_timestamp == state["last_timestamp"]
-    )
+    same_track = tid is not None and tid == last_track_id
 
-    state["last_timestamp"] = current_timestamp
+    # ── Progress-movement tracking (always updated, never skipped) ─────────
+    if prev_progress_ms <= 0:
+        # First sample for this track (callers reset last_progress_ms to 0 on
+        # a track change) — start the freeze clock without counting a stall.
+        state["no_progress_steps"] = 0
+        state["last_progress_change_at"] = now
+    elif progress_ms != prev_progress_ms:
+        # Forward playback or a seek: either way progress is moving, so this
+        # is not a freeze.
+        state["no_progress_steps"] = 0
+        state["last_progress_change_at"] = now
+    else:
+        state["no_progress_steps"] += 1
 
-    if stale:
-        state["pending_seek_back_from_ms"] = None
-        return "stale"
+    state["last_progress_ms"] = progress_ms
 
     if degenerate:
         state["pending_seek_back_from_ms"] = None
+        state["no_progress_steps"] = 0
+        state["last_progress_change_at"] = now
         return None
 
+    # ── Genuine freeze: playing, same track, progress not advancing ────────
+    stalled = (
+        is_playing
+        and same_track
+        and state["no_progress_steps"] >= FREEZE_STALL_POLLS
+        and (now - state["last_progress_change_at"]) >= FREEZE_MIN_STALL_SECONDS
+    )
+    if stalled:
+        state["pending_seek_back_from_ms"] = None
+        return "stale"
+
+    # ── Seek-back: two consecutive qualifying regressions on the same track ─
     if (
-        tid == last_track_id
-        and state["last_progress_ms"] > 0
-        and progress_ms < state["last_progress_ms"] - SEEK_BACK_MIN_DELTA_MS
+        same_track
+        and prev_progress_ms > 0
+        and progress_ms < prev_progress_ms - SEEK_BACK_MIN_DELTA_MS
     ):
         if state["pending_seek_back_from_ms"] is None:
-            state["pending_seek_back_from_ms"] = state["last_progress_ms"]
-            state["last_progress_ms"] = progress_ms
+            state["pending_seek_back_from_ms"] = prev_progress_ms
             return "possible"
         state["pending_seek_back_from_ms"] = None
-        state["last_progress_ms"] = progress_ms
         return "drain"
 
     state["pending_seek_back_from_ms"] = None
-    state["last_progress_ms"] = progress_ms
     return None
 
 
 def _log_stale_snapshot(timestamp, last_log_time):
-    """Log a rate-limited (once per 30 s) frozen-playback-state warning.
+    """Log a rate-limited (once per 30 s) genuine playback-freeze warning.
+
+    Only called after ``_classify_seek_back_step()`` confirmed a real freeze
+    (playing + same track + ``progress_ms`` unchanged for N polls); an
+    unchanged ``timestamp`` alone is NOT a freeze.
 
     Returns the updated ``last_log_time`` (so callers can keep their local
     rate-limit tracker in sync).
@@ -545,11 +598,7 @@ def _card_listen_thread():
     from playlist_arranger.config import POLL_FAST, POLL_NORMAL
 
     last_track_id = None
-    _seek_state = {
-        "last_progress_ms": 0,
-        "last_timestamp": None,
-        "pending_seek_back_from_ms": None,
-    }
+    _seek_state = _new_seek_state()
     last_playing_time = 0.0
     _last_highlighted_id = None
     _last_highlighted_pl = None
@@ -745,6 +794,17 @@ def _card_listen_thread():
             _current_track_elapsed = progress_ms
             _current_track = new_track_info
 
+            # Raw-field diagnostics while a batch runs: a future stall can be
+            # diagnosed from the log (progress vs. is_playing vs. device)
+            # without enabling full SPOTIFY_TRACE request dumps.
+            if _ba._batch_processing:
+                logger.debug(
+                    "poll (batch): is_playing=%r progress_ms=%r timestamp=%r "
+                    "item_id=%r device_id=%r",
+                    cp.get("is_playing"), progress_ms, cp.get("timestamp"),
+                    tid, (cp.get("device") or {}).get("id"),
+                )
+
             context = cp.get("context") or {}
             context_uri = context.get("uri", "")
             pl_id_from_context = ""
@@ -818,20 +878,30 @@ def _card_listen_thread():
                     except Exception:
                         logger.exception("_on_track_changed_cb crashed")
                 last_track_id = tid
-                _seek_state["last_progress_ms"] = 0
-                _seek_state["pending_seek_back_from_ms"] = None
+                _seek_state.update(_new_seek_state())
 
-            # ── Seek-back detection (guarded against stale/degenerate snapshots) ──
+            # ── Seek-back / freeze detection (never gated on ``timestamp``) ──
             action = _classify_seek_back_step(
                 _seek_state,
                 tid,
                 last_track_id,
                 progress_ms,
                 cp.get("currently_playing_type"),
-                cp.get("timestamp"),
+                bool(cp.get("is_playing")),
             )
             if action == "stale":
+                prev_stale_log = _last_stale_log
                 _last_stale_log = _log_stale_snapshot(cp.get("timestamp"), _last_stale_log)
+                if _last_stale_log != prev_stale_log:
+                    # Rate-limited raw-field diagnostic: only a real freeze
+                    # reaches here (see _classify_seek_back_step).
+                    logger.debug(
+                        "poll freeze diagnostic: is_playing=%r progress_ms=%r "
+                        "timestamp=%r item_id=%r device_id=%r no_progress_steps=%d",
+                        cp.get("is_playing"), progress_ms, cp.get("timestamp"),
+                        tid, (cp.get("device") or {}).get("id"),
+                        _seek_state["no_progress_steps"],
+                    )
             elif action == "possible":
                 logger.debug(
                     "Possible seek-back for track %s: %d ms -> %d ms — awaiting confirmation",
@@ -1531,6 +1601,9 @@ def _on_start_batch():
 
     # Preflight: programmatic playback requires a Premium account and a device
     # that accepts remote control (a restricted device is a common 403 source).
+    # After the February 2026 Web API changes GET /me no longer returns
+    # ``product``, so this is normally None and the preflight is skipped — a
+    # non-Premium account is then surfaced as 403 PREMIUM_REQUIRED.
     if getattr(_state, "spotify_product", None) is not None and _state.spotify_product != "premium":
         ui.notify("Spotify Premium is required for programmatic playback.", type="warning")
         return

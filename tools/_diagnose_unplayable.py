@@ -1,9 +1,13 @@
 """Diagnostic: inspect raw Spotify API fields for playability analysis.
 
-Usage: python tools/_diagnose_unplayable.py [playlist_id]
+Usage: python tools/_diagnose_unplayable.py [playlist_id] [market]
 
-Fetches the first page of a playlist WITH and WITHOUT market="from_token",
-printing raw is_playable/available_markets/restrictions for each track.
+Fetches the first page of a playlist with an optional ISO-3166-1 alpha-2
+``market`` (e.g. ``US``) and without a market parameter, printing raw
+is_playable/available_markets/restrictions for each track.
+
+Note: ``market="from_token"`` is no longer a valid value after the February
+2026 Web API changes — pass an explicit country code or omit the argument.
 """
 import sys
 sys.path.insert(0, "e:/Projects/Spotify_playlists/repository")
@@ -15,6 +19,7 @@ from spotipy.oauth2 import SpotifyOAuth
 from playlist_arranger.config import SPOTIFY_SCOPE, REDIRECT_URI
 
 playlist_id = sys.argv[1] if len(sys.argv) > 1 else "6dwYnWPwm7KgFWO6e0wtdd"
+market_arg = sys.argv[2] if len(sys.argv) > 2 else None
 
 
 def fetch_and_inspect(market_param=None):
@@ -119,15 +124,20 @@ def fetch_and_inspect(market_param=None):
 
 
 if __name__ == "__main__":
-    # Test WITH market="from_token" first (current production behavior)
-    with_market = fetch_and_inspect("from_token")
+    # February 2026 Web API change: market="from_token" is no longer valid.
+    # Compare an explicit country code against no market param when given;
+    # otherwise just inspect the default (no market) response.
+    if market_arg:
+        with_market = fetch_and_inspect(market_arg)
+        without_market = fetch_and_inspect(None)
 
-    # Then test WITHOUT market param (to isolate whether market=from_token causes bad data)
-    without_market = fetch_and_inspect(None)
-
-    print(f"\n{'='*70}")
-    print("DIFFERENCE ANALYSIS")
-    print(f"{'='*70}")
-    print(f"With market='from_token':   {with_market['OK']} kept / {sum(v for k,v in with_market.items() if k!='OK')} skipped")
-    print(f"Without market param:       {without_market['OK']} kept / {sum(v for k,v in without_market.items() if k!='OK')} skipped")
-    print(f"Delta (without→with):       {without_market['OK'] - with_market['OK']} fewer tracks kept")
+        print(f"\n{'='*70}")
+        print("DIFFERENCE ANALYSIS")
+        print(f"{'='*70}")
+        print(f"With market={market_arg!r}: {with_market['OK']} kept / {sum(v for k,v in with_market.items() if k!='OK')} skipped")
+        print(f"Without market param:       {without_market['OK']} kept / {sum(v for k,v in without_market.items() if k!='OK')} skipped")
+        print(f"Delta (without→with):       {without_market['OK'] - with_market['OK']} fewer tracks kept")
+    else:
+        print("\nTip: pass a market code as the 2nd argument (e.g. 'US') to compare "
+              "with the market-less response.")
+        fetch_and_inspect(None)

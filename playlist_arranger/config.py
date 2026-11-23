@@ -84,6 +84,16 @@ POLL_FAST = 2.0
 POLL_SCROBBLE = 15.0
 SEEK_BACK_MIN_DELTA_MS = 3000   # progress regression larger than this may be a seek-back
 
+# Genuine "playback frozen" detection.  Spotify's GET /me/player ``timestamp``
+# only changes when the playback STATE changes (play/pause/seek/track change),
+# so it stays constant during normal playback and must NEVER be used as a
+# freeze signal.  A real freeze is: is_playing is True, the same track id, and
+# ``progress_ms`` unchanged for FREEZE_STALL_POLLS consecutive polls spanning at
+# least FREEZE_MIN_STALL_SECONDS (so a loop that polls faster than the
+# configured interval cannot trip it).
+FREEZE_STALL_POLLS = 3
+FREEZE_MIN_STALL_SECONDS = (FREEZE_STALL_POLLS - 1) * POLL_FAST  # 4.0 s
+
 CHUNK = 16384
 SEG_SECONDS = 10
 SCROBBLE_PCT = 0.90
